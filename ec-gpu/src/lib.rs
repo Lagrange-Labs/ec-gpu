@@ -41,6 +41,9 @@ pub trait GpuField: GpuName {
     }
 }
 
+#[cfg(feature = "arkworks")]
+pub mod arkworks_bn254;
+
 /// Macro to get a unique name of an item.
 ///
 /// The name is a string that consists of the module path and the type name. All non-alphanumeric

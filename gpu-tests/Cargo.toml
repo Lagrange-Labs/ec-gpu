@@ -14,18 +14,23 @@ publish = false
 [dev-dependencies]
 blstrs = { version = "0.7.0", features = ["__private_bench"] }
 criterion = "0.4"
-ec-gpu = "0.2"
-ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false }
+ec-gpu = { workspace = true, features = ["arkworks"] }
+ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false, features = ["arkworks"] }
 ff = { version = "0.13.0", default-features = false }
 fil_logger = "0.1.6"
 group = "0.13.0"
 pairing = "0.23.0"
 rand = "0.8"
 rayon = "1.5.3"
+ark-ff = "0.5.0"
+ark-ec = "0.5.0"
+ark-bn254 = "0.5.0"
 
 [build-dependencies]
 blstrs = { version = "0.7.0", features = ["__private_bench"] }
-ec-gpu-gen = { path = "../ec-gpu-gen" }
+ark-bn254 = { version = "0.5.0" }
+ec-gpu = { path = "../ec-gpu", features = ["arkworks"] }
+ec-gpu-gen = { path = "../ec-gpu-gen", features = ["arkworks"] }
 
 [features]
 default = ["cuda", "opencl"]

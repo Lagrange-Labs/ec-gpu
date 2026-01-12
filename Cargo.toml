@@ -5,3 +5,6 @@ members = [
   "gpu-tests",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+ec-gpu = { path = "./ec-gpu" }

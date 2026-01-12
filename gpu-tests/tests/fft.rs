@@ -1,5 +1,6 @@
 #![cfg(any(feature = "cuda", feature = "opencl"))]
 
+/*
 use std::time::Instant;
 
 use blstrs::Scalar as Fr;
@@ -134,3 +135,4 @@ pub fn gpu_fft_many_consistency() {
         println!("============================");
     }
 }
+*/

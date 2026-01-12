@@ -2,8 +2,6 @@ use std::ops::AddAssign;
 use std::sync::{Arc, RwLock};
 
 use ec_gpu::GpuName;
-use ff::PrimeField;
-use group::{prime::PrimeCurveAffine, Group};
 use log::{error, info};
 use rust_gpu_tools::{program_closures, Device, Program};
 use yastl::Scope;
@@ -12,6 +10,7 @@ use crate::{
     error::{EcError, EcResult},
     threadpool::Worker,
 };
+use ark_ff::{AdditiveGroup, BigInteger};
 
 /// On the GPU, the exponents are split into windows, this is the maximum number of such windows.
 const MAX_WINDOW_SIZE: usize = 10;
@@ -45,7 +44,7 @@ const fn work_units(compute_units: u32, compute_capabilities: Option<(u32, u32)>
 /// Multiexp kernel for a single GPU.
 pub struct SingleMultiexpKernel<'a, G>
 where
-    G: PrimeCurveAffine,
+    G: ark_ec::AffineRepr,
 {
     program: Program,
     /// The number of exponentiations the GPU can handle in a single execution of the kernel.
@@ -58,18 +57,17 @@ where
     /// [`EcError::Aborted`].
     maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 
-    _phantom: std::marker::PhantomData<G::Scalar>,
+    _phantom: std::marker::PhantomData<G::ScalarField>,
 }
 
 /// Calculates the maximum number of terms that can be put onto the GPU memory.
 fn calc_chunk_size<G>(mem: u64, work_units: usize) -> usize
 where
-    G: PrimeCurveAffine,
-    G::Scalar: PrimeField,
+    G: ark_ec::AffineRepr,
 {
     let aff_size = std::mem::size_of::<G>();
-    let exp_size = exp_size::<G::Scalar>();
-    let proj_size = std::mem::size_of::<G::Curve>();
+    let exp_size = exp_size::<G::ScalarField>();
+    let proj_size = std::mem::size_of::<G::Group>();
 
     // Leave `MEMORY_PADDING` percent of the memory free.
     let max_memory = ((mem as f64) * (1f64 - MEMORY_PADDING)) as usize;
@@ -88,13 +86,24 @@ where
 /// The size of the exponent in bytes.
 ///
 /// It's the actual bytes size it needs in memory, not it's theoretical bit size.
-fn exp_size<F: PrimeField>() -> usize {
-    std::mem::size_of::<F::Repr>()
+fn exp_size<F: ark_ff::PrimeField>() -> usize {
+    std::mem::size_of::<F::BigInt>()
+}
+
+/// GPU-compatible representation of an affine point.
+/// Coordinates are stored as 32-byte little-endian field elements in Montgomery form.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct G1AffineM {
+    /// X coordinate as 32 bytes in little-endian Montgomery form
+    pub x: [u8; 32],
+    /// Y coordinate as 32 bytes in little-endian Montgomery form
+    pub y: [u8; 32],
 }
 
 impl<'a, G> SingleMultiexpKernel<'a, G>
 where
-    G: PrimeCurveAffine + GpuName,
+    G: ark_ec::AffineRepr + GpuName,
 {
     /// Create a new Multiexp kernel instance for a device.
     ///
@@ -127,10 +136,21 @@ where
     /// running on.
     pub fn multiexp(
         &self,
-        bases: &[G],
-        exponents: &[<G::Scalar as PrimeField>::Repr],
-    ) -> EcResult<G::Curve> {
+        bases: &[G1AffineM],
+        exponents: &[<G::ScalarField as ark_ff::PrimeField>::BigInt],
+    ) -> EcResult<G::Group> {
         assert_eq!(bases.len(), exponents.len());
+
+        let exponents: Vec<_> = exponents
+            .iter()
+            .map(|b| {
+                let mut out = [0u8; 32];
+                let le = b.to_bytes_le();
+                out[..le.len()].copy_from_slice(&le);
+
+                out
+            })
+            .collect();
 
         if let Some(maybe_abort) = &self.maybe_abort {
             if maybe_abort() {
@@ -147,15 +167,15 @@ where
         // be `num_groups` * `num_windows` threads in total.
         // Each thread will use `num_groups` * `num_windows` * `bucket_len` buckets.
 
-        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Curve>> {
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
             let base_buffer = program.create_buffer_from_slice(bases)?;
-            let exp_buffer = program.create_buffer_from_slice(exponents)?;
+            let exp_buffer = program.create_buffer_from_slice(&exponents)?;
 
             // It is safe as the GPU will initialize that buffer
             let bucket_buffer =
-                unsafe { program.create_buffer::<G::Curve>(self.work_units * bucket_len)? };
+                unsafe { program.create_buffer::<G::Group>(self.work_units * bucket_len)? };
             // It is safe as the GPU will initialize that buffer
-            let result_buffer = unsafe { program.create_buffer::<G::Curve>(self.work_units)? };
+            let result_buffer = unsafe { program.create_buffer::<G::Group>(self.work_units)? };
 
             // The global work size follows CUDA's definition and is the number of
             // `LOCAL_WORK_SIZE` sized thread groups.
@@ -175,7 +195,7 @@ where
                 .arg(&(window_size as u32))
                 .run()?;
 
-            let mut results = vec![G::Curve::identity(); self.work_units];
+            let mut results = vec![<G::Group as AdditiveGroup>::ZERO; self.work_units];
             program.read_into_buffer(&result_buffer, &mut results)?;
 
             Ok(results)
@@ -185,9 +205,9 @@ where
 
         // Using the algorithm below, we can calculate the final result by accumulating the results
         // of those `NUM_GROUPS` * `NUM_WINDOWS` threads.
-        let mut acc = G::Curve::identity();
+        let mut acc = <G::Group as AdditiveGroup>::ZERO;
         let mut bits = 0;
-        let exp_bits = exp_size::<G::Scalar>() * 8;
+        let exp_bits = exp_size::<G::ScalarField>() * 8;
         for i in 0..num_windows {
             let w = std::cmp::min(window_size, exp_bits - bits);
             for _ in 0..w {
@@ -219,14 +239,14 @@ where
 /// A struct that contains several multiexp kernels for different devices.
 pub struct MultiexpKernel<'a, G>
 where
-    G: PrimeCurveAffine,
+    G: ark_ec::AffineRepr,
 {
     kernels: Vec<SingleMultiexpKernel<'a, G>>,
 }
 
 impl<'a, G> MultiexpKernel<'a, G>
 where
-    G: PrimeCurveAffine + GpuName,
+    G: ark_ec::AffineRepr + GpuName,
 {
     /// Create new kernels, one for each given device.
     pub fn create(programs: Vec<Program>, devices: &[&Device]) -> EcResult<Self> {
@@ -288,9 +308,9 @@ where
     pub fn parallel_multiexp<'s>(
         &'s mut self,
         scope: &Scope<'s>,
-        bases: &'s [G],
-        exps: &'s [<G::Scalar as PrimeField>::Repr],
-        results: &'s mut [G::Curve],
+        bases: &'s [G1AffineM],
+        exps: &'s [<G::ScalarField as ark_ff::PrimeField>::BigInt],
+        results: &'s mut [G::Group],
         error: Arc<RwLock<EcResult<()>>>,
     ) {
         let num_devices = self.kernels.len();
@@ -309,7 +329,7 @@ where
         {
             let error = error.clone();
             scope.execute(move || {
-                let mut acc = G::Curve::identity();
+                let mut acc = <G::Group as AdditiveGroup>::ZERO;
                 for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
                     if error.read().unwrap().is_err() {
                         break;
@@ -335,10 +355,10 @@ where
     pub fn multiexp(
         &mut self,
         pool: &Worker,
-        bases_arc: Arc<Vec<G>>,
-        exps: Arc<Vec<<G::Scalar as PrimeField>::Repr>>,
+        bases_arc: Arc<Vec<G1AffineM>>,
+        exps: Arc<Vec<<G::ScalarField as ark_ff::PrimeField>::BigInt>>,
         skip: usize,
-    ) -> EcResult<G::Curve> {
+    ) -> EcResult<G::Group> {
         // Bases are skipped by `self.1` elements, when converted from (Arc<Vec<G>>, usize) to Source
         // https://github.com/zkcrypto/bellman/blob/10c5010fd9c2ca69442dc9775ea271e286e776d8/src/multiexp.rs#L38
         let bases = &bases_arc[skip..(skip + exps.len())];
@@ -348,7 +368,7 @@ where
         let error = Arc::new(RwLock::new(Ok(())));
 
         pool.scoped(|s| {
-            results = vec![G::Curve::identity(); self.kernels.len()];
+            results = vec![<G::Group as AdditiveGroup>::ZERO; self.kernels.len()];
             self.parallel_multiexp(s, bases, exps, &mut results, error.clone());
         });
 
@@ -357,7 +377,7 @@ where
             .into_inner()
             .unwrap()?;
 
-        let mut acc = G::Curve::identity();
+        let mut acc = <G::Group as AdditiveGroup>::ZERO;
         for r in results {
             acc.add_assign(&r);
         }

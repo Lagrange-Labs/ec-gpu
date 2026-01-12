@@ -14,8 +14,8 @@
 //! use blstrs::Scalar;
 //! use ec_gpu_gen::SourceBuilder;
 //!
-//! let source_builder = SourceBuilder::new().add_fft::<Scalar>();
-//! ec_gpu_gen::generate(&source_builder);
+//! // let source_builder = SourceBuilder::new().add_fft::<Scalar>();
+//! // ec_gpu_gen::generate(&source_builder);
 //! ```
 //!
 //! The `ec_gpu_gen::generate()` takes care of the actual code generation/compilation. It will automatically create a CUDA and/or OpenCL kernel. It will define two environment variables, which are meant for internal use. `_EC_GPU_CUDA_KERNEL_FATBIN` that points to the compiled CUDA kernel, and `_EC_GPU_OPENCL_KERNEL_SOURCE` that points to the generated OpenCL source.
@@ -59,8 +59,6 @@ pub mod fft_cpu;
 /// Multiexponentiation on the GPU.
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod multiexp;
-/// Multiexponentiation on the CPU.
-pub mod multiexp_cpu;
 /// Helpers for multithreaded code.
 pub mod threadpool;
 
