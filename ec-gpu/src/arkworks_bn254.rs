@@ -1,7 +1,11 @@
-use ark_bn254::{Fq, Fq2, FqConfig, Fr, FrConfig, G1Affine};
+use ark_bn254::{Fq, Fq2, FqConfig, Fr, FrConfig};
+use ark_ec::short_weierstrass::Affine;
 use ark_ff::{BigInteger, MontConfig};
 
 use crate::{GpuField, GpuName};
+
+pub type G1Affine = Affine<ark_bn254::g1::Config>;
+pub type G2Affine = Affine<ark_bn254::g2::Config>;
 
 fn bytes_le_to_u32_limbs(mut bytes: Vec<u8>) -> Vec<u32> {
     // Pad to multiple of 4 bytes
@@ -91,6 +95,12 @@ impl GpuField for Fr {
 }
 
 impl GpuName for G1Affine {
+    fn name() -> String {
+        crate::name!()
+    }
+}
+
+impl GpuName for G2Affine {
     fn name() -> String {
         crate::name!()
     }

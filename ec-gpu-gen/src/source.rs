@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::{env, fs};
 
 use ec_gpu::{GpuField, GpuName};
-use group::prime::PrimeCurveAffine;
 
 static COMMON_SRC: &str = include_str!("cl/common.cl");
 static FIELD_SRC: &str = include_str!("cl/field.cl");
@@ -194,15 +193,12 @@ impl<P: GpuName, F: GpuName, Exp: GpuName> NameAndSource for Multiexp<P, F, Exp>
 ///
 /// # Example
 ///
-/// ```
-/// use blstrs::{Fp, Fp2, G1Affine, G2Affine, Scalar};
+/// ```ignore
+/// use ark_bn254::Fr;
 /// use ec_gpu_gen::SourceBuilder;
 ///
-/// # #[cfg(any(feature = "cuda", feature = "opencl"))]
 /// let source = SourceBuilder::new()
-///     // .add_fft::<Scalar>()
-///     // .add_multiexp::<G1Affine, Fp>()
-///     // .add_multiexp::<G2Affine, Fp2>()
+///     .add_fft::<Fr>()
 ///     .build_32_bit_limbs();
 ///```
 // In the `HashSet`s the concrete types cannot be used, as each item of the set should be able to
@@ -264,29 +260,11 @@ impl SourceBuilder {
         config
     }
 
-    /// Add an Multiexp kernel function to the configuration.
+    /// Add a Multiexp kernel function to the configuration.
     ///
-    /// The field must be given explicitly as currently it cannot derived from the curve point
-    /// directly.
-    pub fn add_multiexp<C, F>(self) -> Self
-    where
-        C: PrimeCurveAffine + GpuName,
-        C::Scalar: GpuField,
-        F: GpuField + 'static,
-    {
-        let mut config = self.add_field::<F>().add_field::<C::Scalar>();
-        let multiexp = Multiexp::<C, F, C::Scalar>::new();
-        config.multiexps.insert(Box::new(multiexp));
-        config
-    }
-
-    /// Add a Multiexp kernel function to the configuration (for arkworks curves).
-    ///
-    /// This version uses arkworks traits instead of the group crate traits.
-    /// The field must be given explicitly as it currently cannot be derived from the curve point
-    /// directly.
-    #[cfg(feature = "arkworks")]
-    pub fn add_multiexp_ark<C, F, S>(self) -> Self
+    /// The field and scalar types must be given explicitly as they currently cannot be derived
+    /// from the curve point directly.
+    pub fn add_multiexp<C, F, S>(self) -> Self
     where
         C: GpuName + 'static,
         S: GpuField + 'static,

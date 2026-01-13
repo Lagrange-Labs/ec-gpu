@@ -4,29 +4,35 @@
 //!
 //! There is also support for Fast Fourier Transform and Multiexponentiation.
 //!
-//! This crate usually creates GPU kernels at compile-time. CUDA generates a [fatbin], which OpenCL only generates the source code, which is then compiled at run-time.
+//! This crate usually creates GPU kernels at compile-time. CUDA generates a [fatbin], which OpenCL
+//! only generates the source code, which is then compiled at run-time.
 //!
-//! In order to make things easier to use, there are helper functions available. You would put some code into `build.rs`, that generates the kernels, and some code into your library which then consumes those generated kernels. The kernels will be directly embedded into your program/library. If something goes wrong, you will get an error at compile-time.
+//! In order to make things easier to use, there are helper functions available. You would put some
+//! code into `build.rs`, that generates the kernels, and some code into your library which then
+//! consumes those generated kernels. The kernels will be directly embedded into your program/library.
+//! If something goes wrong, you will get an error at compile-time.
 //!
 //! In this example we will make use of the FFT functionality. Add to your `build.rs`:
 //!
 //! ```no_run
-//! use blstrs::Scalar;
+//! use ark_bn254::Fr;
 //! use ec_gpu_gen::SourceBuilder;
 //!
-//! // let source_builder = SourceBuilder::new().add_fft::<Scalar>();
-//! // ec_gpu_gen::generate(&source_builder);
+//! let source_builder = SourceBuilder::new().add_fft::<Fr>();
+//! ec_gpu_gen::generate(&source_builder);
 //! ```
 //!
-//! The `ec_gpu_gen::generate()` takes care of the actual code generation/compilation. It will automatically create a CUDA and/or OpenCL kernel. It will define two environment variables, which are meant for internal use. `_EC_GPU_CUDA_KERNEL_FATBIN` that points to the compiled CUDA kernel, and `_EC_GPU_OPENCL_KERNEL_SOURCE` that points to the generated OpenCL source.
+//! The `ec_gpu_gen::generate()` takes care of the actual code generation/compilation. It will
+//! automatically create a CUDA and/or OpenCL kernel. It will define two environment variables,
+//! which are meant for internal use. `_EC_GPU_CUDA_KERNEL_FATBIN` that points to the compiled
+//! CUDA kernel, and `_EC_GPU_OPENCL_KERNEL_SOURCE` that points to the generated OpenCL source.
 //!
-//! Those variables are then picked up by the `ec_gpu_gen::program!()` macro, which generates a program, for a given GPU device. Using FFT within your library would then look like this:
+//! Those variables are then picked up by the `ec_gpu_gen::program!()` macro, which generates a
+//! program, for a given GPU device. Using FFT within your library would then look like this:
 //!
-//! ```no_compile
-//! use blstrs::Scalar;
-//! use ec_gpu_gen::{
-//!     rust_gpu_tools::Device,
-//! };
+//! ```ignore
+//! use ark_bn254::Fr;
+//! use ec_gpu_gen::{fft::FftKernel, rust_gpu_tools::Device};
 //!
 //! let devices = Device::all();
 //! let programs = devices
@@ -35,7 +41,7 @@
 //!     .collect::<Result<_, _>>()
 //!     .expect("Cannot create programs!");
 //!
-//! let mut kern = FftKernel::<Scalar>::create(programs).expect("Cannot initialize kernel!");
+//! let mut kern = FftKernel::<Fr>::create(programs).expect("Cannot initialize kernel!");
 //! kern.radix_fft_many(&mut [&mut coeffs], &[omega], &[log_d]).expect("GPU FFT failed!");
 //! ```
 //!
@@ -68,3 +74,8 @@ pub use rust_gpu_tools;
 
 pub use error::{EcError, EcResult};
 pub use source::{generate, SourceBuilder};
+
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use multiexp::{G1AffineM, G2AffineM, MultiexpKernel, SingleMultiexpKernel};

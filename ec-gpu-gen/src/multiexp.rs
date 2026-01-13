@@ -93,12 +93,88 @@ fn exp_size<F: ark_ff::PrimeField>() -> usize {
 /// GPU-compatible representation of an affine point.
 /// Coordinates are stored as 32-byte little-endian field elements in Montgomery form.
 #[repr(C)]
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct G1AffineM {
     /// X coordinate as 32 bytes in little-endian Montgomery form
     pub x: [u8; 32],
     /// Y coordinate as 32 bytes in little-endian Montgomery form
     pub y: [u8; 32],
+}
+
+#[cfg(feature = "arkworks")]
+impl From<ark_bn254::G1Affine> for G1AffineM {
+    fn from(p: ark_bn254::G1Affine) -> Self {
+        use ark_ec::AffineRepr;
+        use ark_serialize::CanonicalSerialize;
+
+        if p.is_zero() {
+            return Self::default();
+        }
+
+        let mut x = [0u8; 32];
+        let mut y = [0u8; 32];
+
+        // Serialize directly - arkworks serializes field elements in little-endian
+        p.x.serialize_uncompressed(&mut x[..]).unwrap();
+        p.y.serialize_uncompressed(&mut y[..]).unwrap();
+
+        Self { x, y }
+    }
+}
+
+#[cfg(feature = "arkworks")]
+impl From<&ark_bn254::G1Affine> for G1AffineM {
+    fn from(p: &ark_bn254::G1Affine) -> Self {
+        (*p).into()
+    }
+}
+
+/// GPU-compatible representation of a G2 affine point.
+/// Coordinates are stored as 64-byte little-endian Fq2 elements (each Fq2 = two 32-byte Fq elements).
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct G2AffineM {
+    /// X coordinate as Fq2 (64 bytes: c0 followed by c1)
+    pub x: [u8; 64],
+    /// Y coordinate as Fq2 (64 bytes: c0 followed by c1)
+    pub y: [u8; 64],
+}
+
+impl Default for G2AffineM {
+    fn default() -> Self {
+        Self {
+            x: [0u8; 64],
+            y: [0u8; 64],
+        }
+    }
+}
+
+#[cfg(feature = "arkworks")]
+impl From<ark_bn254::G2Affine> for G2AffineM {
+    fn from(p: ark_bn254::G2Affine) -> Self {
+        use ark_ec::AffineRepr;
+        use ark_serialize::CanonicalSerialize;
+
+        if p.is_zero() {
+            return Self::default();
+        }
+
+        let mut x = [0u8; 64];
+        let mut y = [0u8; 64];
+
+        // Serialize Fq2 elements - each is two Fq elements (c0, c1)
+        p.x.serialize_uncompressed(&mut x[..]).unwrap();
+        p.y.serialize_uncompressed(&mut y[..]).unwrap();
+
+        Self { x, y }
+    }
+}
+
+#[cfg(feature = "arkworks")]
+impl From<&ark_bn254::G2Affine> for G2AffineM {
+    fn from(p: &ark_bn254::G2Affine) -> Self {
+        (*p).into()
+    }
 }
 
 impl<'a, G> SingleMultiexpKernel<'a, G>

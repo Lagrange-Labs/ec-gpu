@@ -8,6 +8,6 @@ fn main() {
 
     let source_builder = SourceBuilder::new()
         .add_fft::<Fr>()
-        .add_multiexp_ark::<G1Affine, Fq, Fr>();
+        .add_multiexp::<G1Affine, Fq, Fr>();
     ec_gpu_gen::generate(&source_builder);
 }

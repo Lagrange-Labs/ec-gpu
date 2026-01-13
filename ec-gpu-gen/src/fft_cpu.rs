@@ -1,4 +1,4 @@
-use ff::PrimeField;
+use ark_ff::FftField;
 
 use crate::threadpool::Worker;
 
@@ -7,7 +7,7 @@ use crate::threadpool::Worker;
 /// The input `a` is mutated and contains the result when this function returns. The length of the
 /// input vector must be `2^log_n`.
 #[allow(clippy::many_single_char_names)]
-pub fn serial_fft<F: PrimeField>(a: &mut [F], omega: &F, log_n: u32) {
+pub fn serial_fft<F: FftField>(a: &mut [F], omega: &F, log_n: u32) {
     fn bitreverse(mut n: u32, l: u32) -> u32 {
         let mut r = 0;
         for _ in 0..l {
@@ -29,7 +29,7 @@ pub fn serial_fft<F: PrimeField>(a: &mut [F], omega: &F, log_n: u32) {
 
     let mut m = 1;
     for _ in 0..log_n {
-        let w_m = omega.pow_vartime([u64::from(n / (2 * m))]);
+        let w_m = omega.pow([u64::from(n / (2 * m))]);
 
         let mut k = 0;
         while k < n {
@@ -56,7 +56,7 @@ pub fn serial_fft<F: PrimeField>(a: &mut [F], omega: &F, log_n: u32) {
 /// The result is written to the input `a`.
 /// The number of threads used will be `2^log_threads`.
 /// There must be more items to process than threads.
-pub fn parallel_fft<F: PrimeField>(
+pub fn parallel_fft<F: FftField>(
     a: &mut [F],
     worker: &Worker,
     omega: &F,
@@ -68,7 +68,7 @@ pub fn parallel_fft<F: PrimeField>(
     let num_threads = 1 << log_threads;
     let log_new_n = log_n - log_threads;
     let mut tmp = vec![vec![F::ZERO; 1 << log_new_n]; num_threads];
-    let new_omega = omega.pow_vartime([num_threads as u64]);
+    let new_omega = omega.pow([num_threads as u64]);
 
     worker.scope(0, |scope, _| {
         let a = &*a;
@@ -76,8 +76,8 @@ pub fn parallel_fft<F: PrimeField>(
         for (j, tmp) in tmp.iter_mut().enumerate() {
             scope.execute(move || {
                 // Shuffle into a sub-FFT
-                let omega_j = omega.pow_vartime([j as u64]);
-                let omega_step = omega.pow_vartime([(j as u64) << log_new_n]);
+                let omega_j = omega.pow([j as u64]);
+                let omega_step = omega.pow([(j as u64) << log_new_n]);
 
                 let mut elt = F::ONE;
                 for (i, tmp) in tmp.iter_mut().enumerate() {
@@ -97,7 +97,6 @@ pub fn parallel_fft<F: PrimeField>(
         }
     });
 
-    // TODO: does this hurt or help?
     worker.scope(a.len(), |scope, chunk| {
         let tmp = &tmp;
 
@@ -120,15 +119,13 @@ mod tests {
 
     use std::cmp::min;
 
-    use blstrs::Scalar as Fr;
-    use ff::PrimeField;
-    use rand_core::RngCore;
+    use ark_bn254::Fr;
+    use ark_ff::UniformRand;
 
-    fn omega<F: PrimeField>(num_coeffs: usize) -> F {
-        // Compute omega, the 2^exp primitive root of unity
+    fn omega<F: FftField>(num_coeffs: usize) -> F {
         let exp = (num_coeffs as f32).log2().floor() as u32;
-        let mut omega = F::ROOT_OF_UNITY;
-        for _ in exp..F::S {
+        let mut omega = F::TWO_ADIC_ROOT_OF_UNITY;
+        for _ in exp..F::TWO_ADICITY {
             omega = omega.square();
         }
         omega
@@ -136,30 +133,24 @@ mod tests {
 
     #[test]
     fn parallel_fft_consistency() {
-        fn test_consistency<F: PrimeField, R: RngCore>(rng: &mut R) {
-            let worker = Worker::new();
+        let worker = Worker::new();
+        let mut rng = rand::thread_rng();
 
-            for _ in 0..5 {
-                for log_d in 0..10 {
-                    let d = 1 << log_d;
+        for _ in 0..5 {
+            for log_d in 0..10 {
+                let d = 1 << log_d;
 
-                    let mut v1_coeffs = (0..d).map(|_| F::random(&mut *rng)).collect::<Vec<_>>();
-                    let mut v2_coeffs = v1_coeffs.clone();
-                    let v1_omega = omega::<F>(v1_coeffs.len());
-                    let v2_omega = v1_omega;
+                let mut v1_coeffs = (0..d).map(|_| Fr::rand(&mut rng)).collect::<Vec<_>>();
+                let mut v2_coeffs = v1_coeffs.clone();
+                let fft_omega = omega::<Fr>(v1_coeffs.len());
 
-                    for log_threads in log_d..min(log_d + 1, 3) {
-                        parallel_fft::<F>(&mut v1_coeffs, &worker, &v1_omega, log_d, log_threads);
-                        serial_fft::<F>(&mut v2_coeffs, &v2_omega, log_d);
+                for log_threads in log_d..min(log_d + 1, 3) {
+                    parallel_fft::<Fr>(&mut v1_coeffs, &worker, &fft_omega, log_d, log_threads);
+                    serial_fft::<Fr>(&mut v2_coeffs, &fft_omega, log_d);
 
-                        assert!(v1_coeffs == v2_coeffs);
-                    }
+                    assert!(v1_coeffs == v2_coeffs);
                 }
             }
         }
-
-        let rng = &mut rand::thread_rng();
-
-        test_consistency::<Fr, _>(rng);
     }
 }

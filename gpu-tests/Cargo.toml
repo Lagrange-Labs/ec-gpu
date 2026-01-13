@@ -1,6 +1,3 @@
-# NOTE vmx 2022-07-07: Using the `__private_bench` feature of `blstrs` is just temporarily until
-# https://github.com/zkcrypto/group/pull/29 is fixed. Then we won't need the exports of `Fp` and
-# `Fp2` any more.
 [package]
 name = "gpu-tests"
 version = "0.1.0"
@@ -12,30 +9,26 @@ license = "MIT/Apache-2.0"
 publish = false
 
 [dev-dependencies]
-blstrs = { version = "0.7.0", features = ["__private_bench"] }
 criterion = "0.4"
 ec-gpu = { workspace = true, features = ["arkworks"] }
 ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false, features = ["arkworks"] }
-ff = { version = "0.13.0", default-features = false }
 fil_logger = "0.1.6"
-group = "0.13.0"
-pairing = "0.23.0"
 rand = "0.8"
 rayon = "1.5.3"
 ark-ff = "0.5.0"
 ark-ec = "0.5.0"
 ark-bn254 = "0.5.0"
+ark-std = "0.5.0"
 
 [build-dependencies]
-blstrs = { version = "0.7.0", features = ["__private_bench"] }
 ark-bn254 = { version = "0.5.0" }
 ec-gpu = { path = "../ec-gpu", features = ["arkworks"] }
 ec-gpu-gen = { path = "../ec-gpu-gen", features = ["arkworks"] }
 
 [features]
 default = ["cuda", "opencl"]
-cuda = ["blstrs/gpu", "ec-gpu-gen/cuda"]
-opencl = ["blstrs/gpu", "ec-gpu-gen/opencl"]
+cuda = ["ec-gpu-gen/cuda"]
+opencl = ["ec-gpu-gen/opencl"]
 
 [[bench]]
 name = "multiexp"
