@@ -78,4 +78,4 @@ pub use source::{generate, SourceBuilder};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
-pub use multiexp::{G1AffineM, G2AffineM, MultiexpKernel, SingleMultiexpKernel};
+pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel};

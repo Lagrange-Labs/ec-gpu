@@ -1,6 +1,8 @@
 use std::ops::AddAssign;
 use std::sync::{Arc, RwLock};
 
+use ark_ec::CurveGroup;
+use ark_ff::{AdditiveGroup, BigInteger, PrimeField};
 use ec_gpu::GpuName;
 use log::{error, info};
 use rust_gpu_tools::{program_closures, Device, Program};
@@ -10,7 +12,19 @@ use crate::{
     error::{EcError, EcResult},
     threadpool::Worker,
 };
-use ark_ff::{AdditiveGroup, BigInteger};
+
+/// Trait for curve affine points that have a GPU-compatible representation.
+pub trait GpuAffine: GpuName + Clone + Send + Sync + Sized {
+    /// The GPU-compatible representation type.
+    type GpuRepr: Copy + Clone + Default + Send + Sync;
+    /// The scalar field type.
+    type ScalarField: PrimeField;
+    /// The projective group type.
+    type Group: CurveGroup<ScalarField = Self::ScalarField> + AddAssign;
+
+    /// Convert the affine point to its GPU representation.
+    fn to_gpu(&self) -> Self::GpuRepr;
+}
 
 /// On the GPU, the exponents are split into windows, this is the maximum number of such windows.
 const MAX_WINDOW_SIZE: usize = 10;
@@ -44,7 +58,7 @@ const fn work_units(compute_units: u32, compute_capabilities: Option<(u32, u32)>
 /// Multiexp kernel for a single GPU.
 pub struct SingleMultiexpKernel<'a, G>
 where
-    G: ark_ec::AffineRepr,
+    G: GpuAffine,
 {
     program: Program,
     /// The number of exponentiations the GPU can handle in a single execution of the kernel.
@@ -57,15 +71,15 @@ where
     /// [`EcError::Aborted`].
     maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
 
-    _phantom: std::marker::PhantomData<G::ScalarField>,
+    _phantom: std::marker::PhantomData<G>,
 }
 
 /// Calculates the maximum number of terms that can be put onto the GPU memory.
 fn calc_chunk_size<G>(mem: u64, work_units: usize) -> usize
 where
-    G: ark_ec::AffineRepr,
+    G: GpuAffine,
 {
-    let aff_size = std::mem::size_of::<G>();
+    let aff_size = std::mem::size_of::<G::GpuRepr>();
     let exp_size = exp_size::<G::ScalarField>();
     let proj_size = std::mem::size_of::<G::Group>();
 
@@ -122,23 +136,30 @@ pub struct G1AffineM {
 }
 
 #[cfg(feature = "arkworks")]
+fn fq_to_montgomery_bytes(f: &ark_bn254::Fq) -> [u8; 32] {
+    // Arkworks stores Fq as 4 u64 limbs in Montgomery form
+    // We need the raw Montgomery representation, not the serialized (standard) form
+    let limbs: [u64; 4] = unsafe { std::mem::transmute_copy(f) };
+    let mut out = [0u8; 32];
+    for (i, limb) in limbs.iter().enumerate() {
+        out[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
+    }
+    out
+}
+
+#[cfg(feature = "arkworks")]
 impl From<ark_bn254::G1Affine> for G1AffineM {
     fn from(p: ark_bn254::G1Affine) -> Self {
         use ark_ec::AffineRepr;
-        use ark_serialize::CanonicalSerialize;
 
         if p.is_zero() {
             return Self::default();
         }
 
-        let mut x = [0u8; 32];
-        let mut y = [0u8; 32];
-
-        // Serialize directly - arkworks serializes field elements in little-endian
-        p.x.serialize_uncompressed(&mut x[..]).unwrap();
-        p.y.serialize_uncompressed(&mut y[..]).unwrap();
-
-        Self { x, y }
+        Self {
+            x: fq_to_montgomery_bytes(&p.x),
+            y: fq_to_montgomery_bytes(&p.y),
+        }
     }
 }
 
@@ -170,23 +191,26 @@ impl Default for G2AffineM {
 }
 
 #[cfg(feature = "arkworks")]
+fn fq2_to_montgomery_bytes(f: &ark_bn254::Fq2) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&fq_to_montgomery_bytes(&f.c0));
+    out[32..].copy_from_slice(&fq_to_montgomery_bytes(&f.c1));
+    out
+}
+
+#[cfg(feature = "arkworks")]
 impl From<ark_bn254::G2Affine> for G2AffineM {
     fn from(p: ark_bn254::G2Affine) -> Self {
         use ark_ec::AffineRepr;
-        use ark_serialize::CanonicalSerialize;
 
         if p.is_zero() {
             return Self::default();
         }
 
-        let mut x = [0u8; 64];
-        let mut y = [0u8; 64];
-
-        // Serialize Fq2 elements - each is two Fq elements (c0, c1)
-        p.x.serialize_uncompressed(&mut x[..]).unwrap();
-        p.y.serialize_uncompressed(&mut y[..]).unwrap();
-
-        Self { x, y }
+        Self {
+            x: fq2_to_montgomery_bytes(&p.x),
+            y: fq2_to_montgomery_bytes(&p.y),
+        }
     }
 }
 
@@ -197,9 +221,31 @@ impl From<&ark_bn254::G2Affine> for G2AffineM {
     }
 }
 
+#[cfg(feature = "arkworks")]
+impl GpuAffine for ec_gpu::arkworks_bn254::G1Affine {
+    type GpuRepr = G1AffineM;
+    type ScalarField = ark_bn254::Fr;
+    type Group = ark_bn254::G1Projective;
+
+    fn to_gpu(&self) -> G1AffineM {
+        self.0.into()
+    }
+}
+
+#[cfg(feature = "arkworks")]
+impl GpuAffine for ec_gpu::arkworks_bn254::G2Affine {
+    type GpuRepr = G2AffineM;
+    type ScalarField = ark_bn254::Fr;
+    type Group = ark_bn254::G2Projective;
+
+    fn to_gpu(&self) -> G2AffineM {
+        self.0.into()
+    }
+}
+
 impl<'a, G> SingleMultiexpKernel<'a, G>
 where
-    G: ark_ec::AffineRepr + GpuName,
+    G: GpuAffine,
 {
     /// Create a new Multiexp kernel instance for a device.
     ///
@@ -232,7 +278,7 @@ where
     /// running on.
     pub fn multiexp(
         &self,
-        bases: &[G1AffineM],
+        bases: &[G::GpuRepr],
         exponents: &[<G::ScalarField as ark_ff::PrimeField>::BigInt],
     ) -> EcResult<G::Group> {
         assert_eq!(bases.len(), exponents.len());
@@ -339,14 +385,14 @@ where
 /// A struct that contains several multiexp kernels for different devices.
 pub struct MultiexpKernel<'a, G>
 where
-    G: ark_ec::AffineRepr,
+    G: GpuAffine,
 {
     kernels: Vec<SingleMultiexpKernel<'a, G>>,
 }
 
 impl<'a, G> MultiexpKernel<'a, G>
 where
-    G: ark_ec::AffineRepr + GpuName,
+    G: GpuAffine,
 {
     /// Create new kernels, one for each given device.
     pub fn create(programs: Vec<Program>, devices: &[&Device]) -> EcResult<Self> {
@@ -408,7 +454,7 @@ where
     pub fn parallel_multiexp<'s>(
         &'s mut self,
         scope: &Scope<'s>,
-        bases: &'s [G1AffineM],
+        bases: &'s [G::GpuRepr],
         exps: &'s [<G::ScalarField as ark_ff::PrimeField>::BigInt],
         results: &'s mut [G::Group],
         error: Arc<RwLock<EcResult<()>>>,
@@ -455,7 +501,7 @@ where
     pub fn multiexp(
         &mut self,
         pool: &Worker,
-        bases_arc: Arc<Vec<G1AffineM>>,
+        bases_arc: Arc<Vec<G::GpuRepr>>,
         exps: Arc<Vec<<G::ScalarField as ark_ff::PrimeField>::BigInt>>,
         skip: usize,
     ) -> EcResult<G::Group> {

@@ -3,16 +3,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ark_bn254::{Fq, Fr, G1Affine, G1Projective};
-use ark_ec::{AffineRepr, CurveGroup, VariableBaseMSM};
-use ark_ff::PrimeField;
-use ec_gpu_gen::multiexp::G1AffineM;
+use ark_bn254::Fr;
+use ark_ec::{CurveGroup, VariableBaseMSM};
+use ark_ff::{PrimeField, UniformRand};
+use ec_gpu::arkworks_bn254::{G1Affine, G2Affine};
+use ec_gpu_gen::multiexp::GpuAffine;
 use ec_gpu_gen::{
     multiexp::MultiexpKernel, program, rust_gpu_tools::Device, threadpool::Worker, EcError,
 };
 
 pub trait QueryDensity: Sized {
-    /// Returns whether the base exists.
     type Iter: Iterator<Item = bool>;
 
     fn iter(self) -> Self::Iter;
@@ -45,37 +45,57 @@ impl QueryDensity for &FullDensity {
     }
 }
 
-fn multiexp_gpu<Q, D>(
+fn multiexp_gpu<G, Q, D>(
     pool: &Worker,
-    bases: Arc<Vec<G1Affine>>,
+    bases: Arc<Vec<G>>,
     density_map: D,
     exponents: Arc<Vec<Fr>>,
-    kern: &mut MultiexpKernel<G1Affine>,
-) -> Result<G1Projective, EcError>
+    kern: &mut MultiexpKernel<G>,
+) -> Result<G::Group, EcError>
 where
+    G: GpuAffine<ScalarField = Fr>,
     for<'a> &'a Q: QueryDensity,
     D: Send + Sync + 'static + Clone + AsRef<Q>,
 {
-    let bases_gpu: Vec<G1AffineM> = bases
-        .iter()
-        .map(|affine| {
-            let (x, y) = g1_xy_bytes_le(affine).expect("point not at infinity");
-            G1AffineM { x, y }
-        })
-        .collect();
-
+    let bases_gpu: Vec<G::GpuRepr> = bases.iter().map(|affine| affine.to_gpu()).collect();
     let exps_bigint: Arc<Vec<_>> = Arc::new(exponents.iter().map(|e| e.into_bigint()).collect());
-
     let exps = density_map.as_ref().generate_exps::<Fr>(exps_bigint);
-
     kern.multiexp(pool, Arc::new(bases_gpu), exps, 0)
 }
 
-#[test]
-fn gpu_multiexp_consistency() {
+/// Trait to bridge our newtype wrappers with arkworks types for testing
+trait TestableAffine: GpuAffine<ScalarField = Fr> + From<Self::ArkAffine> {
+    type ArkAffine: ark_ec::AffineRepr<ScalarField = Fr> + Copy;
+    type ArkProjective: CurveGroup<Affine = Self::ArkAffine, ScalarField = Fr> + UniformRand;
+
+    fn group_name() -> &'static str;
+}
+
+impl TestableAffine for G1Affine {
+    type ArkAffine = ark_bn254::G1Affine;
+    type ArkProjective = ark_bn254::G1Projective;
+
+    fn group_name() -> &'static str {
+        "G1"
+    }
+}
+
+impl TestableAffine for G2Affine {
+    type ArkAffine = ark_bn254::G2Affine;
+    type ArkProjective = ark_bn254::G2Projective;
+
+    fn group_name() -> &'static str {
+        "G2"
+    }
+}
+
+fn gpu_multiexp_consistency_test<G>(start_log_d: usize, max_log_d: usize)
+where
+    G: TestableAffine,
+    G::Group: PartialEq<G::ArkProjective>,
+{
     fil_logger::maybe_init();
-    const MAX_LOG_D: usize = 25;
-    const START_LOG_D: usize = 20;
+
     let devices = Device::all();
     let programs = devices
         .iter()
@@ -83,63 +103,63 @@ fn gpu_multiexp_consistency() {
         .collect::<Result<_, _>>()
         .expect("Cannot create programs!");
     let mut kern =
-        MultiexpKernel::<G1Affine>::create(programs, &devices).expect("Cannot initialize kernel!");
+        MultiexpKernel::<G>::create(programs, &devices).expect("Cannot initialize kernel!");
     let pool = Worker::new();
 
     let mut rng = rand::thread_rng();
 
-    use ark_ff::UniformRand;
+    let mut bases_ark: Vec<G::ArkAffine> = (0..(1 << start_log_d))
+        .map(|_| G::ArkProjective::rand(&mut rng).into_affine())
+        .collect();
 
-    let mut bases = (0..(1 << START_LOG_D))
-        .map(|_| G1Projective::rand(&mut rng).into_affine())
-        .collect::<Vec<_>>();
-
-    for log_d in START_LOG_D..=MAX_LOG_D {
-        let g = Arc::new(bases.clone());
+    for log_d in start_log_d..=max_log_d {
+        let bases: Vec<G> = bases_ark.iter().map(|p| G::from(*p)).collect();
+        let g = Arc::new(bases);
 
         let samples = 1 << log_d;
-        println!("Testing Multiexp for {} elements...", samples);
+        println!(
+            "Testing {} Multiexp for {} elements...",
+            G::group_name(),
+            samples
+        );
 
-        let v: Vec<_> = (0..samples).map(|_| Fr::rand(&mut rng)).collect::<Vec<_>>();
-        let v_arc: Arc<Vec<_>> = Arc::new(v.clone());
+        let v: Vec<Fr> = (0..samples).map(|_| Fr::rand(&mut rng)).collect();
+        let v_arc = Arc::new(v.clone());
 
         let mut now = Instant::now();
-        let gpu: G1Projective =
-            multiexp_gpu(&pool, g.clone(), FullDensity, v_arc.clone(), &mut kern).unwrap();
+        let gpu = multiexp_gpu(&pool, g.clone(), FullDensity, v_arc.clone(), &mut kern).unwrap();
         let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
-
         println!("GPU took {}ms.", gpu_dur);
 
         now = Instant::now();
-        let cpu: G1Projective = VariableBaseMSM::msm(bases.as_slice(), v.as_slice()).unwrap();
-
+        let cpu: G::ArkProjective =
+            VariableBaseMSM::msm(bases_ark.as_slice(), v.as_slice()).unwrap();
         let cpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
         println!("CPU took {}ms.", cpu_dur);
 
         println!("Speedup: x{}", cpu_dur as f32 / gpu_dur as f32);
 
-        assert_eq!(cpu, gpu);
+        assert_eq!(
+            gpu,
+            cpu,
+            "GPU and CPU results differ for {} MSM",
+            G::group_name()
+        );
 
         println!("============================");
 
-        bases = [bases.clone(), bases.clone()].concat();
+        bases_ark = [bases_ark.clone(), bases_ark.clone()].concat();
     }
 }
 
-fn fq_to_32_le(x: &Fq) -> [u8; 32] {
-    // Arkworks stores Fq as 4 u64 limbs in Montgomery form
-    let limbs = unsafe { std::mem::transmute::<Fq, [u64; 4]>(*x) };
-
-    let mut out = [0u8; 32];
-    for (i, limb) in limbs.iter().enumerate() {
-        let bytes = limb.to_le_bytes();
-        out[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-    }
-    out
+#[test]
+fn gpu_multiexp_g1_consistency() {
+    gpu_multiexp_consistency_test::<G1Affine>(10, 16);
 }
 
-fn g1_xy_bytes_le(p: &G1Affine) -> Option<([u8; 32], [u8; 32])> {
-    p.xy().map(|(x, y)| (fq_to_32_le(&x), fq_to_32_le(&y)))
+#[test]
+fn gpu_multiexp_g2_consistency() {
+    gpu_multiexp_consistency_test::<G2Affine>(10, 16);
 }
 
 /// Test that the small scalar optimization works correctly.
