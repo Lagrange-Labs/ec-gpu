@@ -375,3 +375,17 @@ DEVICE uint FIELD_get_bits(FIELD l, uint skip, uint window) {
   }
   return ret;
 }
+
+// Get `i`th bit (From least significant digit) of the field.
+DEVICE bool FIELD_get_bit_lsb(FIELD l, uint i) {
+  return (l.val[i / FIELD_LIMB_BITS] >> (i % FIELD_LIMB_BITS)) & 1;
+}
+
+// Get `window` consecutive bits, (Starting from `skip`th bit from LSB) from the field.
+DEVICE uint FIELD_get_bits_lsb(FIELD l, uint skip, uint window) {
+  uint ret = 0;
+  for(uint i = 0; i < window; i++) {
+    ret |= ((uint)FIELD_get_bit_lsb(l, skip + i)) << i;
+  }
+  return ret;
+}
