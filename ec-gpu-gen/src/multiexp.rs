@@ -30,28 +30,6 @@ const fn div_ceil(a: usize, b: usize) -> usize {
     }
 }
 
-/// Computes the maximum number of significant bits across all scalar byte arrays.
-/// Returns the position of the highest set bit + 1, or 1 if all scalars are zero.
-/// This enables the small scalar optimization: when scalars use fewer bits than
-/// the full field capacity, we can skip processing the upper zero windows.
-fn compute_max_scalar_bits(scalars: &[[u8; 32]]) -> usize {
-    let max_bits = scalars
-        .iter()
-        .map(|bytes| {
-            // Scan from MSB to find highest non-zero byte
-            for (i, &byte) in bytes.iter().enumerate().rev() {
-                if byte != 0 {
-                    return (i + 1) * 8 - byte.leading_zeros() as usize;
-                }
-            }
-            0
-        })
-        .max()
-        .unwrap_or(0);
-    // Ensure at least 1 to avoid edge cases with zero scalars
-    max_bits.max(1)
-}
-
 /// The number of units the work is split into. One unit will result in one CUDA thread.
 ///
 /// Based on empirical results, it turns out that on Nvidia devices with the Ampere architecture,
@@ -110,6 +88,26 @@ where
 /// It's the actual bytes size it needs in memory, not it's theoretical bit size.
 fn exp_size<F: ark_ff::PrimeField>() -> usize {
     std::mem::size_of::<F::BigInt>()
+}
+
+/// Computes the maximum number of significant bits across all scalar byte arrays.
+/// Returns the position of the highest set bit + 1, or 1 if all scalars are zero.
+fn compute_max_scalar_bits(scalars: &[[u8; 32]]) -> usize {
+    let max_bits = scalars
+        .iter()
+        .map(|bytes| {
+            // Scan from MSB to find highest non-zero byte
+            for (i, &byte) in bytes.iter().enumerate().rev() {
+                if byte != 0 {
+                    return (i + 1) * 8 - byte.leading_zeros() as usize;
+                }
+            }
+            0
+        })
+        .max()
+        .unwrap_or(0);
+    // Ensure at least 1 to avoid edge cases
+    max_bits.max(1)
 }
 
 /// GPU-compatible representation of an affine point.
@@ -250,16 +248,17 @@ where
             })
             .collect();
 
-        // Small scalar optimization: compute actual bit length needed
-        let effective_bits = compute_max_scalar_bits(&exponents);
-
         if let Some(maybe_abort) = &self.maybe_abort {
             if maybe_abort() {
                 return Err(EcError::Aborted);
             }
         }
+
+        // Compute actual bit length needed for small scalar optimization
+        let effective_bits = compute_max_scalar_bits(&exponents);
+
         let window_size = self.calc_window_size(bases.len());
-        // Use effective_bits instead of full field size for small scalar optimization
+        // windows_size * num_windows needs to be >= effective_bits to cover all scalar bits.
         let num_windows = div_ceil(effective_bits, window_size);
         let num_groups = self.work_units / num_windows;
         let bucket_len = 1 << window_size;
@@ -306,19 +305,18 @@ where
 
         // Using the algorithm below, we can calculate the final result by accumulating the results
         // of those `NUM_GROUPS` * `NUM_WINDOWS` threads.
+        // Since we use LSB-first bit extraction, window 0 contains the LSB and window (num_windows-1)
+        // contains the MSB. We process windows in reverse order (MSB first) using Horner's method.
         let mut acc = <G::Group as AdditiveGroup>::ZERO;
-        let mut bits = 0;
-        // Use the full field bit size for accumulation to match GPU's EXPONENT_BITS
-        let exp_bits = exp_size::<G::ScalarField>() * 8;
-        for i in 0..num_windows {
-            let w = std::cmp::min(window_size, exp_bits - bits);
+        for i in (0..num_windows).rev() {
+            // Window i covers bits [i * window_size, min((i+1) * window_size, effective_bits))
+            let w = std::cmp::min(window_size, effective_bits - i * window_size);
             for _ in 0..w {
                 acc = acc.double();
             }
             for g in 0..num_groups {
                 acc.add_assign(&results[g * num_windows + i]);
             }
-            bits += w; // Process the next window
         }
 
         Ok(acc)
