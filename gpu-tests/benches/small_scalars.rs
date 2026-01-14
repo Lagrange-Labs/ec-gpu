@@ -21,7 +21,7 @@ use ark_bn254::{Fq, Fr, G1Affine, G1Projective};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 use ark_ec::CurveGroup;
 #[cfg(any(feature = "cuda", feature = "opencl"))]
-use ark_ff::UniformRand;
+use ark_ff::{PrimeField, UniformRand};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 use divan::{black_box, Bencher};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
