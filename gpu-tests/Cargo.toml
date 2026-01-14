@@ -10,6 +10,7 @@ publish = false
 
 [dev-dependencies]
 criterion = "0.4"
+divan = "0.1"
 ec-gpu = { workspace = true, features = ["arkworks"] }
 ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false, features = ["arkworks"] }
 fil_logger = "0.1.6"
@@ -32,4 +33,8 @@ opencl = ["ec-gpu-gen/opencl"]
 
 [[bench]]
 name = "multiexp"
+harness = false
+
+[[bench]]
+name = "small_scalars"
 harness = false
