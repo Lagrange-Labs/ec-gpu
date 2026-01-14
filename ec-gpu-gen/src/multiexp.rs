@@ -308,7 +308,8 @@ where
         // of those `NUM_GROUPS` * `NUM_WINDOWS` threads.
         let mut acc = <G::Group as AdditiveGroup>::ZERO;
         let mut bits = 0;
-        let exp_bits = effective_bits;
+        // Use the full field bit size for accumulation to match GPU's EXPONENT_BITS
+        let exp_bits = exp_size::<G::ScalarField>() * 8;
         for i in 0..num_windows {
             let w = std::cmp::min(window_size, exp_bits - bits);
             for _ in 0..w {
