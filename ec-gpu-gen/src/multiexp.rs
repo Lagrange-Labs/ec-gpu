@@ -549,9 +549,9 @@ where
         let mut results = Vec::new();
         let error = Arc::new(RwLock::new(Ok(())));
 
-        let _span = debug_span!("before scoped");
+        let _span = debug_span!("before scoped").entered();
         pool.scoped(|s| {
-            let _span = info_span!("before scoped");
+            let _span = info_span!("before scoped").entered();
             results = vec![<G::Group as AdditiveGroup>::ZERO; self.kernels.len()];
             self.parallel_multiexp(s, bases, exps, &mut results, error.clone());
         });
