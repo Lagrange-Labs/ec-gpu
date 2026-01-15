@@ -560,6 +560,7 @@ where
         let parent_span = tracing::info_span!("parent"); // Use an INFO span for parent
         let _pg = parent_span.enter();
         pool.scoped(|s| {
+            let _span = debug_span!(parent: &parent_span, "before scoped 2").entered();
             let child_span = tracing::debug_span!(parent: &parent_span, "child").or_current();
             results = vec![<G::Group as AdditiveGroup>::ZERO; self.kernels.len()];
             self.parallel_multiexp(s, bases, exps, &mut results, error.clone(), &child_span);
