@@ -16,6 +16,7 @@ static FIELD2_SRC: &str = include_str!("cl/field2.cl");
 static EC_SRC: &str = include_str!("cl/ec.cl");
 static FFT_SRC: &str = include_str!("cl/fft.cl");
 static MULTIEXP_SRC: &str = include_str!("cl/multiexp.cl");
+static POLY_OPS_SRC: &str = include_str!("cl/poly_ops.cl");
 
 #[derive(Clone, Copy)]
 enum Limb32Or64 {
@@ -189,6 +190,19 @@ impl<P: GpuName, F: GpuName, Exp: GpuName> NameAndSource for Multiexp<P, F, Exp>
     }
 }
 
+/// Struct that generates polynomial operations GPU source code.
+struct PolyOps<F: GpuName>(PhantomData<F>);
+
+impl<F: GpuName> NameAndSource for PolyOps<F> {
+    fn name(&self) -> String {
+        format!("{}_poly_ops", F::name())
+    }
+
+    fn source(&self, _limb: Limb32Or64) -> String {
+        String::from(POLY_OPS_SRC).replace("FIELD", &F::name())
+    }
+}
+
 /// Builder to create the source code of a GPU kernel.
 ///
 /// # Example
@@ -214,6 +228,8 @@ pub struct SourceBuilder {
     ffts: HashSet<Box<dyn NameAndSource>>,
     /// The [`Multiexp`]s that are used in this kernel.
     multiexps: HashSet<Box<dyn NameAndSource>>,
+    /// The [`PolyOps`] that are used in this kernel.
+    poly_ops: HashSet<Box<dyn NameAndSource>>,
     /// Additional source that is appended at the end of the generated source.
     extra_sources: Vec<String>,
 }
@@ -226,6 +242,7 @@ impl SourceBuilder {
             extension_fields: HashSet::new(),
             ffts: HashSet::new(),
             multiexps: HashSet::new(),
+            poly_ops: HashSet::new(),
             extra_sources: Vec::new(),
         }
     }
@@ -276,6 +293,20 @@ impl SourceBuilder {
         config
     }
 
+    /// Add polynomial operations kernel functions to the configuration.
+    ///
+    /// This includes kernels for variable fixing, polynomial evaluation,
+    /// linear combination, and witness polynomial computation.
+    pub fn add_poly_ops<F>(self) -> Self
+    where
+        F: GpuField + 'static,
+    {
+        let mut config = self.add_field::<F>();
+        let poly_ops = PolyOps::<F>(PhantomData);
+        config.poly_ops.insert(Box::new(poly_ops));
+        config
+    }
+
     /// Appends some given source at the end of the generated source.
     ///
     /// This is useful for cases where you use this library as building block, but have your own
@@ -318,6 +349,11 @@ impl SourceBuilder {
             .iter()
             .map(|multiexp| multiexp.source(limb_size))
             .collect();
+        let poly_ops = self
+            .poly_ops
+            .iter()
+            .map(|poly_op| poly_op.source(limb_size))
+            .collect();
         let extra_sources = self.extra_sources.join("\n");
         [
             COMMON_SRC.to_string(),
@@ -325,6 +361,7 @@ impl SourceBuilder {
             extension_fields,
             ffts,
             multiexps,
+            poly_ops,
             extra_sources,
         ]
         .join("\n\n")

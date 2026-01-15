@@ -65,6 +65,9 @@ pub mod fft_cpu;
 /// Multiexponentiation on the GPU.
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod multiexp;
+/// Polynomial operations on the GPU (fix_var, linear_combine, witness_poly).
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub mod poly_ops;
 /// Helpers for multithreaded code.
 pub mod threadpool;
 
@@ -79,3 +82,5 @@ pub use source::{generate, SourceBuilder};
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
