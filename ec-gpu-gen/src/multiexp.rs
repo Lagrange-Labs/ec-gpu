@@ -505,26 +505,31 @@ where
         {
             let error = error.clone();
             // Capture current span to propagate to worker thread
-            let parent_span = tracing::Span::current();
+            let parent_span = tracing::debug_span!("parent");
+            let _pg = parent_span.enter();
 
-            scope.execute(move || {
-                let _parent_guard = parent_span.enter();
-                let _span = debug_span!("gpu_device_multiexp", n = exps.len()).entered();
-                let mut acc = <G::Group as AdditiveGroup>::ZERO;
-                for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
-                    if error.read().unwrap().is_err() {
-                        break;
-                    }
-                    match kern.multiexp(bases, exps) {
-                        Ok(result) => acc.add_assign(&result),
-                        Err(e) => {
-                            *error.write().unwrap() = Err(e);
+            scope.execute({
+                let child_span = tracing::debug_span!("child").or_current();
+                move || {
+                    let _entered = child_span.entered();
+
+                    let _span = debug_span!("gpu_device_multiexp", n = exps.len()).entered();
+                    let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                    for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
+                        if error.read().unwrap().is_err() {
                             break;
                         }
+                        match kern.multiexp(bases, exps) {
+                            Ok(result) => acc.add_assign(&result),
+                            Err(e) => {
+                                *error.write().unwrap() = Err(e);
+                                break;
+                            }
+                        }
                     }
-                }
-                if error.read().unwrap().is_ok() {
-                    *result = acc;
+                    if error.read().unwrap().is_ok() {
+                        *result = acc;
+                    }
                 }
             });
         }
