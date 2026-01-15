@@ -6,7 +6,7 @@ use ark_ff::{AdditiveGroup, BigInteger, PrimeField};
 use ec_gpu::GpuName;
 use log::{error, info};
 use rust_gpu_tools::{program_closures, Device, Program};
-use tracing::debug_span;
+use tracing::{debug_span, info_span};
 use yastl::Scope;
 
 use crate::{
@@ -549,7 +549,9 @@ where
         let mut results = Vec::new();
         let error = Arc::new(RwLock::new(Ok(())));
 
+        let _span = debug_span!("before scoped");
         pool.scoped(|s| {
+            let _span = info_span!("before scoped");
             results = vec![<G::Group as AdditiveGroup>::ZERO; self.kernels.len()];
             self.parallel_multiexp(s, bases, exps, &mut results, error.clone());
         });
