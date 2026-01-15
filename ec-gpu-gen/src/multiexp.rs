@@ -9,7 +9,6 @@ use rust_gpu_tools::{program_closures, Device, Program};
 use tracing::debug_span;
 use yastl::Scope;
 
-use tracing::debug_span;
 use crate::{
     error::{EcError, EcResult},
     threadpool::Worker,
