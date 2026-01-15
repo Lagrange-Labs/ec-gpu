@@ -24,6 +24,7 @@ rayon = "1.5.1"
 rust-gpu-tools = { version = "0.7.0", default-features = false, optional = true }
 sha2 = "0.10"
 thiserror = "1.0.30"
+tracing = "0.1"
 yastl = "0.1.2"
 
 ark-bn254 = { version = "0.5.0", optional = true }

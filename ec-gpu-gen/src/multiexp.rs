@@ -6,6 +6,7 @@ use ark_ff::{AdditiveGroup, BigInteger, PrimeField};
 use ec_gpu::GpuName;
 use log::{error, info};
 use rust_gpu_tools::{program_closures, Device, Program};
+use tracing::debug_span;
 use yastl::Scope;
 
 use crate::{
@@ -256,6 +257,7 @@ where
         device: &Device,
         maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
     ) -> EcResult<Self> {
+        let _span = debug_span!("single_multiexp_kernel_create").entered();
         let mem = device.memory();
         let compute_units = device.compute_units();
         let compute_capability = device.compute_capability();
@@ -281,18 +283,22 @@ where
         bases: &[G::GpuRepr],
         exponents: &[<G::ScalarField as ark_ff::PrimeField>::BigInt],
     ) -> EcResult<G::Group> {
+        let _span = debug_span!("single_multiexp", n = bases.len()).entered();
         assert_eq!(bases.len(), exponents.len());
 
-        let exponents: Vec<_> = exponents
-            .iter()
-            .map(|b| {
-                let mut out = [0u8; 32];
-                let le = b.to_bytes_le();
-                out[..le.len()].copy_from_slice(&le);
+        let exponents: Vec<_> = {
+            let _span = debug_span!("convert_exponents").entered();
+            exponents
+                .iter()
+                .map(|b| {
+                    let mut out = [0u8; 32];
+                    let le = b.to_bytes_le();
+                    out[..le.len()].copy_from_slice(&le);
 
-                out
-            })
-            .collect();
+                    out
+                })
+                .collect()
+        };
 
         if let Some(maybe_abort) = &self.maybe_abort {
             if maybe_abort() {
@@ -314,35 +320,54 @@ where
         // Each thread will use `num_groups` * `num_windows` * `bucket_len` buckets.
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
-            let base_buffer = program.create_buffer_from_slice(bases)?;
-            let exp_buffer = program.create_buffer_from_slice(&exponents)?;
+            let base_buffer = {
+                let _span = debug_span!("upload_bases").entered();
+                program.create_buffer_from_slice(bases)?
+            };
+            let exp_buffer = {
+                let _span = debug_span!("upload_exponents").entered();
+                program.create_buffer_from_slice(&exponents)?
+            };
 
-            // It is safe as the GPU will initialize that buffer
-            let bucket_buffer =
-                unsafe { program.create_buffer::<G::Group>(self.work_units * bucket_len)? };
-            // It is safe as the GPU will initialize that buffer
-            let result_buffer = unsafe { program.create_buffer::<G::Group>(self.work_units)? };
+            let (bucket_buffer, result_buffer) = {
+                let _span = debug_span!("allocate_gpu_buffers").entered();
+                // It is safe as the GPU will initialize that buffer
+                let bucket_buffer =
+                    unsafe { program.create_buffer::<G::Group>(self.work_units * bucket_len)? };
+                // It is safe as the GPU will initialize that buffer
+                let result_buffer = unsafe { program.create_buffer::<G::Group>(self.work_units)? };
+                (bucket_buffer, result_buffer)
+            };
 
             // The global work size follows CUDA's definition and is the number of
             // `LOCAL_WORK_SIZE` sized thread groups.
             let global_work_size = div_ceil(num_windows * num_groups, LOCAL_WORK_SIZE);
 
-            let kernel_name = format!("{}_multiexp", G::name());
-            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+            let kernel = {
+                let _span = debug_span!("create_kernel").entered();
+                let kernel_name = format!("{}_multiexp", G::name());
+                program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?
+            };
 
-            kernel
-                .arg(&base_buffer)
-                .arg(&bucket_buffer)
-                .arg(&result_buffer)
-                .arg(&exp_buffer)
-                .arg(&(bases.len() as u32))
-                .arg(&(num_groups as u32))
-                .arg(&(num_windows as u32))
-                .arg(&(window_size as u32))
-                .run()?;
+            {
+                let _span = debug_span!("kernel_run").entered();
+                kernel
+                    .arg(&base_buffer)
+                    .arg(&bucket_buffer)
+                    .arg(&result_buffer)
+                    .arg(&exp_buffer)
+                    .arg(&(bases.len() as u32))
+                    .arg(&(num_groups as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+            }
 
             let mut results = vec![<G::Group as AdditiveGroup>::ZERO; self.work_units];
-            program.read_into_buffer(&result_buffer, &mut results)?;
+            {
+                let _span = debug_span!("download_results").entered();
+                program.read_into_buffer(&result_buffer, &mut results)?;
+            }
 
             Ok(results)
         });
@@ -353,17 +378,21 @@ where
         // of those `NUM_GROUPS` * `NUM_WINDOWS` threads.
         // Since we use LSB-first bit extraction, window 0 contains the LSB and window (num_windows-1)
         // contains the MSB. We process windows in reverse order (MSB first) using Horner's method.
-        let mut acc = <G::Group as AdditiveGroup>::ZERO;
-        for i in (0..num_windows).rev() {
-            // Window i covers bits [i * window_size, min((i+1) * window_size, effective_bits))
-            let w = std::cmp::min(window_size, effective_bits - i * window_size);
-            for _ in 0..w {
-                acc = acc.double();
+        let acc = {
+            let _span = debug_span!("cpu_accumulation").entered();
+            let mut acc = <G::Group as AdditiveGroup>::ZERO;
+            for i in (0..num_windows).rev() {
+                // Window i covers bits [i * window_size, min((i+1) * window_size, effective_bits))
+                let w = std::cmp::min(window_size, effective_bits - i * window_size);
+                for _ in 0..w {
+                    acc = acc.double();
+                }
+                for g in 0..num_groups {
+                    acc.add_assign(&results[g * num_windows + i]);
+                }
             }
-            for g in 0..num_groups {
-                acc.add_assign(&results[g * num_windows + i]);
-            }
-        }
+            acc
+        };
 
         Ok(acc)
     }
@@ -416,6 +445,7 @@ where
         devices: &[&Device],
         maybe_abort: Option<&'a (dyn Fn() -> bool + Send + Sync)>,
     ) -> EcResult<Self> {
+        let _span = debug_span!("multiexp_kernel_create").entered();
         let kernels: Vec<_> = programs
             .into_iter()
             .zip(devices.iter())
@@ -505,6 +535,7 @@ where
         exps: Arc<Vec<<G::ScalarField as ark_ff::PrimeField>::BigInt>>,
         skip: usize,
     ) -> EcResult<G::Group> {
+        let _span = debug_span!("multiexp", n = exps.len()).entered();
         // Bases are skipped by `self.1` elements, when converted from (Arc<Vec<G>>, usize) to Source
         // https://github.com/zkcrypto/bellman/blob/10c5010fd9c2ca69442dc9775ea271e286e776d8/src/multiexp.rs#L38
         let bases = &bases_arc[skip..(skip + exps.len())];

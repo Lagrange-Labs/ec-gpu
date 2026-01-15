@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ark_bn254::Fr;
+use ark_bn254::{Fr, G1Projective};
 use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ff::{PrimeField, UniformRand};
 use ec_gpu::arkworks_bn254::{G1Affine, G2Affine};
@@ -11,6 +11,9 @@ use ec_gpu_gen::multiexp::GpuAffine;
 use ec_gpu_gen::{
     multiexp::MultiexpKernel, program, rust_gpu_tools::Device, threadpool::Worker, EcError,
 };
+use tracing::debug_span;
+use tracing_profile::{PrintTreeConfig, PrintTreeLayer};
+use tracing_subscriber::{filter::filter_fn, prelude::*};
 
 pub trait QueryDensity: Sized {
     type Iter: Iterator<Item = bool>;
@@ -184,9 +187,12 @@ fn gpu_multiexp_small_scalars() {
 
     // Test with small scalars (64-bit range)
     let num_points = 1 << 16;
-    println!("Testing small scalar MSM optimization with {} points...", num_points);
+    println!(
+        "Testing small scalar MSM optimization with {} points...",
+        num_points
+    );
 
-    let bases: Vec<_> = (0..num_points)
+    let bases_ark: Vec<ark_bn254::G1Affine> = (0..num_points)
         .map(|_| G1Projective::rand(&mut rng).into_affine())
         .collect();
 
@@ -195,7 +201,8 @@ fn gpu_multiexp_small_scalars() {
         .map(|_| Fr::from(rng.gen::<u64>()))
         .collect();
 
-    let g = Arc::new(bases.clone());
+    let bases: Vec<G1Affine> = bases_ark.iter().map(|p| G1Affine::from(*p)).collect();
+    let g = Arc::new(bases);
     let v_arc: Arc<Vec<_>> = Arc::new(small_scalars.clone());
 
     let now = Instant::now();
@@ -204,7 +211,8 @@ fn gpu_multiexp_small_scalars() {
     let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
     println!("Small scalar GPU MSM took {}ms.", gpu_dur);
 
-    let cpu: G1Projective = VariableBaseMSM::msm(bases.as_slice(), small_scalars.as_slice()).unwrap();
+    let cpu: G1Projective =
+        VariableBaseMSM::msm(bases_ark.as_slice(), small_scalars.as_slice()).unwrap();
 
     assert_eq!(cpu, gpu, "Small scalar MSM mismatch!");
     println!("Small scalar MSM test passed!");
@@ -229,9 +237,12 @@ fn gpu_multiexp_very_small_scalars() {
     use rand::Rng;
 
     let num_points = 1 << 14;
-    println!("Testing very small scalar (32-bit) MSM with {} points...", num_points);
+    println!(
+        "Testing very small scalar (32-bit) MSM with {} points...",
+        num_points
+    );
 
-    let bases: Vec<_> = (0..num_points)
+    let bases_ark: Vec<ark_bn254::G1Affine> = (0..num_points)
         .map(|_| G1Projective::rand(&mut rng).into_affine())
         .collect();
 
@@ -240,7 +251,8 @@ fn gpu_multiexp_very_small_scalars() {
         .map(|_| Fr::from(rng.gen::<u32>() as u64))
         .collect();
 
-    let g = Arc::new(bases.clone());
+    let bases: Vec<G1Affine> = bases_ark.iter().map(|p| G1Affine::from(*p)).collect();
+    let g = Arc::new(bases);
     let v_arc: Arc<Vec<_>> = Arc::new(small_scalars.clone());
 
     let now = Instant::now();
@@ -249,8 +261,75 @@ fn gpu_multiexp_very_small_scalars() {
     let gpu_dur = now.elapsed().as_secs() * 1000 + now.elapsed().subsec_millis() as u64;
     println!("Very small scalar GPU MSM took {}ms.", gpu_dur);
 
-    let cpu: G1Projective = VariableBaseMSM::msm(bases.as_slice(), small_scalars.as_slice()).unwrap();
+    let cpu: G1Projective =
+        VariableBaseMSM::msm(bases_ark.as_slice(), small_scalars.as_slice()).unwrap();
 
     assert_eq!(cpu, gpu, "Very small scalar MSM mismatch!");
     println!("Very small scalar MSM test passed!");
+}
+
+#[test]
+fn gpu_multiexp_profile() {
+    use ec_gpu_gen::multiexp::SingleMultiexpKernel;
+
+    let config = PrintTreeConfig {
+        hide_below_percent: 0.0,
+        accumulate_events: false,
+        ..PrintTreeConfig::default()
+    };
+    let (layer, _guard) = PrintTreeLayer::new(config);
+    // Filter out events, only keep spans
+    let layer = layer.with_filter(filter_fn(|metadata| metadata.is_span()));
+    tracing_subscriber::registry().with(layer).init();
+
+    let root = debug_span!("profile_multiexp");
+    let _root_guard = root.enter();
+
+    let devices = Device::all();
+    let device = &devices[0];
+    let program = crate::program!(device).expect("Cannot create program!");
+
+    let kern = {
+        let span = debug_span!("create_kernel");
+        let _guard = span.enter();
+        SingleMultiexpKernel::<G1Affine>::create(program, device, None)
+            .expect("Cannot initialize kernel!")
+    };
+
+    let mut rng = rand::thread_rng();
+    let log_n = 16;
+    let n = 1 << log_n;
+
+    let bases_ark: Vec<ark_bn254::G1Affine> = {
+        let span = debug_span!("generate_bases", n = n);
+        let _guard = span.enter();
+        (0..n)
+            .map(|_| G1Projective::rand(&mut rng).into_affine())
+            .collect()
+    };
+
+    let bases_gpu: Vec<_> = {
+        let span = debug_span!("convert_bases_to_gpu", n = n);
+        let _guard = span.enter();
+        bases_ark
+            .iter()
+            .map(|p| G1Affine::from(*p).to_gpu())
+            .collect()
+    };
+
+    let exponents: Vec<_> = {
+        let span = debug_span!("generate_exponents", n = n);
+        let _guard = span.enter();
+        (0..n).map(|_| Fr::rand(&mut rng).into_bigint()).collect()
+    };
+
+    // Run multiexp on main thread - this will show all nested spans
+    let _result = {
+        let span = debug_span!("run_multiexp", n = n);
+        let _guard = span.enter();
+        kern.multiexp(&bases_gpu, &exponents)
+            .expect("multiexp failed")
+    };
+
+    drop(_root_guard);
 }

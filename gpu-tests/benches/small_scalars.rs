@@ -83,9 +83,7 @@ fn msm_full_254bit_scalars(bencher: Bencher) {
     let bases_gpu = Arc::new(bases_gpu);
 
     // Generate full 254-bit random scalars
-    let full_scalars: Vec<Fr> = (0..NUM_POINTS)
-        .map(|_| Fr::rand(&mut rng))
-        .collect();
+    let full_scalars: Vec<Fr> = (0..NUM_POINTS).map(|_| Fr::rand(&mut rng)).collect();
     let full_exps: Arc<Vec<_>> = Arc::new(full_scalars.iter().map(|e| e.into_bigint()).collect());
 
     bencher.bench_local(|| {
