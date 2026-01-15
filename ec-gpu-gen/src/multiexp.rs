@@ -9,6 +9,7 @@ use rust_gpu_tools::{program_closures, Device, Program};
 use tracing::debug_span;
 use yastl::Scope;
 
+use tracing::debug_span;
 use crate::{
     error::{EcError, EcResult},
     threadpool::Worker,
@@ -504,7 +505,12 @@ where
             .zip(results.iter_mut())
         {
             let error = error.clone();
+            // Capture current span to propagate to worker thread
+            let parent_span = tracing::Span::current();
+
             scope.execute(move || {
+                let _parent_guard = parent_span.enter();
+                let _span = debug_span!("gpu_device_multiexp", n = exps.len()).entered();
                 let mut acc = <G::Group as AdditiveGroup>::ZERO;
                 for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
                     if error.read().unwrap().is_err() {
