@@ -488,7 +488,6 @@ where
         exps: &'s [<G::ScalarField as ark_ff::PrimeField>::BigInt],
         results: &'s mut [G::Group],
         error: Arc<RwLock<EcResult<()>>>,
-        tracing_span: &tracing::Span,
     ) {
         let num_devices = self.kernels.len();
         let num_exps = exps.len();
@@ -506,31 +505,24 @@ where
         {
             let error = error.clone();
             // Capture current span to propagate to worker thread
-            let parent_span = tracing_span.clone();
 
-            scope.execute({
-                let _pg = parent_span.enter();
-                let child_span = tracing::debug_span!("child").or_current();
-                move || {
-                    let _entered = child_span.entered();
-
-                    let _span = debug_span!("gpu_device_multiexp", n = exps.len()).entered();
-                    let mut acc = <G::Group as AdditiveGroup>::ZERO;
-                    for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
-                        if error.read().unwrap().is_err() {
+            scope.execute(move || {
+                let _span = debug_span!("gpu_device_multiexp", n = exps.len()).entered();
+                let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                for (bases, exps) in bases.chunks(kern.n).zip(exps.chunks(kern.n)) {
+                    if error.read().unwrap().is_err() {
+                        break;
+                    }
+                    match kern.multiexp(bases, exps) {
+                        Ok(result) => acc.add_assign(&result),
+                        Err(e) => {
+                            *error.write().unwrap() = Err(e);
                             break;
                         }
-                        match kern.multiexp(bases, exps) {
-                            Ok(result) => acc.add_assign(&result),
-                            Err(e) => {
-                                *error.write().unwrap() = Err(e);
-                                break;
-                            }
-                        }
                     }
-                    if error.read().unwrap().is_ok() {
-                        *result = acc;
-                    }
+                }
+                if error.read().unwrap().is_ok() {
+                    *result = acc;
                 }
             });
         }
@@ -555,15 +547,9 @@ where
         let mut results = Vec::new();
         let error = Arc::new(RwLock::new(Ok(())));
 
-        let _span = debug_span!("before scoped 1").entered();
-
-        let parent_span = tracing::info_span!("parent"); // Use an INFO span for parent
-        let _pg = parent_span.enter();
         pool.scoped(|s| {
-            let _span = debug_span!(parent: &parent_span, "before scoped 2").entered();
-            let child_span = tracing::debug_span!(parent: &parent_span, "child").or_current();
             results = vec![<G::Group as AdditiveGroup>::ZERO; self.kernels.len()];
-            self.parallel_multiexp(s, bases, exps, &mut results, error.clone(), &child_span);
+            self.parallel_multiexp(s, bases, exps, &mut results, error.clone());
         });
 
         Arc::try_unwrap(error)
