@@ -43,7 +43,7 @@ KERNEL void POINT_multiexp(
 
   POINT_jacobian res = POINT_ZERO;
   for(uint i = nstart; i < nend; i++) {
-    uint ind = EXPONENT_get_bits(exps[i], bits, w);
+    uint ind = EXPONENT_get_bits_lsb(exps[i], bits, w);
 
     #if defined(OPENCL_NVIDIA) || defined(CUDA)
       // O_o, weird optimization, having a single special case makes it

@@ -1,0 +1,161 @@
+use std::ops::{Deref, DerefMut};
+
+use ark_bn254::{Fq, Fq2, FqConfig, Fr, FrConfig};
+use ark_ec::short_weierstrass::Affine;
+use ark_ff::{BigInteger, MontConfig};
+
+use crate::{GpuField, GpuName};
+
+fn bytes_le_to_u32_limbs(mut bytes: Vec<u8>) -> Vec<u32> {
+    while !bytes.len().is_multiple_of(4) {
+        bytes.push(0);
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+fn bigint_to_u32_limbs_le<B: BigInteger>(b: B) -> Vec<u32> {
+    bytes_le_to_u32_limbs(b.to_bytes_le())
+}
+
+impl GpuName for Fq {
+    fn name() -> String {
+        crate::name!()
+    }
+}
+
+impl GpuField for Fq {
+    fn one() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FqConfig::R)
+    }
+
+    fn r2() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FqConfig::R2)
+    }
+
+    fn modulus() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FqConfig::MODULUS)
+    }
+}
+
+impl GpuName for Fq2 {
+    fn name() -> String {
+        crate::name!()
+    }
+}
+
+impl GpuField for Fq2 {
+    fn one() -> Vec<u32> {
+        let n = bigint_to_u32_limbs_le(FqConfig::MODULUS).len();
+        let mut out = vec![0u32; 2 * n];
+        out[..n].copy_from_slice(&bigint_to_u32_limbs_le(FqConfig::R));
+        out
+    }
+
+    fn r2() -> Vec<u32> {
+        let n = bigint_to_u32_limbs_le(FqConfig::MODULUS).len();
+        let mut out = vec![0u32; 2 * n];
+        out[..n].copy_from_slice(&bigint_to_u32_limbs_le(FqConfig::R2));
+        out
+    }
+
+    fn modulus() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FqConfig::MODULUS)
+    }
+
+    fn sub_field_name() -> Option<String> {
+        Some(Fq::name())
+    }
+}
+
+impl GpuName for Fr {
+    fn name() -> String {
+        crate::name!()
+    }
+}
+
+impl GpuField for Fr {
+    fn one() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FrConfig::R)
+    }
+
+    fn r2() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FrConfig::R2)
+    }
+
+    fn modulus() -> Vec<u32> {
+        bigint_to_u32_limbs_le(FrConfig::MODULUS)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct G1Affine(pub Affine<ark_bn254::g1::Config>);
+
+impl Deref for G1Affine {
+    type Target = Affine<ark_bn254::g1::Config>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for G1Affine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<Affine<ark_bn254::g1::Config>> for G1Affine {
+    fn from(p: Affine<ark_bn254::g1::Config>) -> Self {
+        Self(p)
+    }
+}
+
+impl From<G1Affine> for Affine<ark_bn254::g1::Config> {
+    fn from(p: G1Affine) -> Self {
+        p.0
+    }
+}
+
+impl GpuName for G1Affine {
+    fn name() -> String {
+        crate::name!()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(transparent)]
+pub struct G2Affine(pub Affine<ark_bn254::g2::Config>);
+
+impl Deref for G2Affine {
+    type Target = Affine<ark_bn254::g2::Config>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for G2Affine {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl From<Affine<ark_bn254::g2::Config>> for G2Affine {
+    fn from(p: Affine<ark_bn254::g2::Config>) -> Self {
+        Self(p)
+    }
+}
+
+impl From<G2Affine> for Affine<ark_bn254::g2::Config> {
+    fn from(p: G2Affine) -> Self {
+        p.0
+    }
+}
+
+impl GpuName for G2Affine {
+    fn name() -> String {
+        crate::name!()
+    }
+}

@@ -164,6 +164,94 @@ DEVICE void FIELD_reduce(uint32_t accLow[FIELD_LIMBS], uint32_t np0, uint32_t fq
   accLow[i]=chain_add(&chain5, accLow[i], highCarry);
 }
 
+// Optimized squaring: exploits symmetry a² = a·a
+// Cross products aᵢ·aⱼ for i≠j appear twice, so compute once and double.
+// Reduces from n² to n(n+1)/2 multiplications (~44% fewer for 8 limbs).
+DEVICE inline
+void FIELD_sqr_v1(uint32_t *x, uint32_t *xx) {
+  const uint32_t xLimbs = FIELD_LIMBS;
+  const uint32_t xxLimbs = FIELD_LIMBS * 2;
+  uint32_t temp[FIELD_LIMBS * 2];
+  uint32_t carry = 0;
+
+  #pragma unroll
+  for (int32_t i = 0; i < xxLimbs; i++) {
+    temp[i] = 0;
+  }
+
+  // Step 1: Compute off-diagonal products for odd (i+j) positions
+  // Following the same pattern as FIELD_mult_v1 for correctness
+  #pragma unroll
+  for (int32_t i = 0; i < xLimbs; i++) {
+    chain_t chain1;
+    chain_init(&chain1);
+    #pragma unroll
+    for (int32_t j = i + 1; j < xLimbs; j++) {
+      if ((i + j) % 2 == 1) {
+        temp[i + j - 1] = chain_madlo(&chain1, x[i], x[j], temp[i + j - 1]);
+        temp[i + j]     = chain_madhi(&chain1, x[i], x[j], temp[i + j]);
+      }
+    }
+    if (i % 2 == 1 && i + 1 < xLimbs) {
+      temp[i + xLimbs - 1] = chain_add(&chain1, 0, 0);
+    }
+  }
+
+  // Shift right by 1 position (same as mult_v1)
+  #pragma unroll
+  for (int32_t i = xxLimbs - 1; i > 0; i--) {
+    temp[i] = temp[i - 1];
+  }
+  temp[0] = 0;
+
+  // Step 2: Compute off-diagonal products for even (i+j) positions
+  carry = 0;
+  #pragma unroll
+  for (int32_t i = 0; i < xLimbs; i++) {
+    chain_t chain2;
+    chain_init(&chain2);
+
+    #pragma unroll
+    for (int32_t j = i + 1; j < xLimbs; j++) {
+      if ((i + j) % 2 == 0) {
+        temp[i + j]     = chain_madlo(&chain2, x[i], x[j], temp[i + j]);
+        temp[i + j + 1] = chain_madhi(&chain2, x[i], x[j], temp[i + j + 1]);
+      }
+    }
+    if ((i + xLimbs) % 2 == 0 && i != xLimbs - 1 && i + 1 < xLimbs) {
+      temp[i + xLimbs]     = chain_add(&chain2, temp[i + xLimbs], carry);
+      temp[i + xLimbs + 1] = chain_add(&chain2, temp[i + xLimbs + 1], 0);
+      carry = chain_add(&chain2, 0, 0);
+    }
+    if ((i + xLimbs) % 2 == 1 && i != xLimbs - 1 && i + 1 < xLimbs) {
+      carry = chain_add(&chain2, carry, 0);
+    }
+  }
+
+  // Step 3: Double the off-diagonal products (left shift by 1 bit)
+  carry = 0;
+  #pragma unroll
+  for (int32_t i = 0; i < xxLimbs; i++) {
+    uint32_t new_carry = temp[i] >> 31;
+    temp[i] = (temp[i] << 1) | carry;
+    carry = new_carry;
+  }
+
+  // Step 4: Add diagonal products x[i] * x[i]
+  chain_t chain3;
+  chain_init(&chain3);
+  #pragma unroll
+  for (int32_t i = 0; i < xLimbs; i++) {
+    temp[2 * i]     = chain_madlo(&chain3, x[i], x[i], temp[2 * i]);
+    temp[2 * i + 1] = chain_madhi(&chain3, x[i], x[i], temp[2 * i + 1]);
+  }
+
+  #pragma unroll
+  for (int32_t i = 0; i < xxLimbs; i++) {
+    xx[i] = temp[i];
+  }
+}
+
 // Requirement: yLimbs >= xLimbs
 DEVICE inline
 void FIELD_mult_v1(uint32_t *x, uint32_t *y, uint32_t *xy) {
@@ -262,6 +350,40 @@ DEVICE FIELD FIELD_mul_nvidia(FIELD a, FIELD b) {
   return r;
 }
 
+DEVICE FIELD FIELD_sqr_nvidia(FIELD a) {
+  // Perform optimized squaring
+  limb aa[2 * FIELD_LIMBS];
+  FIELD_sqr_v1(a.val, aa);
+
+  uint32_t io[FIELD_LIMBS];
+  #pragma unroll
+  for(int i=0;i<FIELD_LIMBS;i++) {
+    io[i]=aa[i];
+  }
+  FIELD_reduce(io, FIELD_INV, FIELD_P.val);
+
+  // Add io to the upper words of aa
+  aa[FIELD_LIMBS] = add_cc(aa[FIELD_LIMBS], io[0]);
+  int j;
+  #pragma unroll
+  for (j = 1; j < FIELD_LIMBS - 1; j++) {
+    aa[j + FIELD_LIMBS] = addc_cc(aa[j + FIELD_LIMBS], io[j]);
+  }
+  aa[2 * FIELD_LIMBS - 1] = addc(aa[2 * FIELD_LIMBS - 1], io[FIELD_LIMBS - 1]);
+
+  FIELD r;
+  #pragma unroll
+  for (int i = 0; i < FIELD_LIMBS; i++) {
+    r.val[i] = aa[i + FIELD_LIMBS];
+  }
+
+  if (FIELD_gte(r, FIELD_P)) {
+    r = FIELD_sub_(r, FIELD_P);
+  }
+
+  return r;
+}
+
 #endif
 
 // Modular multiplication
@@ -310,9 +432,15 @@ DEVICE FIELD FIELD_mul(FIELD a, FIELD b) {
 
 // Squaring is a special case of multiplication which can be done ~1.5x faster.
 // https://stackoverflow.com/a/16388571/1348497
+#ifdef CUDA
+DEVICE FIELD FIELD_sqr(FIELD a) {
+  return FIELD_sqr_nvidia(a);
+}
+#else
 DEVICE FIELD FIELD_sqr(FIELD a) {
   return FIELD_mul(a, a);
 }
+#endif
 
 // Left-shift the limbs by one bit and subtract by modulus in case of overflow.
 // Faster version of FIELD_add(a, a)
@@ -372,6 +500,20 @@ DEVICE uint FIELD_get_bits(FIELD l, uint skip, uint window) {
   for(uint i = 0; i < window; i++) {
     ret <<= 1;
     ret |= FIELD_get_bit(l, skip + i);
+  }
+  return ret;
+}
+
+// Get `i`th bit (From least significant digit) of the field.
+DEVICE bool FIELD_get_bit_lsb(FIELD l, uint i) {
+  return (l.val[i / FIELD_LIMB_BITS] >> (i % FIELD_LIMB_BITS)) & 1;
+}
+
+// Get `window` consecutive bits, (Starting from `skip`th bit from LSB) from the field.
+DEVICE uint FIELD_get_bits_lsb(FIELD l, uint skip, uint window) {
+  uint ret = 0;
+  for(uint i = 0; i < window; i++) {
+    ret |= ((uint)FIELD_get_bit_lsb(l, skip + i)) << i;
   }
   return ret;
 }

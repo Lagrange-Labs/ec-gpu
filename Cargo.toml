@@ -5,3 +5,7 @@ members = [
   "gpu-tests",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+ec-gpu = { path = "./ec-gpu" }
+tracing-profile = { git = "https://github.com/IrreducibleOSS/tracing-profile" }
