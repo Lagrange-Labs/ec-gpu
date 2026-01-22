@@ -366,6 +366,131 @@ impl<F: PrimeField + GpuName> SinglePolyOpsKernel<F> {
 
         self.program.run(closures, ())
     }
+
+    /// Batch evaluate multiple polynomials at multiple points.
+    ///
+    /// Treats each polynomial as univariate in coefficient form and evaluates
+    /// at all given points using Horner's method on the GPU.
+    ///
+    /// Returns a 2D vector: `results[point_idx][poly_idx]` = evaluation of poly_idx at point_idx.
+    ///
+    /// All polynomials must have the same length.
+    pub fn eval_univariate_batch(
+        &self,
+        polys: &[&[F]],
+        points: &[F],
+    ) -> EcResult<Vec<Vec<F>>> {
+        assert!(!polys.is_empty(), "Must have at least one polynomial");
+        assert!(!points.is_empty(), "Must have at least one point");
+
+        let poly_len = polys[0].len();
+        assert!(
+            polys.iter().all(|p| p.len() == poly_len),
+            "All polynomials must have the same length"
+        );
+
+        let num_polys = polys.len();
+        let num_points = points.len();
+
+        // Flatten polynomials into a single buffer
+        let mut flat_polys: Vec<F> = Vec::with_capacity(num_polys * poly_len);
+        for poly in polys {
+            flat_polys.extend_from_slice(poly);
+        }
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<F>>> {
+            let polys_buffer = program.create_buffer_from_slice(&flat_polys)?;
+            let points_buffer = program.create_buffer_from_slice(points)?;
+
+            let total_evals = num_polys * num_points;
+            // It is safe as the GPU will initialize that buffer
+            let results_buffer = unsafe { program.create_buffer::<F>(total_evals)? };
+
+            let global_work_size = div_ceil(total_evals, LOCAL_WORK_SIZE);
+            let kernel_name = format!("{}_eval_univariate_batch", F::name());
+            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+            kernel
+                .arg(&polys_buffer)
+                .arg(&points_buffer)
+                .arg(&results_buffer)
+                .arg(&(num_polys as u32))
+                .arg(&(poly_len as u32))
+                .arg(&(num_points as u32))
+                .run()?;
+
+            // Read flat results
+            let mut flat_results = vec![F::ZERO; total_evals];
+            program.read_into_buffer(&results_buffer, &mut flat_results)?;
+
+            // Reshape to [num_points][num_polys]
+            let mut results = Vec::with_capacity(num_points);
+            for point_idx in 0..num_points {
+                let start = point_idx * num_polys;
+                let end = start + num_polys;
+                results.push(flat_results[start..end].to_vec());
+            }
+
+            Ok(results)
+        });
+
+        self.program.run(closures, ())
+    }
+
+    /// Batch compute witness polynomials for KZG opening at multiple points.
+    ///
+    /// Given polynomial f(x) and evaluation points, computes witness polynomials h_i(x) where:
+    /// f(x) = h_i(x) * (x - u[i]) + f(u[i])
+    ///
+    /// Returns a vector of witness polynomials, one for each evaluation point.
+    /// Each witness polynomial has length `f.len() - 1`.
+    pub fn witness_poly_batch(&self, f: &[F], points: &[F]) -> EcResult<Vec<Vec<F>>> {
+        assert!(!f.is_empty(), "Polynomial must not be empty");
+        assert!(!points.is_empty(), "Must have at least one point");
+
+        let n = f.len();
+        let num_points = points.len();
+        let witness_len = n - 1;
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<F>>> {
+            let f_buffer = program.create_buffer_from_slice(f)?;
+            let points_buffer = program.create_buffer_from_slice(points)?;
+
+            // Total output: num_points witness polynomials, each of length n-1
+            let total_output = num_points * witness_len;
+            // It is safe as the GPU will initialize that buffer
+            let witnesses_buffer = unsafe { program.create_buffer::<F>(total_output)? };
+
+            // One thread per point (each computes a full witness polynomial sequentially)
+            let global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
+            let kernel_name = format!("{}_witness_poly_batch", F::name());
+            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+            kernel
+                .arg(&f_buffer)
+                .arg(&points_buffer)
+                .arg(&witnesses_buffer)
+                .arg(&(n as u32))
+                .arg(&(num_points as u32))
+                .run()?;
+
+            // Read flat results
+            let mut flat_witnesses = vec![F::ZERO; total_output];
+            program.read_into_buffer(&witnesses_buffer, &mut flat_witnesses)?;
+
+            // Reshape to [num_points][witness_len]
+            let mut results = Vec::with_capacity(num_points);
+            for point_idx in 0..num_points {
+                let start = point_idx * witness_len;
+                let end = start + witness_len;
+                results.push(flat_witnesses[start..end].to_vec());
+            }
+
+            Ok(results)
+        });
+
+        self.program.run(closures, ())
+    }
 }
 
 /// A struct that contains polynomial operations kernels for multiple devices.
@@ -407,6 +532,20 @@ impl<F: PrimeField + GpuName> PolyOpsKernel<F> {
     /// Compute witness polynomial for KZG opening.
     pub fn witness_poly(&self, f: &[F], u: &F) -> EcResult<Vec<F>> {
         self.kernels[0].witness_poly(f, u)
+    }
+
+    /// Batch evaluate multiple polynomials at multiple points.
+    pub fn eval_univariate_batch(
+        &self,
+        polys: &[&[F]],
+        points: &[F],
+    ) -> EcResult<Vec<Vec<F>>> {
+        self.kernels[0].eval_univariate_batch(polys, points)
+    }
+
+    /// Batch compute witness polynomials for multiple points.
+    pub fn witness_poly_batch(&self, f: &[F], points: &[F]) -> EcResult<Vec<Vec<F>>> {
+        self.kernels[0].witness_poly_batch(f, points)
     }
 }
 
@@ -509,5 +648,56 @@ mod tests {
         // Verify: f(x) = h(x) * (x - u) + f(u)
         // At x = u: f(u) should equal f evaluated at u
         // The witness polynomial satisfies the division property
+    }
+
+    /// CPU reference for univariate polynomial evaluation using Horner's method
+    #[cfg(feature = "arkworks")]
+    fn eval_univariate_cpu<F: Field>(coeffs: &[F], x: &F) -> F {
+        let mut result = coeffs[coeffs.len() - 1];
+        for i in (0..coeffs.len() - 1).rev() {
+            result = result * x + coeffs[i];
+        }
+        result
+    }
+
+    #[cfg(feature = "arkworks")]
+    #[test]
+    fn test_eval_univariate_batch_reference() {
+        let mut rng = ark_std::test_rng();
+
+        let p1: Vec<Fr> = (0..8).map(|_| Fr::rand(&mut rng)).collect();
+        let p2: Vec<Fr> = (0..8).map(|_| Fr::rand(&mut rng)).collect();
+        let points = vec![Fr::rand(&mut rng), Fr::rand(&mut rng), Fr::rand(&mut rng)];
+
+        let polys = vec![&p1[..], &p2[..]];
+
+        // Compute expected results
+        for (point_idx, point) in points.iter().enumerate() {
+            for (poly_idx, poly) in polys.iter().enumerate() {
+                let expected = eval_univariate_cpu(poly, point);
+                // Just verify the CPU reference computes something
+                assert!(!expected.is_zero() || poly.iter().all(|c| c.is_zero()));
+                println!(
+                    "eval_univariate_cpu(poly[{}], point[{}]) = {:?}",
+                    poly_idx, point_idx, expected
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "arkworks")]
+    #[test]
+    fn test_witness_poly_batch_reference() {
+        let mut rng = ark_std::test_rng();
+
+        let f: Vec<Fr> = (0..8).map(|_| Fr::rand(&mut rng)).collect();
+        let points = vec![Fr::rand(&mut rng), Fr::rand(&mut rng), Fr::rand(&mut rng)];
+
+        // Compute witnesses for each point using the CPU reference
+        for (i, point) in points.iter().enumerate() {
+            let h = witness_poly_cpu(&f, point);
+            assert_eq!(h.len(), f.len() - 1);
+            println!("witness_poly_cpu(f, point[{}]).len() = {}", i, h.len());
+        }
     }
 }

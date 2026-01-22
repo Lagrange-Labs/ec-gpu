@@ -68,6 +68,9 @@ pub mod multiexp;
 /// Polynomial operations on the GPU (fix_var, linear_combine, witness_poly).
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod poly_ops;
+/// GPU buffer management and combined operations for persistent data.
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub mod gpu_buffer;
 /// Helpers for multithreaded code.
 pub mod threadpool;
 
@@ -84,3 +87,5 @@ pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult};

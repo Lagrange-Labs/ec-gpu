@@ -225,3 +225,96 @@ KERNEL void FIELD_sub_poly(
 
     out[gid] = FIELD_sub(a[gid], b[gid]);
 }
+
+/*
+ * Batch evaluate multiple polynomials at multiple points using Horner's method.
+ *
+ * Each thread handles one (poly_idx, point_idx) pair.
+ * The polynomial is treated as univariate in coefficient form:
+ *   f(x) = coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + ...
+ *
+ * polys:       Concatenated polynomials [poly0, poly1, ..., poly_{num_polys-1}]
+ * points:      Evaluation points [point0, point1, ..., point_{num_points-1}]
+ * results:     Output: results[point_idx * num_polys + poly_idx] = poly_idx(point_idx)
+ * num_polys:   Number of polynomials
+ * poly_len:    Length of each polynomial (all same length)
+ * num_points:  Number of evaluation points
+ *
+ * Total threads needed: num_polys * num_points
+ */
+KERNEL void FIELD_eval_univariate_batch(
+    GLOBAL FIELD* polys,
+    GLOBAL FIELD* points,
+    GLOBAL FIELD* results,
+    uint num_polys,
+    uint poly_len,
+    uint num_points)
+{
+    const uint gid = GET_GLOBAL_ID();
+    const uint total_evals = num_polys * num_points;
+    if (gid >= total_evals) return;
+
+    // Decode which polynomial and which point this thread handles
+    const uint poly_idx = gid % num_polys;
+    const uint point_idx = gid / num_polys;
+
+    // Get the evaluation point
+    FIELD x = points[point_idx];
+
+    // Get pointer to this polynomial's coefficients
+    GLOBAL FIELD* coeffs = polys + poly_idx * poly_len;
+
+    // Evaluate using Horner's method: f(x) = c[n-1], then f = f*x + c[i] for i = n-2..0
+    FIELD result = coeffs[poly_len - 1];
+    for (int i = (int)poly_len - 2; i >= 0; i--) {
+        result = FIELD_add(FIELD_mul(result, x), coeffs[i]);
+    }
+
+    // Store result at [point_idx][poly_idx] position
+    results[point_idx * num_polys + poly_idx] = result;
+}
+
+/*
+ * Batch compute witness polynomials for KZG opening at multiple points.
+ *
+ * Given polynomial f(x) and evaluation points u[0..num_points-1],
+ * computes witness polynomials h_i(x) where:
+ *   f(x) = h_i(x) * (x - u[i]) + f(u[i])
+ *
+ * The recurrence is: h[j-1] = f[j] + h[j] * u (computed in reverse)
+ *
+ * This kernel processes one polynomial at one point per thread group,
+ * with each thread in the group handling a chunk of the computation.
+ * Since witness computation is inherently sequential, we use a single thread.
+ *
+ * f:           Input polynomial coefficients (length n)
+ * u_points:    Evaluation points [u0, u1, ..., u_{num_points-1}]
+ * witnesses:   Output: concatenated witness polys [h0, h1, ...] each of length n-1
+ * n:           Length of input polynomial
+ * num_points:  Number of evaluation points
+ *
+ * Total threads needed: num_points (one thread per point, sequential computation)
+ */
+KERNEL void FIELD_witness_poly_batch(
+    GLOBAL FIELD* f,
+    GLOBAL FIELD* u_points,
+    GLOBAL FIELD* witnesses,
+    uint n,
+    uint num_points)
+{
+    const uint point_idx = GET_GLOBAL_ID();
+    if (point_idx >= num_points) return;
+
+    // Get the evaluation point for this witness
+    FIELD u = u_points[point_idx];
+
+    // Output witness polynomial starts at this offset
+    GLOBAL FIELD* h = witnesses + point_idx * (n - 1);
+
+    // Compute h(x) = f(x)/(x - u) using the recurrence h[i-1] = f[i] + h[i] * u
+    FIELD carry = FIELD_ZERO;
+    for (int i = n - 1; i >= 1; i--) {
+        carry = FIELD_add(f[i], FIELD_mul(carry, u));
+        h[i - 1] = carry;
+    }
+}
