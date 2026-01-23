@@ -88,4 +88,4 @@ pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultie
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
-pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult};
+pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult, FusedPolyCommit, FixVarsAndCommitResult};
