@@ -409,6 +409,147 @@ where
         let window_size = ((div_ceil(num_terms, self.work_units) as f64).log2() as usize) + 2;
         std::cmp::min(window_size, MAX_WINDOW_SIZE)
     }
+
+    /// Batch MSM: upload bases once, compute multiple MSMs with different scalars.
+    ///
+    /// This is more efficient than calling `multiexp` multiple times because:
+    /// 1. Bases are uploaded to GPU only once
+    /// 2. All MSMs are computed in a single GPU session
+    ///
+    /// All scalar sets must have the same length as bases.
+    pub fn batch_multiexp(
+        &self,
+        bases: &[G::GpuRepr],
+        exponent_sets: &[Vec<<G::ScalarField as PrimeField>::BigInt>],
+    ) -> EcResult<Vec<G::Group>> {
+        let _span = debug_span!("batch_multiexp", n_bases = bases.len(), n_sets = exponent_sets.len()).entered();
+
+        if exponent_sets.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Verify all exponent sets have same length as bases
+        for (i, exps) in exponent_sets.iter().enumerate() {
+            assert_eq!(
+                bases.len(),
+                exps.len(),
+                "Exponent set {} has length {}, expected {}",
+                i,
+                exps.len(),
+                bases.len()
+            );
+        }
+
+        // Convert all exponent sets to bytes
+        let exponent_sets_bytes: Vec<Vec<[u8; 32]>> = exponent_sets
+            .iter()
+            .map(|exps| {
+                exps.iter()
+                    .map(|b| {
+                        let mut out = [0u8; 32];
+                        let le = b.to_bytes_le();
+                        out[..le.len()].copy_from_slice(&le);
+                        out
+                    })
+                    .collect()
+            })
+            .collect();
+
+        if let Some(maybe_abort) = &self.maybe_abort {
+            if maybe_abort() {
+                return Err(EcError::Aborted);
+            }
+        }
+
+        // Compute window size based on number of bases (same for all MSMs)
+        let window_size = self.calc_window_size(bases.len());
+        let bucket_len = 1 << window_size;
+
+        let work_units = self.work_units;
+        let num_sets = exponent_sets_bytes.len();
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
+            // Upload bases ONCE
+            let base_buffer = {
+                let _span = debug_span!("upload_bases_once").entered();
+                program.create_buffer_from_slice(bases)?
+            };
+
+            // Allocate reusable buffers
+            let bucket_buffer = {
+                let _span = debug_span!("allocate_bucket_buffer").entered();
+                unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? }
+            };
+            let result_buffer = {
+                let _span = debug_span!("allocate_result_buffer").entered();
+                unsafe { program.create_buffer::<G::Group>(work_units)? }
+            };
+
+            let mut all_results = Vec::with_capacity(num_sets);
+
+            // Process each exponent set
+            for exponents in exponent_sets_bytes.iter() {
+                let effective_bits = compute_max_scalar_bits(exponents);
+                let num_windows = div_ceil(effective_bits, window_size);
+                let num_groups = work_units / num_windows;
+
+                // Upload this set of exponents
+                let exp_buffer = {
+                    let _span = debug_span!("upload_exponents").entered();
+                    program.create_buffer_from_slice(exponents)?
+                };
+
+                let global_work_size = div_ceil(num_windows * num_groups, LOCAL_WORK_SIZE);
+                let kernel_name = format!("{}_multiexp", G::name());
+                let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+                kernel
+                    .arg(&base_buffer)
+                    .arg(&bucket_buffer)
+                    .arg(&result_buffer)
+                    .arg(&exp_buffer)
+                    .arg(&(bases.len() as u32))
+                    .arg(&(num_groups as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                let mut results = vec![<G::Group as AdditiveGroup>::ZERO; work_units];
+                program.read_into_buffer(&result_buffer, &mut results)?;
+
+                all_results.push(results);
+            }
+
+            Ok(all_results)
+        });
+
+        let all_partial_results = self.program.run(closures, ())?;
+
+        // CPU accumulation for each MSM result
+        let final_results: Vec<G::Group> = all_partial_results
+            .into_iter()
+            .zip(exponent_sets_bytes.iter())
+            .map(|(results, exponents)| {
+                let effective_bits = compute_max_scalar_bits(exponents);
+                let num_windows = div_ceil(effective_bits, window_size);
+                let num_groups = self.work_units / num_windows;
+
+                let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                for i in (0..num_windows).rev() {
+                    let w = std::cmp::min(window_size, effective_bits - i * window_size);
+                    for _ in 0..w {
+                        acc = acc.double();
+                    }
+                    for g in 0..num_groups {
+                        acc.add_assign(&results[g * num_windows + i]);
+                    }
+                }
+                acc
+            })
+            .collect();
+
+        Ok(final_results)
+    }
 }
 
 /// A struct that contains several multiexp kernels for different devices.
@@ -565,5 +706,19 @@ where
     /// Returns the number of kernels (one per device).
     pub fn num_kernels(&self) -> usize {
         self.kernels.len()
+    }
+
+    /// Batch MSM: upload bases once, compute multiple MSMs with different scalars.
+    ///
+    /// This is more efficient than calling `multiexp` multiple times because
+    /// bases are uploaded to GPU only once.
+    ///
+    /// Uses the first available GPU kernel for simplicity.
+    pub fn batch_multiexp(
+        &self,
+        bases: &[G::GpuRepr],
+        exponent_sets: &[Vec<<G::ScalarField as PrimeField>::BigInt>],
+    ) -> EcResult<Vec<G::Group>> {
+        self.kernels[0].batch_multiexp(bases, exponent_sets)
     }
 }
