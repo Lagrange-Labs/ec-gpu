@@ -318,3 +318,131 @@ KERNEL void FIELD_witness_poly_batch(
         h[i - 1] = carry;
     }
 }
+
+/*
+ * Convert field elements from Montgomery form to little-endian scalar bytes.
+ *
+ * This is used to prepare field elements for MSM without CPU round-trip.
+ * The field elements must be in Montgomery form (as output by fix_var).
+ * The output is 32-byte little-endian scalars suitable for the multiexp kernel.
+ *
+ * input:  Field elements in Montgomery form (length n)
+ * output: Scalar bytes, 32 bytes per element (total n * 32 bytes)
+ * n:      Number of elements to convert
+ *
+ * Total threads needed: n (one thread per element)
+ */
+KERNEL void FIELD_to_scalar_bytes(
+    GLOBAL FIELD* input,
+    GLOBAL uchar* output,
+    uint n)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    // Load field element in Montgomery form
+    FIELD mont = input[gid];
+
+    // Convert from Montgomery form to standard form
+    // This computes: mont * R^(-1) mod P
+    FIELD standard = FIELD_unmont(mont);
+
+    // Write 32 bytes in little-endian order
+    GLOBAL uchar* out_ptr = output + gid * 32;
+
+    // The standard form is stored as FIELD_LIMBS limbs, each FIELD_LIMB_BITS bits
+    // We need to serialize to 32 bytes in little-endian order
+    #if FIELD_LIMB_BITS == 32
+        // 8 x 32-bit limbs = 32 bytes
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 4 + 0] = (uchar)(limb);
+            out_ptr[i * 4 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 4 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 4 + 3] = (uchar)(limb >> 24);
+        }
+    #elif FIELD_LIMB_BITS == 64
+        // 4 x 64-bit limbs = 32 bytes
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 8 + 0] = (uchar)(limb);
+            out_ptr[i * 8 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 8 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 8 + 3] = (uchar)(limb >> 24);
+            out_ptr[i * 8 + 4] = (uchar)(limb >> 32);
+            out_ptr[i * 8 + 5] = (uchar)(limb >> 40);
+            out_ptr[i * 8 + 6] = (uchar)(limb >> 48);
+            out_ptr[i * 8 + 7] = (uchar)(limb >> 56);
+        }
+    #else
+        #error "Unsupported FIELD_LIMB_BITS value"
+    #endif
+}
+
+/*
+ * Combined fix_var + to_scalar_bytes in one kernel to minimize memory accesses.
+ *
+ * This performs the fix_var operation and immediately converts the output
+ * to scalar bytes format suitable for MSM, without writing intermediate field elements.
+ *
+ * poly:    Input polynomial in evaluation form (length 2n)
+ * out:     Output scalar bytes, 32 bytes per element (total n * 32 bytes)
+ * r_buf:   Single-element buffer containing the challenge value r
+ * n:       Output length (half of input length)
+ *
+ * Total threads needed: n (one thread per output element)
+ */
+KERNEL void FIELD_fix_var_to_scalar(
+    GLOBAL FIELD* poly,
+    GLOBAL uchar* out,
+    GLOBAL FIELD* r_buf,
+    uint n)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    // Load r from buffer
+    FIELD r = r_buf[0];
+
+    FIELD low = poly[2 * gid];
+    FIELD high = poly[2 * gid + 1];
+
+    // diff = high - low
+    FIELD diff = FIELD_sub(high, low);
+
+    // scaled = r * diff
+    FIELD scaled = FIELD_mul(r, diff);
+
+    // result = low + scaled = low + r * (high - low)
+    FIELD result = FIELD_add(low, scaled);
+
+    // Convert to scalar bytes (unmont and serialize)
+    FIELD standard = FIELD_unmont(result);
+
+    // Write 32 bytes in little-endian order
+    GLOBAL uchar* out_ptr = out + gid * 32;
+
+    #if FIELD_LIMB_BITS == 32
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 4 + 0] = (uchar)(limb);
+            out_ptr[i * 4 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 4 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 4 + 3] = (uchar)(limb >> 24);
+        }
+    #elif FIELD_LIMB_BITS == 64
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 8 + 0] = (uchar)(limb);
+            out_ptr[i * 8 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 8 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 8 + 3] = (uchar)(limb >> 24);
+            out_ptr[i * 8 + 4] = (uchar)(limb >> 32);
+            out_ptr[i * 8 + 5] = (uchar)(limb >> 40);
+            out_ptr[i * 8 + 6] = (uchar)(limb >> 48);
+            out_ptr[i * 8 + 7] = (uchar)(limb >> 56);
+        }
+    #else
+        #error "Unsupported FIELD_LIMB_BITS value"
+    #endif
+}

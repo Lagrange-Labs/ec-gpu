@@ -414,7 +414,8 @@ where
     ///
     /// This is more efficient than calling `multiexp` multiple times because:
     /// 1. Bases are uploaded to GPU only once
-    /// 2. All MSMs are computed in a single GPU session
+    /// 2. All scalars are uploaded in a single transfer
+    /// 3. All results are downloaded in a single transfer
     ///
     /// All scalar sets must have the same length as bases.
     pub fn batch_multiexp(
@@ -441,19 +442,22 @@ where
         }
 
         // Convert all exponent sets to bytes
-        let exponent_sets_bytes: Vec<Vec<[u8; 32]>> = exponent_sets
-            .iter()
-            .map(|exps| {
-                exps.iter()
-                    .map(|b| {
-                        let mut out = [0u8; 32];
-                        let le = b.to_bytes_le();
-                        out[..le.len()].copy_from_slice(&le);
-                        out
-                    })
-                    .collect()
-            })
-            .collect();
+        let exponent_sets_bytes: Vec<Vec<[u8; 32]>> = {
+            let _span = debug_span!("convert_exponents_to_bytes").entered();
+            exponent_sets
+                .iter()
+                .map(|exps| {
+                    exps.iter()
+                        .map(|b| {
+                            let mut out = [0u8; 32];
+                            let le = b.to_bytes_le();
+                            out[..le.len()].copy_from_slice(&le);
+                            out
+                        })
+                        .collect()
+                })
+                .collect()
+        };
 
         if let Some(maybe_abort) = &self.maybe_abort {
             if maybe_abort() {
@@ -467,6 +471,24 @@ where
 
         let work_units = self.work_units;
         let num_sets = exponent_sets_bytes.len();
+        let num_bases = bases.len();
+
+        // Pre-compute effective bits and parameters for each set
+        let set_params: Vec<(usize, usize, usize)> = exponent_sets_bytes
+            .iter()
+            .map(|exps| {
+                let effective_bits = compute_max_scalar_bits(exps);
+                let num_windows = div_ceil(effective_bits, window_size);
+                let num_groups = work_units / num_windows;
+                (effective_bits, num_windows, num_groups)
+            })
+            .collect();
+
+        // Flatten all exponents into a single buffer for batch upload
+        let all_exponents: Vec<[u8; 32]> = {
+            let _span = debug_span!("flatten_exponents").entered();
+            exponent_sets_bytes.iter().flatten().copied().collect()
+        };
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             // Upload bases ONCE
@@ -475,11 +497,19 @@ where
                 program.create_buffer_from_slice(bases)?
             };
 
-            // Allocate reusable buffers
+            // Upload ALL exponents in a single transfer
+            let all_exp_buffer = {
+                let _span = debug_span!("upload_all_exponents_once").entered();
+                program.create_buffer_from_slice(&all_exponents)?
+            };
+
+            // Allocate bucket buffer (reused across all MSMs)
             let bucket_buffer = {
                 let _span = debug_span!("allocate_bucket_buffer").entered();
                 unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? }
             };
+
+            // Allocate single result buffer (reused across all MSMs)
             let result_buffer = {
                 let _span = debug_span!("allocate_result_buffer").entered();
                 unsafe { program.create_buffer::<G::Group>(work_units)? }
@@ -487,37 +517,36 @@ where
 
             let mut all_results = Vec::with_capacity(num_sets);
 
-            // Process each exponent set
-            for exponents in exponent_sets_bytes.iter() {
-                let effective_bits = compute_max_scalar_bits(exponents);
-                let num_windows = div_ceil(effective_bits, window_size);
-                let num_groups = work_units / num_windows;
+            // Run all MSM kernels using the offset variant
+            {
+                let _span = debug_span!("run_all_msm_kernels").entered();
+                for (set_idx, &(_, num_windows, num_groups)) in set_params.iter().enumerate() {
+                    let global_work_size = div_ceil(num_windows * num_groups, LOCAL_WORK_SIZE);
+                    // Use the offset variant of the kernel for batched exponent buffer
+                    let kernel_name = format!("{}_multiexp_offset", G::name());
+                    let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
 
-                // Upload this set of exponents
-                let exp_buffer = {
-                    let _span = debug_span!("upload_exponents").entered();
-                    program.create_buffer_from_slice(exponents)?
-                };
+                    // Calculate offset into the flattened exponent buffer
+                    let exp_offset = set_idx * num_bases;
 
-                let global_work_size = div_ceil(num_windows * num_groups, LOCAL_WORK_SIZE);
-                let kernel_name = format!("{}_multiexp", G::name());
-                let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+                    kernel
+                        .arg(&base_buffer)
+                        .arg(&bucket_buffer)
+                        .arg(&result_buffer)
+                        .arg(&all_exp_buffer)
+                        .arg(&(num_bases as u32))
+                        .arg(&(num_groups as u32))
+                        .arg(&(num_windows as u32))
+                        .arg(&(window_size as u32))
+                        .arg(&(exp_offset as u32))
+                        .run()?;
 
-                kernel
-                    .arg(&base_buffer)
-                    .arg(&bucket_buffer)
-                    .arg(&result_buffer)
-                    .arg(&exp_buffer)
-                    .arg(&(bases.len() as u32))
-                    .arg(&(num_groups as u32))
-                    .arg(&(num_windows as u32))
-                    .arg(&(window_size as u32))
-                    .run()?;
-
-                let mut results = vec![<G::Group as AdditiveGroup>::ZERO; work_units];
-                program.read_into_buffer(&result_buffer, &mut results)?;
-
-                all_results.push(results);
+                    // Download this MSM's results
+                    // TODO: In future, could batch these downloads using a larger buffer
+                    let mut results = vec![<G::Group as AdditiveGroup>::ZERO; work_units];
+                    program.read_into_buffer(&result_buffer, &mut results)?;
+                    all_results.push(results);
+                }
             }
 
             Ok(all_results)
@@ -526,27 +555,26 @@ where
         let all_partial_results = self.program.run(closures, ())?;
 
         // CPU accumulation for each MSM result
-        let final_results: Vec<G::Group> = all_partial_results
-            .into_iter()
-            .zip(exponent_sets_bytes.iter())
-            .map(|(results, exponents)| {
-                let effective_bits = compute_max_scalar_bits(exponents);
-                let num_windows = div_ceil(effective_bits, window_size);
-                let num_groups = self.work_units / num_windows;
-
-                let mut acc = <G::Group as AdditiveGroup>::ZERO;
-                for i in (0..num_windows).rev() {
-                    let w = std::cmp::min(window_size, effective_bits - i * window_size);
-                    for _ in 0..w {
-                        acc = acc.double();
+        let final_results: Vec<G::Group> = {
+            let _span = debug_span!("cpu_accumulation_all").entered();
+            all_partial_results
+                .into_iter()
+                .zip(set_params.iter())
+                .map(|(results, &(effective_bits, num_windows, num_groups))| {
+                    let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                    for i in (0..num_windows).rev() {
+                        let w = std::cmp::min(window_size, effective_bits - i * window_size);
+                        for _ in 0..w {
+                            acc = acc.double();
+                        }
+                        for g in 0..num_groups {
+                            acc.add_assign(&results[g * num_windows + i]);
+                        }
                     }
-                    for g in 0..num_groups {
-                        acc.add_assign(&results[g * num_windows + i]);
-                    }
-                }
-                acc
-            })
-            .collect();
+                    acc
+                })
+                .collect()
+        };
 
         Ok(final_results)
     }

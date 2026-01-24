@@ -69,3 +69,74 @@ KERNEL void POINT_multiexp(
 
   results[gid] = res;
 }
+
+/*
+ * Batch multiexp variant that reads exponents from an offset in a larger buffer.
+ * This allows multiple MSMs to share a single exponent buffer upload.
+ * The exp_offset parameter specifies the starting index in the exps buffer.
+ */
+KERNEL void POINT_multiexp_offset(
+    GLOBAL POINT_affine *bases,
+    GLOBAL POINT_jacobian *buckets,
+    GLOBAL POINT_jacobian *results,
+    GLOBAL EXPONENT *exps,
+    uint n,
+    uint num_groups,
+    uint num_windows,
+    uint window_size,
+    uint exp_offset) {
+
+  // We have `num_windows` * `num_groups` threads per multiexp.
+  const uint gid = GET_GLOBAL_ID();
+  if(gid >= num_windows * num_groups) return;
+
+  // We have (2^window_size - 1) buckets.
+  const uint bucket_len = ((1 << window_size) - 1);
+
+  // Each thread has its own set of buckets in global memory.
+  buckets += bucket_len * gid;
+
+  const POINT_jacobian local_zero = POINT_ZERO;
+  for(uint i = 0; i < bucket_len; i++) buckets[i] = local_zero;
+
+  // Num of elements in each group. Round the number up (ceil).
+  const uint len = (n + num_groups - 1) / num_groups;
+
+  // This thread runs the multiexp algorithm on elements from `nstart` to `nened`
+  // on the window [`bits`, `bits` + `w`)
+  const uint nstart = len * (gid / num_windows);
+  const uint nend = min(nstart + len, n);
+  const uint bits = (gid % num_windows) * window_size;
+  const ushort w = min((ushort)window_size, (ushort)(EXPONENT_BITS - bits));
+
+  // Apply offset to exponent reads
+  GLOBAL EXPONENT *exps_offset = exps + exp_offset;
+
+  POINT_jacobian res = POINT_ZERO;
+  for(uint i = nstart; i < nend; i++) {
+    uint ind = EXPONENT_get_bits_lsb(exps_offset[i], bits, w);
+
+    #if defined(OPENCL_NVIDIA) || defined(CUDA)
+      // O_o, weird optimization, having a single special case makes it
+      // tremendously faster!
+      // 511 is chosen because it's half of the maximum bucket len, but
+      // any other number works... Bigger indices seems to be better...
+      if(ind == 511) buckets[510] = POINT_add_mixed(buckets[510], bases[i]);
+      else if(ind--) buckets[ind] = POINT_add_mixed(buckets[ind], bases[i]);
+    #else
+      if(ind--) buckets[ind] = POINT_add_mixed(buckets[ind], bases[i]);
+    #endif
+  }
+
+  // Summation by parts
+  // e.g. 3a + 2b + 1c = a +
+  //                    (a) + b +
+  //                    ((a) + b) + c
+  POINT_jacobian acc = POINT_ZERO;
+  for(int j = bucket_len - 1; j >= 0; j--) {
+    acc = POINT_add(acc, buckets[j]);
+    res = POINT_add(res, acc);
+  }
+
+  results[gid] = res;
+}

@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ark_ff::{AdditiveGroup, BigInteger, PrimeField};
+use ark_ff::{AdditiveGroup, PrimeField};
 use ec_gpu::GpuName;
 use rust_gpu_tools::{program_closures, Program};
 
@@ -516,6 +516,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
     /// This performs fix_var iterations and commits to each intermediate polynomial
     /// in a single GPU session, keeping bases on GPU between MSMs.
     ///
+    /// Optimizations over the naive approach:
+    /// 1. Bases are uploaded once and reused for all MSMs
+    /// 2. Scalar bytes are generated on GPU (no CPU conversion + re-upload)
+    /// 3. All operations happen in a single GPU session
+    ///
     /// # Arguments
     /// * `poly` - Input polynomial evaluations
     /// * `challenges` - Challenge values for each fix_var iteration
@@ -595,10 +600,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             for r in challenges_vec.iter() {
                 let next_len = current_len / 2;
 
-                // === Phase 1: fix_var ===
+                // === Phase 1: fix_var (outputs Fr elements) ===
                 let r_buffer = program.create_buffer_from_slice(&[*r])?;
                 // SAFETY: GPU will initialize this buffer
-                let out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
+                let fr_out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let fix_var_global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
                 let fix_var_kernel_name = format!("{}_fix_var", F::name());
@@ -606,25 +611,41 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                 fix_var_kernel
                     .arg(&current_buffer)
-                    .arg(&out_buffer)
+                    .arg(&fr_out_buffer)
                     .arg(&r_buffer)
                     .arg(&(next_len as u32))
                     .run()?;
 
                 // Download intermediate (needed for Phase 3 of HyperKZG)
                 let mut intermediate = vec![F::ZERO; next_len];
-                program.read_into_buffer(&out_buffer, &mut intermediate)?;
+                program.read_into_buffer(&fr_out_buffer, &mut intermediate)?;
 
-                // === Phase 2: MSM commit ===
-                // Convert intermediate to scalar bytes
-                let scalars: Vec<[u8; 32]> = intermediate
-                    .iter()
-                    .map(|s| {
-                        let mut out = [0u8; 32];
-                        let bigint = s.into_bigint();
-                        let le = bigint.to_bytes_le();
-                        out[..le.len()].copy_from_slice(&le);
-                        out
+                // === Phase 2: Convert Fr to scalar bytes ON GPU ===
+                // SAFETY: GPU will initialize this buffer
+                let scalar_buffer = unsafe { program.create_buffer::<u8>(next_len * 32)? };
+
+                let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
+                let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
+
+                to_scalar_kernel
+                    .arg(&fr_out_buffer)
+                    .arg(&scalar_buffer)
+                    .arg(&(next_len as u32))
+                    .run()?;
+
+                // === Phase 3: MSM commit using GPU-converted scalars ===
+                // Note: We still need effective_bits for window calculation
+                // For now, download scalars to compute effective_bits, but this could be optimized
+                // by using a fixed window size or computing effective_bits on GPU
+                let mut scalars_flat = vec![0u8; next_len * 32];
+                program.read_into_buffer(&scalar_buffer, &mut scalars_flat)?;
+
+                let scalars: Vec<[u8; 32]> = scalars_flat
+                    .chunks(32)
+                    .map(|chunk| {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(chunk);
+                        arr
                     })
                     .collect();
 
@@ -634,18 +655,17 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let num_windows = div_ceil(effective_bits, window_size_for_len);
                 let num_groups = work_units / num_windows;
 
-                // Upload scalars for this MSM
-                let exp_buffer = program.create_buffer_from_slice(&scalars)?;
-
                 let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
                 let msm_kernel_name = format!("{}_multiexp", G::name());
                 let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
 
+                // Use scalar_buffer directly - it's already in the right format on GPU!
+                // Note: The multiexp kernel expects [u8; 32] layout which matches our scalar_buffer
                 msm_kernel
                     .arg(&base_buffer)
                     .arg(&bucket_buffer)
                     .arg(&result_buffer)
-                    .arg(&exp_buffer)
+                    .arg(&scalar_buffer)  // Use GPU-converted scalars directly
                     .arg(&(next_len as u32))
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
@@ -672,7 +692,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 commitments.push(acc);
 
                 // Update for next iteration
-                current_buffer = out_buffer;
+                current_buffer = fr_out_buffer;
                 current_len = next_len;
             }
 

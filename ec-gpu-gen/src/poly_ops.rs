@@ -491,6 +491,107 @@ impl<F: PrimeField + GpuName> SinglePolyOpsKernel<F> {
 
         self.program.run(closures, ())
     }
+
+    /// Convert field elements from Montgomery form to 32-byte little-endian scalars.
+    ///
+    /// This is used to prepare field elements for MSM without CPU round-trip.
+    /// Each field element is converted to 32 bytes in little-endian format.
+    pub fn to_scalar_bytes(&self, field_elements: &[F]) -> EcResult<Vec<[u8; 32]>> {
+        if field_elements.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let n = field_elements.len();
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<[u8; 32]>> {
+            let input_buffer = program.create_buffer_from_slice(field_elements)?;
+            // Output is n * 32 bytes
+            // SAFETY: GPU will initialize this buffer
+            let output_buffer = unsafe { program.create_buffer::<u8>(n * 32)? };
+
+            let global_work_size = div_ceil(n, LOCAL_WORK_SIZE);
+            let kernel_name = format!("{}_to_scalar_bytes", F::name());
+            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+            kernel
+                .arg(&input_buffer)
+                .arg(&output_buffer)
+                .arg(&(n as u32))
+                .run()?;
+
+            // Read raw bytes
+            let mut flat_bytes = vec![0u8; n * 32];
+            program.read_into_buffer(&output_buffer, &mut flat_bytes)?;
+
+            // Convert to array of [u8; 32]
+            let result: Vec<[u8; 32]> = flat_bytes
+                .chunks(32)
+                .map(|chunk| {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(chunk);
+                    arr
+                })
+                .collect();
+
+            Ok(result)
+        });
+
+        self.program.run(closures, ())
+    }
+
+    /// Combined fix_var + to_scalar_bytes operation.
+    ///
+    /// Performs fix_var on the polynomial and immediately converts the result
+    /// to scalar bytes format, avoiding intermediate memory storage.
+    ///
+    /// This is optimized for the HyperKZG fused operation where we need to
+    /// commit to intermediate polynomials.
+    pub fn fix_var_to_scalar(&self, poly: &[F], r: &F) -> EcResult<Vec<[u8; 32]>> {
+        assert!(
+            poly.len() >= 2 && poly.len().is_power_of_two(),
+            "Polynomial length must be a power of 2 and >= 2"
+        );
+
+        let n = poly.len() / 2;
+        let r_slice = [*r];
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<[u8; 32]>> {
+            let poly_buffer = program.create_buffer_from_slice(poly)?;
+            let r_buffer = program.create_buffer_from_slice(&r_slice)?;
+            // Output is n * 32 bytes
+            // SAFETY: GPU will initialize this buffer
+            let output_buffer = unsafe { program.create_buffer::<u8>(n * 32)? };
+
+            let global_work_size = div_ceil(n, LOCAL_WORK_SIZE);
+            let kernel_name = format!("{}_fix_var_to_scalar", F::name());
+            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+            kernel
+                .arg(&poly_buffer)
+                .arg(&output_buffer)
+                .arg(&r_buffer)
+                .arg(&(n as u32))
+                .run()?;
+
+            // Read raw bytes
+            let mut flat_bytes = vec![0u8; n * 32];
+            program.read_into_buffer(&output_buffer, &mut flat_bytes)?;
+
+            // Convert to array of [u8; 32]
+            let result: Vec<[u8; 32]> = flat_bytes
+                .chunks(32)
+                .map(|chunk| {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(chunk);
+                    arr
+                })
+                .collect();
+
+            Ok(result)
+        });
+
+        self.program.run(closures, ())
+    }
 }
 
 /// A struct that contains polynomial operations kernels for multiple devices.
@@ -547,18 +648,26 @@ impl<F: PrimeField + GpuName> PolyOpsKernel<F> {
     pub fn witness_poly_batch(&self, f: &[F], points: &[F]) -> EcResult<Vec<Vec<F>>> {
         self.kernels[0].witness_poly_batch(f, points)
     }
+
+    /// Convert field elements to scalar bytes on GPU.
+    pub fn to_scalar_bytes(&self, field_elements: &[F]) -> EcResult<Vec<[u8; 32]>> {
+        self.kernels[0].to_scalar_bytes(field_elements)
+    }
+
+    /// Combined fix_var + to_scalar_bytes operation.
+    pub fn fix_var_to_scalar(&self, poly: &[F], r: &F) -> EcResult<Vec<[u8; 32]>> {
+        self.kernels[0].fix_var_to_scalar(poly, r)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[cfg(feature = "arkworks")]
     use ark_bn254::Fr;
     #[cfg(feature = "arkworks")]
     use ark_ff::Field;
     #[cfg(feature = "arkworks")]
-    use ark_std::UniformRand;
+    use ark_std::{UniformRand, Zero};
 
     /// CPU reference implementation for fix_var
     #[cfg(feature = "arkworks")]
