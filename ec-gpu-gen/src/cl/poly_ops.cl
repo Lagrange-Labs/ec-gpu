@@ -39,6 +39,42 @@ KERNEL void FIELD_fix_var(
 }
 
 /*
+ * Fix the lowest variable with challenge read from an offset in a buffer.
+ * This variant allows all challenges to be uploaded once and indexed per iteration.
+ *
+ * Input:  poly of length 2n (evaluation form)
+ * Output: out of length n
+ * challenges: Buffer containing all challenge values
+ * challenge_idx: Index of the challenge to use from the buffer
+ * Effect: Fixes the lowest variable to value challenges[challenge_idx]
+ */
+KERNEL void FIELD_fix_var_indexed(
+    GLOBAL FIELD* poly,
+    GLOBAL FIELD* out,
+    GLOBAL FIELD* challenges,
+    uint n,
+    uint challenge_idx)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    // Load r from the indexed position in challenges buffer
+    FIELD r = challenges[challenge_idx];
+
+    FIELD low = poly[2 * gid];
+    FIELD high = poly[2 * gid + 1];
+
+    // diff = high - low
+    FIELD diff = FIELD_sub(high, low);
+
+    // scaled = r * diff
+    FIELD scaled = FIELD_mul(r, diff);
+
+    // result = low + scaled = low + r * (high - low)
+    out[gid] = FIELD_add(low, scaled);
+}
+
+/*
  * Evaluate a univariate polynomial at a single point using Horner's method.
  * The polynomial is in coefficient form: f(x) = c0 + c1*x + c2*x^2 + ...
  *
@@ -363,6 +399,62 @@ KERNEL void FIELD_to_scalar_bytes(
         }
     #elif FIELD_LIMB_BITS == 64
         // 4 x 64-bit limbs = 32 bytes
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 8 + 0] = (uchar)(limb);
+            out_ptr[i * 8 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 8 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 8 + 3] = (uchar)(limb >> 24);
+            out_ptr[i * 8 + 4] = (uchar)(limb >> 32);
+            out_ptr[i * 8 + 5] = (uchar)(limb >> 40);
+            out_ptr[i * 8 + 6] = (uchar)(limb >> 48);
+            out_ptr[i * 8 + 7] = (uchar)(limb >> 56);
+        }
+    #else
+        #error "Unsupported FIELD_LIMB_BITS value"
+    #endif
+}
+
+/*
+ * Convert field elements from Montgomery form to 32-byte scalars with offset.
+ *
+ * This variant reads from a specific offset in the input buffer, useful for
+ * processing batched witness polynomials without copying.
+ *
+ * input:       Field elements in Montgomery form
+ * output:      Scalar bytes, 32 bytes per element (total n * 32 bytes)
+ * n:           Number of elements to convert
+ * input_offset: Offset (in elements) into the input buffer
+ *
+ * Total threads needed: n (one thread per element)
+ */
+KERNEL void FIELD_to_scalar_bytes_offset(
+    GLOBAL FIELD* input,
+    GLOBAL uchar* output,
+    uint n,
+    uint input_offset)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    // Load field element in Montgomery form from offset position
+    FIELD mont = input[input_offset + gid];
+
+    // Convert from Montgomery form to standard form
+    FIELD standard = FIELD_unmont(mont);
+
+    // Write 32 bytes in little-endian order
+    GLOBAL uchar* out_ptr = output + gid * 32;
+
+    #if FIELD_LIMB_BITS == 32
+        for (uint i = 0; i < FIELD_LIMBS; i++) {
+            FIELD_limb limb = standard.val[i];
+            out_ptr[i * 4 + 0] = (uchar)(limb);
+            out_ptr[i * 4 + 1] = (uchar)(limb >> 8);
+            out_ptr[i * 4 + 2] = (uchar)(limb >> 16);
+            out_ptr[i * 4 + 3] = (uchar)(limb >> 24);
+        }
+    #elif FIELD_LIMB_BITS == 64
         for (uint i = 0; i < FIELD_LIMBS; i++) {
             FIELD_limb limb = standard.val[i];
             out_ptr[i * 8 + 0] = (uchar)(limb);

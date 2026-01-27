@@ -88,6 +88,9 @@ impl<F: PrimeField + GpuName> SinglePolyOpsKernel<F> {
     ///
     /// Starting from a polynomial of length 2^k, fixes k variables to the given
     /// challenge values, returning the final constant value.
+    ///
+    /// This uses `fix_vars_with_intermediates` internally to perform all operations
+    /// in a single GPU session (optimization #6).
     pub fn fix_vars(&self, poly: &[F], challenges: &[F]) -> EcResult<F> {
         assert!(poly.len().is_power_of_two());
         let log_len = poly.len().ilog2() as usize;
@@ -96,14 +99,15 @@ impl<F: PrimeField + GpuName> SinglePolyOpsKernel<F> {
             "Too many challenges for polynomial size"
         );
 
-        let mut current = poly.to_vec();
-
-        for challenge in challenges {
-            current = self.fix_var(&current, challenge)?;
+        if challenges.is_empty() {
+            return Ok(poly[0]);
         }
 
-        // After fixing all variables, we should have a single element
-        Ok(current[0])
+        // Use the optimized single-session version (optimization #6)
+        let intermediates = self.fix_vars_with_intermediates(poly, challenges)?;
+
+        // The last intermediate is the final result after fixing all variables
+        Ok(intermediates.last().unwrap()[0])
     }
 
     /// Fix multiple variables and return all intermediate polynomials.
@@ -144,25 +148,26 @@ impl<F: PrimeField + GpuName> SinglePolyOpsKernel<F> {
             let mut current_len = initial_len;
             let mut results = Vec::with_capacity(num_challenges);
 
-            for r in challenges_vec.iter() {
-                let next_len = current_len / 2;
+            // Upload ALL challenges in a single buffer (optimization #9)
+            let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
 
-                // Create single-element buffer for r
-                let r_buffer = program.create_buffer_from_slice(&[*r])?;
+            for challenge_idx in 0..num_challenges {
+                let next_len = current_len / 2;
 
                 // It is safe as the GPU will initialize that buffer
                 let out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
-                let kernel_name = format!("{}_fix_var", F::name());
+                let kernel_name = format!("{}_fix_var_indexed", F::name());
                 let kernel =
                     program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
 
                 kernel
                     .arg(&current_buffer)
                     .arg(&out_buffer)
-                    .arg(&r_buffer)
+                    .arg(&challenges_buffer)
                     .arg(&(next_len as u32))
+                    .arg(&(challenge_idx as u32))
                     .run()?;
 
                 // Download intermediate result for MSM

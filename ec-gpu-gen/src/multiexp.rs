@@ -578,6 +578,171 @@ where
 
         Ok(final_results)
     }
+
+    /// Batch MSM with fixed bit size assumption.
+    ///
+    /// This variant avoids the CPU scan to compute effective_bits by using a fixed
+    /// 254-bit assumption (appropriate for bn254 scalar field). This eliminates
+    /// the O(n * num_sets) CPU work at the cost of slightly more GPU work when
+    /// scalars are small.
+    ///
+    /// Use this when:
+    /// - Scalars are expected to be close to full size (254 bits)
+    /// - You want to minimize CPU overhead for batch operations
+    /// - Performance profiling shows effective_bits computation is a bottleneck
+    pub fn batch_multiexp_fixed_bits(
+        &self,
+        bases: &[G::GpuRepr],
+        exponent_sets: &[Vec<<G::ScalarField as PrimeField>::BigInt>],
+        fixed_bits: usize,
+    ) -> EcResult<Vec<G::Group>> {
+        let _span = debug_span!("batch_multiexp_fixed_bits", n_bases = bases.len(), n_sets = exponent_sets.len(), bits = fixed_bits).entered();
+
+        if exponent_sets.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Verify all exponent sets have same length as bases
+        for (i, exps) in exponent_sets.iter().enumerate() {
+            assert_eq!(
+                bases.len(),
+                exps.len(),
+                "Exponent set {} has length {}, expected {}",
+                i,
+                exps.len(),
+                bases.len()
+            );
+        }
+
+        // Convert all exponent sets to bytes
+        let exponent_sets_bytes: Vec<Vec<[u8; 32]>> = {
+            let _span = debug_span!("convert_exponents_to_bytes").entered();
+            exponent_sets
+                .iter()
+                .map(|exps| {
+                    exps.iter()
+                        .map(|b| {
+                            let mut out = [0u8; 32];
+                            let le = b.to_bytes_le();
+                            out[..le.len()].copy_from_slice(&le);
+                            out
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+
+        if let Some(maybe_abort) = &self.maybe_abort {
+            if maybe_abort() {
+                return Err(EcError::Aborted);
+            }
+        }
+
+        // Compute window size based on number of bases (same for all MSMs)
+        let window_size = self.calc_window_size(bases.len());
+        let bucket_len = 1 << window_size;
+
+        let work_units = self.work_units;
+        let num_sets = exponent_sets_bytes.len();
+        let num_bases = bases.len();
+
+        // Use fixed bits for all sets - avoids CPU scan
+        let effective_bits = fixed_bits;
+        let num_windows = div_ceil(effective_bits, window_size);
+        let num_groups = work_units / num_windows;
+
+        // Flatten all exponents into a single buffer for batch upload
+        let all_exponents: Vec<[u8; 32]> = {
+            let _span = debug_span!("flatten_exponents").entered();
+            exponent_sets_bytes.iter().flatten().copied().collect()
+        };
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
+            // Upload bases ONCE
+            let base_buffer = {
+                let _span = debug_span!("upload_bases_once").entered();
+                program.create_buffer_from_slice(bases)?
+            };
+
+            // Upload ALL exponents in a single transfer
+            let all_exp_buffer = {
+                let _span = debug_span!("upload_all_exponents_once").entered();
+                program.create_buffer_from_slice(&all_exponents)?
+            };
+
+            // Allocate bucket buffer (reused across all MSMs)
+            let bucket_buffer = {
+                let _span = debug_span!("allocate_bucket_buffer").entered();
+                unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? }
+            };
+
+            // Allocate single result buffer (reused across all MSMs)
+            let result_buffer = {
+                let _span = debug_span!("allocate_result_buffer").entered();
+                unsafe { program.create_buffer::<G::Group>(work_units)? }
+            };
+
+            let mut all_results = Vec::with_capacity(num_sets);
+
+            // Run all MSM kernels using the offset variant
+            {
+                let _span = debug_span!("run_all_msm_kernels").entered();
+                let global_work_size = div_ceil(num_windows * num_groups, LOCAL_WORK_SIZE);
+                let kernel_name = format!("{}_multiexp_offset", G::name());
+
+                for set_idx in 0..num_sets {
+                    let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+                    // Calculate offset into the flattened exponent buffer
+                    let exp_offset = set_idx * num_bases;
+
+                    kernel
+                        .arg(&base_buffer)
+                        .arg(&bucket_buffer)
+                        .arg(&result_buffer)
+                        .arg(&all_exp_buffer)
+                        .arg(&(num_bases as u32))
+                        .arg(&(num_groups as u32))
+                        .arg(&(num_windows as u32))
+                        .arg(&(window_size as u32))
+                        .arg(&(exp_offset as u32))
+                        .run()?;
+
+                    // Download this MSM's results
+                    let mut results = vec![<G::Group as AdditiveGroup>::ZERO; work_units];
+                    program.read_into_buffer(&result_buffer, &mut results)?;
+                    all_results.push(results);
+                }
+            }
+
+            Ok(all_results)
+        });
+
+        let all_partial_results = self.program.run(closures, ())?;
+
+        // CPU accumulation for each MSM result (using fixed effective_bits for all)
+        let final_results: Vec<G::Group> = {
+            let _span = debug_span!("cpu_accumulation_all").entered();
+            all_partial_results
+                .into_iter()
+                .map(|results| {
+                    let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                    for i in (0..num_windows).rev() {
+                        let w = std::cmp::min(window_size, effective_bits - i * window_size);
+                        for _ in 0..w {
+                            acc = acc.double();
+                        }
+                        for g in 0..num_groups {
+                            acc.add_assign(&results[g * num_windows + i]);
+                        }
+                    }
+                    acc
+                })
+                .collect()
+        };
+
+        Ok(final_results)
+    }
 }
 
 /// A struct that contains several multiexp kernels for different devices.
@@ -748,5 +913,20 @@ where
         exponent_sets: &[Vec<<G::ScalarField as PrimeField>::BigInt>],
     ) -> EcResult<Vec<G::Group>> {
         self.kernels[0].batch_multiexp(bases, exponent_sets)
+    }
+
+    /// Batch MSM with fixed bit size assumption.
+    ///
+    /// This variant avoids the CPU scan to compute effective_bits by using a fixed
+    /// bit size assumption. For bn254, use 254.
+    ///
+    /// Uses the first available GPU kernel for simplicity.
+    pub fn batch_multiexp_fixed_bits(
+        &self,
+        bases: &[G::GpuRepr],
+        exponent_sets: &[Vec<<G::ScalarField as PrimeField>::BigInt>],
+        fixed_bits: usize,
+    ) -> EcResult<Vec<G::Group>> {
+        self.kernels[0].batch_multiexp_fixed_bits(bases, exponent_sets, fixed_bits)
     }
 }

@@ -197,26 +197,27 @@ impl<F: PrimeField + GpuName> CombinedPolyOps<F> {
             let mut current_len = initial_len;
             let mut intermediates = Vec::with_capacity(num_challenges);
 
-            for r in challenges_vec.iter() {
-                let next_len = current_len / 2;
+            // Upload ALL challenges in a single buffer (optimization #9)
+            let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
 
-                // Create buffer for challenge value
-                let r_buffer = program.create_buffer_from_slice(&[*r])?;
+            for challenge_idx in 0..num_challenges {
+                let next_len = current_len / 2;
 
                 // Create output buffer
                 // SAFETY: GPU will initialize this buffer
                 let out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
-                let kernel_name = format!("{}_fix_var", F::name());
+                let kernel_name = format!("{}_fix_var_indexed", F::name());
                 let kernel =
                     program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
 
                 kernel
                     .arg(&current_buffer)
                     .arg(&out_buffer)
-                    .arg(&r_buffer)
+                    .arg(&challenges_buffer)
                     .arg(&(next_len as u32))
+                    .arg(&(challenge_idx as u32))
                     .run()?;
 
                 // Download intermediate result
@@ -282,24 +283,27 @@ impl<F: PrimeField + GpuName> CombinedPolyOps<F> {
 
             let mut intermediates = Vec::with_capacity(num_challenges);
 
+            // Upload ALL challenges in a single buffer (optimization #9)
+            let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
+
             // Phase 1: Fix vars and collect intermediates
-            for r in challenges_vec.iter() {
+            for challenge_idx in 0..num_challenges {
                 let next_len = current_len / 2;
 
-                let r_buffer = program.create_buffer_from_slice(&[*r])?;
                 // SAFETY: GPU will initialize this buffer
                 let out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
-                let kernel_name = format!("{}_fix_var", F::name());
+                let kernel_name = format!("{}_fix_var_indexed", F::name());
                 let kernel =
                     program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
 
                 kernel
                     .arg(&current_buffer)
                     .arg(&out_buffer)
-                    .arg(&r_buffer)
+                    .arg(&challenges_buffer)
                     .arg(&(next_len as u32))
+                    .arg(&(challenge_idx as u32))
                     .run()?;
 
                 // Download intermediate
@@ -560,23 +564,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
 
-        // Pre-compute max scalar bits function
-        fn compute_max_scalar_bits(scalars: &[[u8; 32]]) -> usize {
-            let max_bits = scalars
-                .iter()
-                .map(|bytes| {
-                    for (i, &byte) in bytes.iter().enumerate().rev() {
-                        if byte != 0 {
-                            return (i + 1) * 8 - byte.leading_zeros() as usize;
-                        }
-                    }
-                    0
-                })
-                .max()
-                .unwrap_or(0);
-            max_bits.max(1)
-        }
-
         let closures = program_closures!(|program, _arg| -> EcResult<FixVarsAndCommitResult<F, G::Group>> {
             // Upload polynomial once
             let mut current_buffer = program.create_buffer_from_slice(&poly_vec)?;
@@ -584,6 +571,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // Upload bases once (for all MSMs)
             let base_buffer = program.create_buffer_from_slice(bases)?;
+
+            // Upload ALL challenges in a single buffer (optimization #9)
+            let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
 
             let mut intermediates = Vec::with_capacity(num_challenges);
             let mut commitments = Vec::with_capacity(num_challenges);
@@ -597,23 +587,23 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
             let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
-            for r in challenges_vec.iter() {
+            for challenge_idx in 0..num_challenges {
                 let next_len = current_len / 2;
 
                 // === Phase 1: fix_var (outputs Fr elements) ===
-                let r_buffer = program.create_buffer_from_slice(&[*r])?;
                 // SAFETY: GPU will initialize this buffer
                 let fr_out_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let fix_var_global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
-                let fix_var_kernel_name = format!("{}_fix_var", F::name());
+                let fix_var_kernel_name = format!("{}_fix_var_indexed", F::name());
                 let fix_var_kernel = program.create_kernel(&fix_var_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
 
                 fix_var_kernel
                     .arg(&current_buffer)
                     .arg(&fr_out_buffer)
-                    .arg(&r_buffer)
+                    .arg(&challenges_buffer)
                     .arg(&(next_len as u32))
+                    .arg(&(challenge_idx as u32))
                     .run()?;
 
                 // Download intermediate (needed for Phase 3 of HyperKZG)
@@ -634,22 +624,12 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // === Phase 3: MSM commit using GPU-converted scalars ===
-                // Note: We still need effective_bits for window calculation
-                // For now, download scalars to compute effective_bits, but this could be optimized
-                // by using a fixed window size or computing effective_bits on GPU
-                let mut scalars_flat = vec![0u8; next_len * 32];
-                program.read_into_buffer(&scalar_buffer, &mut scalars_flat)?;
-
-                let scalars: Vec<[u8; 32]> = scalars_flat
-                    .chunks(32)
-                    .map(|chunk| {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(chunk);
-                        arr
-                    })
-                    .collect();
-
-                let effective_bits = compute_max_scalar_bits(&scalars);
+                // Use fixed 254-bit assumption for bn254 scalars (the field modulus bit size).
+                // This avoids downloading scalars just to compute effective_bits.
+                // The trade-off is slightly more windows than necessary for small scalars,
+                // but eliminates a costly GPU->CPU transfer per iteration.
+                const BN254_SCALAR_BITS: usize = 254;
+                let effective_bits = BN254_SCALAR_BITS;
                 let window_size_for_len = ((div_ceil(next_len, work_units) as f64).log2() as usize) + 2;
                 let window_size_for_len = std::cmp::min(window_size_for_len, max_window_size);
                 let num_windows = div_ceil(effective_bits, window_size_for_len);
@@ -700,6 +680,154 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 intermediates,
                 commitments,
             })
+        });
+
+        self.program.run(closures, ())
+    }
+
+    /// Fused witness polynomial computation + MSM commit.
+    ///
+    /// This computes witness polynomials for KZG opening at multiple points and
+    /// immediately commits to each witness polynomial, all in a single GPU session.
+    /// The witness polynomials are never downloaded to CPU.
+    ///
+    /// This eliminates a GPU→CPU→GPU round-trip compared to calling
+    /// witness_poly_batch followed by batch_commit separately.
+    ///
+    /// # Arguments
+    /// * `poly` - The polynomial to open (B(x) in HyperKZG Phase 3)
+    /// * `points` - Evaluation points (e.g., [r, -r, r²] in HyperKZG)
+    /// * `bases` - G1 bases for MSM (must be at least poly.len() - 1)
+    ///
+    /// # Returns
+    /// Commitments to each witness polynomial (one per point)
+    pub fn witness_poly_batch_and_commit(
+        &self,
+        poly: &[F],
+        points: &[F],
+        bases: &[G::GpuRepr],
+    ) -> EcResult<Vec<G::Group>> {
+        assert!(!poly.is_empty(), "Polynomial must not be empty");
+        assert!(!points.is_empty(), "Must have at least one point");
+
+        let n = poly.len();
+        let witness_len = n - 1;
+        let num_points = points.len();
+
+        assert!(
+            bases.len() >= witness_len,
+            "Not enough bases for witness polynomial size"
+        );
+
+        let poly_vec = poly.to_vec();
+        let points_vec = points.to_vec();
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
+            // Upload polynomial once
+            let poly_buffer = program.create_buffer_from_slice(&poly_vec)?;
+
+            // Upload points
+            let points_buffer = program.create_buffer_from_slice(&points_vec)?;
+
+            // Upload bases once (for all witness MSMs)
+            let base_buffer = program.create_buffer_from_slice(&bases[..witness_len])?;
+
+            // Compute all witness polynomials in batch
+            // Output: num_points witness polynomials, each of length witness_len
+            let total_witness_elements = num_points * witness_len;
+            // SAFETY: GPU will initialize this buffer
+            let witnesses_buffer = unsafe { program.create_buffer::<F>(total_witness_elements)? };
+
+            // One thread per point (each computes a full witness polynomial)
+            let witness_global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
+            let witness_kernel_name = format!("{}_witness_poly_batch", F::name());
+            let witness_kernel = program.create_kernel(&witness_kernel_name, witness_global_work_size, LOCAL_WORK_SIZE)?;
+
+            witness_kernel
+                .arg(&poly_buffer)
+                .arg(&points_buffer)
+                .arg(&witnesses_buffer)
+                .arg(&(n as u32))
+                .arg(&(num_points as u32))
+                .run()?;
+
+            // Now commit each witness polynomial using MSM
+            // Pre-allocate MSM buffers
+            let window_size = ((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2;
+            let window_size = std::cmp::min(window_size, max_window_size);
+            let bucket_len = 1 << window_size;
+
+            // SAFETY: GPU will initialize these buffers
+            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
+            let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
+
+            // Buffer for scalar bytes (reused for each witness)
+            // SAFETY: GPU will initialize this buffer
+            let scalar_buffer = unsafe { program.create_buffer::<u8>(witness_len * 32)? };
+
+            let mut commitments = Vec::with_capacity(num_points);
+
+            // Use fixed 254-bit assumption for bn254 scalars
+            const BN254_SCALAR_BITS: usize = 254;
+            let effective_bits = BN254_SCALAR_BITS;
+            let num_windows = div_ceil(effective_bits, window_size);
+            let num_groups = work_units / num_windows;
+            let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
+
+            for point_idx in 0..num_points {
+                // Extract this witness polynomial's data from the batched output
+                // The witness_poly_batch kernel stores witnesses contiguously
+                let witness_offset = point_idx * witness_len;
+
+                // Convert witness Fr elements to scalar bytes ON GPU
+                // We need a kernel that operates on a slice of the witnesses buffer
+                let to_scalar_kernel_name = format!("{}_to_scalar_bytes_offset", F::name());
+                let to_scalar_global_work_size = div_ceil(witness_len, LOCAL_WORK_SIZE);
+                let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, to_scalar_global_work_size, LOCAL_WORK_SIZE)?;
+
+                to_scalar_kernel
+                    .arg(&witnesses_buffer)
+                    .arg(&scalar_buffer)
+                    .arg(&(witness_len as u32))
+                    .arg(&(witness_offset as u32))
+                    .run()?;
+
+                // MSM commit
+                let msm_kernel_name = format!("{}_multiexp", G::name());
+                let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
+
+                msm_kernel
+                    .arg(&base_buffer)
+                    .arg(&bucket_buffer)
+                    .arg(&result_buffer)
+                    .arg(&scalar_buffer)
+                    .arg(&(witness_len as u32))
+                    .arg(&(num_groups as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                // Download MSM partial results and accumulate
+                let mut msm_results = vec![<G::Group as AdditiveGroup>::ZERO; work_units];
+                program.read_into_buffer(&result_buffer, &mut msm_results)?;
+
+                let mut acc = <G::Group as AdditiveGroup>::ZERO;
+                for i in (0..num_windows).rev() {
+                    let w = std::cmp::min(window_size, effective_bits - i * window_size);
+                    for _ in 0..w {
+                        acc = acc.double();
+                    }
+                    for g in 0..num_groups {
+                        acc.add_assign(&msm_results[g * num_windows + i]);
+                    }
+                }
+
+                commitments.push(acc);
+            }
+
+            Ok(commitments)
         });
 
         self.program.run(closures, ())
