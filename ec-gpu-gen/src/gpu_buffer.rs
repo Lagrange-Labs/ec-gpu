@@ -610,9 +610,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let mut intermediate = vec![F::ZERO; next_len];
                 program.read_into_buffer(&fr_out_buffer, &mut intermediate)?;
 
-                // === Phase 2: Convert Fr to scalar bytes ON GPU ===
+                // === Phase 2: Convert Fr from Montgomery to standard form ON GPU ===
                 // SAFETY: GPU will initialize this buffer
-                let scalar_buffer = unsafe { program.create_buffer::<u8>(next_len * 32)? };
+                let scalar_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
                 let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
@@ -763,9 +763,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
             let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
-            // Buffer for scalar bytes (reused for each witness)
+            // Buffer for scalar conversion (reused for each witness)
             // SAFETY: GPU will initialize this buffer
-            let scalar_buffer = unsafe { program.create_buffer::<u8>(witness_len * 32)? };
+            let scalar_buffer = unsafe { program.create_buffer::<F>(witness_len)? };
 
             let mut commitments = Vec::with_capacity(num_points);
 
@@ -963,9 +963,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let mut intermediate = vec![F::ZERO; next_len];
                 program.read_into_buffer(&fr_out_buffer, &mut intermediate)?;
 
-                // Phase 2: Convert Fr to scalar bytes ON GPU
+                // Phase 2: Convert Fr from Montgomery to standard form ON GPU
+                // The output has the same limb layout as EXPONENT, so MSM can consume it directly.
                 // SAFETY: GPU will initialize this buffer
-                let scalar_buffer = unsafe { program.create_buffer::<u8>(next_len * 32)? };
+                let scalar_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
                 let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
                 let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
@@ -1102,9 +1103,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let bucket_buffer_p3 = unsafe { program.create_buffer::<G::Group>(work_units * witness_bucket_len)? };
             let result_buffer_p3 = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
-            // Scalar buffer for witness conversion
+            // Scalar buffer for witness conversion (FIELD layout = EXPONENT layout after unmont)
             // SAFETY: GPU will initialize this buffer
-            let scalar_buffer_p3 = unsafe { program.create_buffer::<u8>(witness_len * 32)? };
+            let scalar_buffer_p3 = unsafe { program.create_buffer::<F>(witness_len)? };
 
             let mut witness_commitments = Vec::with_capacity(num_points);
 

@@ -225,3 +225,100 @@ KERNEL void FIELD_sub_poly(
 
     out[gid] = FIELD_sub(a[gid], b[gid]);
 }
+
+/*
+ * Fix variable with indexed challenge from a challenges buffer.
+ * Same as fix_var but reads r from challenges[challenge_idx] instead of r_buf[0].
+ *
+ * This avoids uploading one challenge at a time — all challenges are uploaded once.
+ */
+KERNEL void FIELD_fix_var_indexed(
+    GLOBAL FIELD* poly,
+    GLOBAL FIELD* out,
+    GLOBAL FIELD* challenges,
+    uint n,
+    uint challenge_idx)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    FIELD r = challenges[challenge_idx];
+
+    FIELD low = poly[2 * gid];
+    FIELD high = poly[2 * gid + 1];
+
+    FIELD diff = FIELD_sub(high, low);
+    FIELD scaled = FIELD_mul(r, diff);
+    out[gid] = FIELD_add(low, scaled);
+}
+
+/*
+ * Convert field elements from Montgomery form to standard (non-Montgomery) form.
+ * Output has the same limb layout as the EXPONENT type used by MSM.
+ *
+ * This allows scalar conversion to happen on GPU instead of downloading Fr values,
+ * calling into_bigint() on CPU, and re-uploading.
+ */
+KERNEL void FIELD_to_scalar_bytes(
+    GLOBAL FIELD* input,
+    GLOBAL FIELD* output,
+    uint n)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    output[gid] = FIELD_unmont(input[gid]);
+}
+
+/*
+ * Convert field elements from Montgomery to standard form, reading from an offset.
+ * Reads from input[offset + gid] and writes to output[gid].
+ *
+ * Used for extracting individual witness polynomials from a flattened buffer
+ * (where multiple witnesses are stored contiguously).
+ */
+KERNEL void FIELD_to_scalar_bytes_offset(
+    GLOBAL FIELD* input,
+    GLOBAL FIELD* output,
+    uint n,
+    uint offset)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= n) return;
+
+    output[gid] = FIELD_unmont(input[offset + gid]);
+}
+
+/*
+ * Batch witness polynomial computation for multiple evaluation points.
+ * For each point u_i, computes h_i(x) where f(x) = h_i(x) * (x - u_i) + f(u_i).
+ *
+ * Each thread handles one evaluation point (sequential recurrence per point).
+ * Output: witnesses is a flattened buffer of num_points * (n-1) elements.
+ *
+ * f:         input polynomial of length n
+ * points:    evaluation points [u_0, u_1, ..., u_{num_points-1}]
+ * witnesses: output buffer, witnesses[i*(n-1) + j] = h_i[j]
+ * n:         polynomial length
+ * num_points: number of evaluation points
+ */
+KERNEL void FIELD_witness_poly_batch(
+    GLOBAL FIELD* f,
+    GLOBAL FIELD* points,
+    GLOBAL FIELD* witnesses,
+    uint n,
+    uint num_points)
+{
+    const uint pid = GET_GLOBAL_ID();
+    if (pid >= num_points) return;
+
+    FIELD u = points[pid];
+    uint witness_len = n - 1;
+    uint out_offset = pid * witness_len;
+
+    FIELD carry = FIELD_ZERO;
+    for (int i = n - 1; i >= 1; i--) {
+        carry = FIELD_add(f[i], FIELD_mul(carry, u));
+        witnesses[out_offset + i - 1] = carry;
+    }
+}
