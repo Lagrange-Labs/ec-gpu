@@ -321,8 +321,9 @@ where
         let effective_bits = compute_max_scalar_bits(&exponents);
 
         let window_size = self.calc_window_size(bases.len());
-        // windows_size * num_windows needs to be >= effective_bits to cover all scalar bits.
-        let num_windows = div_ceil(effective_bits, window_size);
+        // Signed-digit (Booth) encoding can produce a carry out of the last window,
+        // so we need one extra bit of headroom: effective_bits + 1.
+        let num_windows = div_ceil(effective_bits + 1, window_size);
         let num_groups = self.work_units / num_windows;
         // Signed-digit: half the buckets (2^(w-1) instead of 2^w - 1)
         let signed_bucket_len = 1 << (window_size - 1);

@@ -658,7 +658,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let effective_bits = BN254_SCALAR_BITS;
                 let window_size_for_len = ((div_ceil(next_len, work_units) as f64).log2() as usize) + 2;
                 let window_size_for_len = std::cmp::min(window_size_for_len, max_window_size);
-                let num_windows = div_ceil(effective_bits, window_size_for_len);
+                let num_windows = div_ceil(effective_bits + 1, window_size_for_len);
                 let num_groups = work_units / num_windows;
 
                 // Preprocess to signed digits
@@ -843,7 +843,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // Use fixed 254-bit assumption for bn254 scalars
             const BN254_SCALAR_BITS: usize = 254;
             let effective_bits = BN254_SCALAR_BITS;
-            let num_windows = div_ceil(effective_bits, window_size);
+            let num_windows = div_ceil(effective_bits + 1, window_size);
             let num_groups = work_units / num_windows;
             let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
 
@@ -1087,7 +1087,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let ws = ((div_ceil(next_len, work_units) as f64).log2() as usize) + 2;
                     std::cmp::min(ws, max_window_size)
                 };
-                let num_windows = div_ceil(effective_bits, window_size_for_len);
+                let num_windows = div_ceil(effective_bits + 1, window_size_for_len);
                 let num_groups = work_units / num_windows;
                 assert!(num_groups > 0, "MSM num_groups must be > 0 (work_units={work_units}, num_windows={num_windows})");
 
@@ -1288,7 +1288,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             const BN254_SCALAR_BITS_P3: usize = 254;
             let effective_bits_p3 = BN254_SCALAR_BITS_P3;
-            let num_windows_p3 = div_ceil(effective_bits_p3, witness_window_size);
+            let num_windows_p3 = div_ceil(effective_bits_p3 + 1, witness_window_size);
             let num_groups_p3 = work_units / num_windows_p3;
             assert!(num_groups_p3 > 0, "Phase 3 MSM num_groups must be > 0 (work_units={work_units}, num_windows={num_windows_p3})");
             let msm_global_work_size_p3 = div_ceil(num_windows_p3 * num_groups_p3, MSM_LOCAL_WORK_SIZE);
