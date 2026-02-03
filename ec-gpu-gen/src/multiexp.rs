@@ -96,8 +96,8 @@ where
     let max_memory = ((mem as f64) * (1f64 - MEMORY_PADDING)) as usize;
     // The amount of memory (in bytes) of a single term.
     let term_size = aff_size + exp_size;
-    // The number of buckets needed for one work unit
-    let max_buckets_per_work_unit = 1 << MAX_WINDOW_SIZE;
+    // The number of buckets needed for one work unit (signed-digit: half)
+    let max_buckets_per_work_unit = 1 << (MAX_WINDOW_SIZE - 1);
     // The amount of memory (in bytes) we need for the intermediate steps (buckets).
     let buckets_size = work_units * max_buckets_per_work_unit * proj_size;
     // The amount of memory (in bytes) we need for the results.
@@ -281,7 +281,10 @@ where
         })
     }
 
-    /// Run the actual multiexp computation on the GPU.
+    /// Run the actual multiexp computation on the GPU using signed-digit decomposition.
+    ///
+    /// Uses Booth encoding to halve the number of buckets per thread (from 2^w-1 to 2^(w-1)),
+    /// which roughly halves the summation-by-parts cost in each thread.
     ///
     /// The number of `bases` and `exponents` are determined by [`SingleMultiexpKernel`]`::n`, this
     /// means that it is guaranteed that this amount of calculations fit on the GPU this kernel is
@@ -321,11 +324,12 @@ where
         // windows_size * num_windows needs to be >= effective_bits to cover all scalar bits.
         let num_windows = div_ceil(effective_bits, window_size);
         let num_groups = self.work_units / num_windows;
-        let bucket_len = 1 << window_size;
+        // Signed-digit: half the buckets (2^(w-1) instead of 2^w - 1)
+        let signed_bucket_len = 1 << (window_size - 1);
+        let n_bases = bases.len();
 
         // Each group will have `num_windows` threads and as there are `num_groups` groups, there will
         // be `num_groups` * `num_windows` threads in total.
-        // Each thread will use `num_groups` * `num_windows` * `bucket_len` buckets.
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
             let base_buffer = {
@@ -337,12 +341,34 @@ where
                 program.create_buffer_from_slice(&exponents)?
             };
 
+            // Preprocessing: convert exponents to signed digits
+            let digits_buffer = {
+                let _span = debug_span!("preprocess_signed_digits").entered();
+                let digits_len = n_bases * num_windows;
+                // SAFETY: GPU will initialize this buffer
+                let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+
+                let preprocess_global = div_ceil(n_bases, LOCAL_WORK_SIZE);
+                let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
+                let preprocess_kernel = program.create_kernel(
+                    &preprocess_kernel_name, preprocess_global, LOCAL_WORK_SIZE)?;
+
+                preprocess_kernel
+                    .arg(&exp_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(n_bases as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                digits_buffer
+            };
+
             let (bucket_buffer, result_buffer) = {
                 let _span = debug_span!("allocate_gpu_buffers").entered();
-                // It is safe as the GPU will initialize that buffer
+                // SAFETY: GPU will initialize these buffers
                 let bucket_buffer =
-                    unsafe { program.create_buffer::<G::Group>(self.work_units * bucket_len)? };
-                // It is safe as the GPU will initialize that buffer
+                    unsafe { program.create_buffer::<G::Group>(self.work_units * signed_bucket_len)? };
                 let result_buffer = unsafe { program.create_buffer::<G::Group>(self.work_units)? };
                 (bucket_buffer, result_buffer)
             };
@@ -353,7 +379,7 @@ where
 
             let kernel = {
                 let _span = debug_span!("create_kernel").entered();
-                let kernel_name = format!("{}_multiexp", G::name());
+                let kernel_name = format!("{}_multiexp_signed", G::name());
                 program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?
             };
 
@@ -363,8 +389,8 @@ where
                     .arg(&base_buffer)
                     .arg(&bucket_buffer)
                     .arg(&result_buffer)
-                    .arg(&exp_buffer)
-                    .arg(&(bases.len() as u32))
+                    .arg(&digits_buffer)
+                    .arg(&(n_bases as u32))
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
                     .arg(&(window_size as u32))

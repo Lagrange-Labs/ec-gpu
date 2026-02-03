@@ -322,3 +322,223 @@ KERNEL void FIELD_witness_poly_batch(
         witnesses[out_offset + i - 1] = carry;
     }
 }
+
+/*
+ * =====================================================================
+ * Parallel witness polynomial computation (3-phase approach).
+ *
+ * The witness recurrence h[i-1] = f[i] + h[i]*u is sequential per-point.
+ * We parallelize it by splitting f into chunks, processing each independently
+ * (assuming carry_in=0), then propagating carries across chunks.
+ *
+ * For num_points evaluation points and C chunks, Phase 1 launches
+ * num_points * C threads (massive parallelism vs 3 threads before).
+ * =====================================================================
+ */
+
+/*
+ * Phase 1: Each thread processes one (point, chunk) pair independently.
+ *
+ * For chunk c of eval point p, processes f[chunk_start..chunk_end] in reverse,
+ * computing local witness values assuming carry_in = 0.
+ * Stores the local carry-out in carries[p * num_chunks + c].
+ *
+ * witnesses: output, witnesses[p*(n-1) + j] = local h[j] (before carry correction)
+ * carries:   output, carries[p*num_chunks + c] = carry-out of chunk c for point p
+ * f:         input polynomial of length n
+ * points:    evaluation points
+ * n:         polynomial length
+ * num_points: number of eval points
+ * chunk_size: elements per chunk
+ * num_chunks: total number of chunks
+ */
+KERNEL void FIELD_witness_poly_batch_phase1(
+    GLOBAL FIELD* f,
+    GLOBAL FIELD* witnesses,
+    GLOBAL FIELD* carries,
+    GLOBAL FIELD* points,
+    uint n,
+    uint num_points,
+    uint chunk_size,
+    uint num_chunks)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= num_points * num_chunks) return;
+
+    const uint pid = gid / num_chunks;
+    const uint cid = gid % num_chunks;
+
+    FIELD u = points[pid];
+    uint witness_len = n - 1;
+    uint out_offset = pid * witness_len;
+
+    /*
+     * Chunks partition the index range [1, n-1] (the valid range for the
+     * recurrence h[i-1] = f[i] + h[i]*u).
+     *
+     * Chunk 0 covers the HIGHEST indices (rightmost), chunk (num_chunks-1) the lowest.
+     * This matches the right-to-left scan direction of the recurrence.
+     *
+     * chunk_start_idx / chunk_end_idx are the f[] indices this chunk processes.
+     */
+    uint chunk_end_idx = n - cid * chunk_size;              /* inclusive upper bound in f */
+    uint chunk_start_raw = (chunk_end_idx > chunk_size) ? (chunk_end_idx - chunk_size) : 0;
+    uint chunk_start_idx = (chunk_start_raw < 1) ? 1 : chunk_start_raw;  /* f index >= 1 */
+
+    FIELD carry = FIELD_ZERO;
+    for (int i = (int)chunk_end_idx - 1; i >= (int)chunk_start_idx; i--) {
+        carry = FIELD_add(f[i], FIELD_mul(carry, u));
+        witnesses[out_offset + i - 1] = carry;
+    }
+
+    carries[pid * num_chunks + cid] = carry;
+}
+
+/*
+ * Phase 2: Carry propagation across chunks (one thread per eval point).
+ *
+ * Processes chunks right-to-left. The carry from chunk c is multiplied by
+ * u^(elements_in_chunk_{c+1}) and added to chunk c+1's carry, producing
+ * propagated_carries that represent the cumulative correction for each chunk.
+ *
+ * carries:           input, carries[p*num_chunks + c] from Phase 1
+ * propagated_carries: output, propagated_carries[p*num_chunks + c] = correction multiplier
+ * points:            evaluation points
+ * num_chunks:        number of chunks
+ * num_points:        number of eval points
+ * chunk_size:        elements per chunk
+ * n:                 polynomial length
+ */
+KERNEL void FIELD_witness_carry_propagate(
+    GLOBAL FIELD* carries,
+    GLOBAL FIELD* propagated_carries,
+    GLOBAL FIELD* points,
+    uint num_chunks,
+    uint num_points,
+    uint chunk_size,
+    uint n)
+{
+    const uint pid = GET_GLOBAL_ID();
+    if (pid >= num_points) return;
+
+    FIELD u = points[pid];
+
+    /* propagated_carries[chunk 0] = ZERO (rightmost chunk has no incoming carry) */
+    propagated_carries[pid * num_chunks + 0] = FIELD_ZERO;
+
+    /* carry_in tracks the actual carry entering each chunk.
+     *
+     * For chunk c, carry_in = carries[c-1] + carry_in_prev * u^(size_chunk_(c-1))
+     * because the previous chunk's local carry-out (carries[c-1]) is what h would be
+     * at its left boundary with zero carry-in, and the carry_in to that chunk propagates
+     * through size_chunk_(c-1) recurrence steps, each multiplying by u.
+     *
+     * propagated_carries[c] = carry_in * u, because Phase 3 applies the correction
+     * starting at the rightmost element of the chunk: the first correction is
+     * carry_in * u (one recurrence step from the boundary).
+     */
+    FIELD carry_in = FIELD_ZERO;
+    for (uint c = 1; c < num_chunks; c++) {
+        /* Size of the previous chunk (c-1) */
+        uint prev_end = n - (c - 1) * chunk_size;
+        uint prev_start_raw = (prev_end > chunk_size) ? (prev_end - chunk_size) : 0;
+        uint prev_start = (prev_start_raw < 1) ? 1 : prev_start_raw;
+        uint prev_size = prev_end - prev_start;
+
+        /* u^prev_size: carry_in propagates through prev_size recurrence steps */
+        FIELD u_power = FIELD_ONE;
+        for (uint k = 0; k < prev_size; k++) {
+            u_power = FIELD_mul(u_power, u);
+        }
+
+        /* carry_in for chunk c = local_carry_out[c-1] + carry_in_prev * u^prev_size */
+        carry_in = FIELD_add(carries[pid * num_chunks + c - 1], FIELD_mul(carry_in, u_power));
+
+        /* Phase 3 applies: correction = prop_carry, then *= u each step.
+         * The rightmost element needs carry_in * u, so prop_carry = carry_in * u. */
+        propagated_carries[pid * num_chunks + c] = FIELD_mul(carry_in, u);
+    }
+}
+
+/*
+ * Phase 3: Apply carry corrections to each chunk's witness values.
+ *
+ * For each witness element h[i-1] in chunk c of point p:
+ *   h[i-1] += propagated_carry[c] * u^(position within chunk from the right)
+ *
+ * Actually, the correction is simpler: the propagated carry acts as if it were
+ * the carry_in to the chunk. So for element at position j within the chunk
+ * (counting from the END of the chunk), the correction is:
+ *   h[i-1] += propagated_carry * u^j
+ *
+ * We process each chunk's elements right-to-left, accumulating the correction.
+ *
+ * witnesses:           in/out, witnesses[p*(n-1) + j]
+ * propagated_carries:  input, from Phase 2
+ * points:              evaluation points
+ * n:                   polynomial length
+ * num_points:          number of eval points
+ * chunk_size:          elements per chunk
+ * num_chunks:          total number of chunks
+ */
+KERNEL void FIELD_witness_poly_batch_phase3(
+    GLOBAL FIELD* witnesses,
+    GLOBAL FIELD* propagated_carries,
+    GLOBAL FIELD* points,
+    uint n,
+    uint num_points,
+    uint chunk_size,
+    uint num_chunks)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= num_points * num_chunks) return;
+
+    const uint pid = gid / num_chunks;
+    const uint cid = gid % num_chunks;
+
+    /* Skip chunk 0 — it has no correction (propagated_carry = 0) */
+    if (cid == 0) return;
+
+    FIELD u = points[pid];
+    uint witness_len = n - 1;
+    uint out_offset = pid * witness_len;
+
+    FIELD prop_carry = propagated_carries[pid * num_chunks + cid];
+
+    /* Chunk boundaries (same logic as Phase 1) */
+    uint chunk_end_idx = n - cid * chunk_size;
+    uint chunk_start_raw = (chunk_end_idx > chunk_size) ? (chunk_end_idx - chunk_size) : 0;
+    uint chunk_start_idx = (chunk_start_raw < 1) ? 1 : chunk_start_raw;
+
+    /* Apply correction: scan right-to-left within chunk, accumulating prop_carry * u^j */
+    FIELD correction = prop_carry;
+    for (int i = (int)chunk_end_idx - 1; i >= (int)chunk_start_idx; i--) {
+        witnesses[out_offset + i - 1] = FIELD_add(witnesses[out_offset + i - 1], correction);
+        correction = FIELD_mul(correction, u);
+    }
+}
+
+/*
+ * Copy a polynomial into a padded flat buffer on GPU.
+ * Copies src[0..src_len] into dst[poly_idx * dst_stride .. poly_idx * dst_stride + src_len],
+ * and zero-fills the remainder up to dst_stride.
+ *
+ * Each thread handles one element position within dst_stride.
+ */
+KERNEL void FIELD_copy_and_pad(
+    GLOBAL FIELD* src,
+    GLOBAL FIELD* dst,
+    uint src_len,
+    uint dst_stride,
+    uint poly_idx)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= dst_stride) return;
+
+    uint dst_offset = poly_idx * dst_stride + gid;
+    if (gid < src_len) {
+        dst[dst_offset] = src[gid];
+    } else {
+        dst[dst_offset] = FIELD_ZERO;
+    }
+}

@@ -440,22 +440,51 @@ impl<F: PrimeField + GpuName> CombinedPolyOps<F> {
             let mut combined_poly = vec![F::ZERO; poly_len];
             program.read_into_buffer(&combined_buffer, &mut combined_poly)?;
 
-            // Step 3: Batch witness computation
+            // Step 3: Parallel batch witness computation (3-phase)
             let witness_len = poly_len - 1;
             let total_witnesses = num_points * witness_len;
             // SAFETY: GPU will initialize this buffer
             let witnesses_buffer = unsafe { program.create_buffer::<F>(total_witnesses)? };
 
-            let witness_global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
-            let witness_kernel_name = format!("{}_witness_poly_batch", F::name());
-            let witness_kernel = program.create_kernel(&witness_kernel_name, witness_global_work_size, LOCAL_WORK_SIZE)?;
+            let chunk_size = std::cmp::max(1, witness_len / 4096);
+            let num_chunks = div_ceil(witness_len, chunk_size);
+            let total_phase1_threads = num_points * num_chunks;
+            let carries_len = num_points * num_chunks;
 
-            witness_kernel
-                .arg(&combined_buffer)
+            let carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+
+            // Phase 1
+            let phase1_kernel = program.create_kernel(
+                &format!("{}_witness_poly_batch_phase1", F::name()),
+                div_ceil(total_phase1_threads, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+            phase1_kernel
+                .arg(&combined_buffer).arg(&witnesses_buffer).arg(&carries_buffer)
                 .arg(&points_buffer)
-                .arg(&witnesses_buffer)
-                .arg(&(poly_len as u32))
-                .arg(&(num_points as u32))
+                .arg(&(poly_len as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(num_chunks as u32))
+                .run()?;
+
+            // Phase 2
+            let propagated_carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+            let phase2_kernel = program.create_kernel(
+                &format!("{}_witness_carry_propagate", F::name()),
+                div_ceil(num_points, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+            phase2_kernel
+                .arg(&carries_buffer).arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(num_chunks as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(poly_len as u32))
+                .run()?;
+
+            // Phase 3
+            let phase3_kernel = program.create_kernel(
+                &format!("{}_witness_poly_batch_phase3", F::name()),
+                div_ceil(total_phase1_threads, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+            phase3_kernel
+                .arg(&witnesses_buffer).arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(poly_len as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(num_chunks as u32))
                 .run()?;
 
             // Download witnesses
@@ -579,12 +608,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let mut commitments = Vec::with_capacity(num_challenges);
 
             // Pre-allocate MSM buffers (sized for largest intermediate)
+            // Signed-digit: half the buckets
             let window_size = ((div_ceil(initial_len / 2, work_units) as f64).log2() as usize) + 2;
             let window_size = std::cmp::min(window_size, max_window_size);
-            let bucket_len = 1 << window_size;
+            let signed_bucket_len = 1 << (window_size - 1);
 
             // SAFETY: GPU will initialize these buffers
-            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
+            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * signed_bucket_len)? };
             let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
             for challenge_idx in 0..num_challenges {
@@ -623,11 +653,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(next_len as u32))
                     .run()?;
 
-                // === Phase 3: MSM commit using GPU-converted scalars ===
-                // Use fixed 254-bit assumption for bn254 scalars (the field modulus bit size).
-                // This avoids downloading scalars just to compute effective_bits.
-                // The trade-off is slightly more windows than necessary for small scalars,
-                // but eliminates a costly GPU->CPU transfer per iteration.
+                // === Phase 3: Signed-digit MSM commit ===
                 const BN254_SCALAR_BITS: usize = 254;
                 let effective_bits = BN254_SCALAR_BITS;
                 let window_size_for_len = ((div_ceil(next_len, work_units) as f64).log2() as usize) + 2;
@@ -635,17 +661,32 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let num_windows = div_ceil(effective_bits, window_size_for_len);
                 let num_groups = work_units / num_windows;
 
-                let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
-                let msm_kernel_name = format!("{}_multiexp", G::name());
-                let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
+                // Preprocess to signed digits
+                let digits_len = next_len * num_windows;
+                let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+                let preprocess_global = div_ceil(next_len, LOCAL_WORK_SIZE);
+                let preprocess_kernel = program.create_kernel(
+                    &format!("{}_preprocess_signed_digits", G::name()),
+                    preprocess_global, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(next_len as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size_for_len as u32))
+                    .run()?;
 
-                // Use scalar_buffer directly - it's already in the right format on GPU!
-                // Note: The multiexp kernel expects [u8; 32] layout which matches our scalar_buffer
+                // Signed multiexp
+                let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
+                let msm_kernel = program.create_kernel(
+                    &format!("{}_multiexp_signed", G::name()),
+                    msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
+
                 msm_kernel
                     .arg(&base_buffer)
                     .arg(&bucket_buffer)
                     .arg(&result_buffer)
-                    .arg(&scalar_buffer)  // Use GPU-converted scalars directly
+                    .arg(&digits_buffer)
                     .arg(&(next_len as u32))
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
@@ -734,33 +775,63 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // Upload bases once (for all witness MSMs)
             let base_buffer = program.create_buffer_from_slice(&bases[..witness_len])?;
 
-            // Compute all witness polynomials in batch
+            // Parallel witness polynomial batch computation (3-phase)
             // Output: num_points witness polynomials, each of length witness_len
             let total_witness_elements = num_points * witness_len;
             // SAFETY: GPU will initialize this buffer
             let witnesses_buffer = unsafe { program.create_buffer::<F>(total_witness_elements)? };
 
-            // One thread per point (each computes a full witness polynomial)
-            let witness_global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
-            let witness_kernel_name = format!("{}_witness_poly_batch", F::name());
-            let witness_kernel = program.create_kernel(&witness_kernel_name, witness_global_work_size, LOCAL_WORK_SIZE)?;
-
-            witness_kernel
-                .arg(&poly_buffer)
-                .arg(&points_buffer)
-                .arg(&witnesses_buffer)
-                .arg(&(n as u32))
-                .arg(&(num_points as u32))
-                .run()?;
-
-            // Now commit each witness polynomial using MSM
-            // Pre-allocate MSM buffers
-            let window_size = ((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2;
-            let window_size = std::cmp::min(window_size, max_window_size);
-            let bucket_len = 1 << window_size;
+            let chunk_size = std::cmp::max(1, witness_len / 4096);
+            let num_chunks = div_ceil(witness_len, chunk_size);
+            let total_phase1_threads = num_points * num_chunks;
+            let carries_len = num_points * num_chunks;
 
             // SAFETY: GPU will initialize these buffers
-            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
+            let carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+
+            // Phase 1
+            let phase1_global_work_size = div_ceil(total_phase1_threads, LOCAL_WORK_SIZE);
+            let phase1_kernel = program.create_kernel(
+                &format!("{}_witness_poly_batch_phase1", F::name()),
+                phase1_global_work_size, LOCAL_WORK_SIZE)?;
+            phase1_kernel
+                .arg(&poly_buffer).arg(&witnesses_buffer).arg(&carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(n as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(num_chunks as u32))
+                .run()?;
+
+            // Phase 2
+            let propagated_carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+            let phase2_kernel = program.create_kernel(
+                &format!("{}_witness_carry_propagate", F::name()),
+                div_ceil(num_points, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+            phase2_kernel
+                .arg(&carries_buffer).arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(num_chunks as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(n as u32))
+                .run()?;
+
+            // Phase 3
+            let phase3_kernel = program.create_kernel(
+                &format!("{}_witness_poly_batch_phase3", F::name()),
+                phase1_global_work_size, LOCAL_WORK_SIZE)?;
+            phase3_kernel
+                .arg(&witnesses_buffer).arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(n as u32)).arg(&(num_points as u32))
+                .arg(&(chunk_size as u32)).arg(&(num_chunks as u32))
+                .run()?;
+
+            // Now commit each witness polynomial using signed-digit MSM
+            // Pre-allocate MSM buffers (half the buckets with signed decomposition)
+            let window_size = ((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2;
+            let window_size = std::cmp::min(window_size, max_window_size);
+            let signed_bucket_len = 1 << (window_size - 1);
+
+            // SAFETY: GPU will initialize these buffers
+            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * signed_bucket_len)? };
             let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
             // Buffer for scalar conversion (reused for each witness)
@@ -776,13 +847,14 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let num_groups = work_units / num_windows;
             let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
 
+            // Signed digits buffer (reused for each witness)
+            let digits_len = witness_len * num_windows;
+            let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+
             for point_idx in 0..num_points {
-                // Extract this witness polynomial's data from the batched output
-                // The witness_poly_batch kernel stores witnesses contiguously
                 let witness_offset = point_idx * witness_len;
 
                 // Convert witness Fr elements to scalar bytes ON GPU
-                // We need a kernel that operates on a slice of the witnesses buffer
                 let to_scalar_kernel_name = format!("{}_to_scalar_bytes_offset", F::name());
                 let to_scalar_global_work_size = div_ceil(witness_len, LOCAL_WORK_SIZE);
                 let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, to_scalar_global_work_size, LOCAL_WORK_SIZE)?;
@@ -794,15 +866,29 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_offset as u32))
                     .run()?;
 
-                // MSM commit
-                let msm_kernel_name = format!("{}_multiexp", G::name());
-                let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
+                // Preprocess to signed digits
+                let preprocess_global = div_ceil(witness_len, LOCAL_WORK_SIZE);
+                let preprocess_kernel = program.create_kernel(
+                    &format!("{}_preprocess_signed_digits", G::name()),
+                    preprocess_global, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(witness_len as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                // Signed MSM commit
+                let msm_kernel = program.create_kernel(
+                    &format!("{}_multiexp_signed", G::name()),
+                    msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
 
                 msm_kernel
                     .arg(&base_buffer)
                     .arg(&bucket_buffer)
                     .arg(&result_buffer)
-                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
                     .arg(&(witness_len as u32))
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
@@ -838,9 +924,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 ///
 /// Returned by the middle callback to provide the CPU-computed parameters
 /// needed for Phase 3 (linear combination + witness polynomials + witness MSMs).
+///
+/// Note: padded_polys are no longer needed — intermediate polynomial buffers are
+/// kept alive on GPU and packed using copy_and_pad kernel, eliminating a ~2.8GB
+/// CPU→GPU transfer.
 pub struct Phase3Input<F, G> {
-    /// All polynomials (original + intermediates), zero-padded to the same length.
-    pub padded_polys: Vec<Vec<F>>,
     /// Linear combination coefficients (q_powers from transcript).
     pub lc_coeffs: Vec<F>,
     /// Evaluation points (e.g., [r, -r, r²] in HyperKZG).
@@ -915,29 +1003,38 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // ================================================================
             let base_buffer = program.create_buffer_from_slice(bases)?;
 
-            // Upload polynomial
-            let mut current_buffer = program.create_buffer_from_slice(&poly_vec)?;
+            // Upload polynomial — keep this buffer alive for GPU-side packing later
+            let poly_buffer = program.create_buffer_from_slice(&poly_vec)?;
             let mut current_len = initial_len;
 
             let mut intermediates = Vec::with_capacity(num_challenges);
             let mut commitments = Vec::with_capacity(num_challenges);
+            // Keep all intermediate GPU buffers alive for GPU-side packing in Phase 3
+            let mut intermediate_gpu_buffers = Vec::with_capacity(num_challenges);
+            let mut intermediate_lens = Vec::with_capacity(num_challenges);
 
             // ================================================================
             // Phase 1+2: fix_vars + intermediate MSM commits
             // ================================================================
+            // We need current_buffer as a reference that advances through fix_var iterations.
+            // But we also need to keep all intermediate buffers alive.
+            // Use a "previous buffer index" approach: the first input is poly_buffer,
+            // subsequent inputs are the previous intermediate buffer.
+            let mut prev_buffer_is_poly = true;
             if num_challenges > 0 {
             // Upload challenges in a single buffer
             let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
 
             // Pre-allocate MSM buffers (sized for largest intermediate)
+            // With signed-digit decomposition, bucket count is 2^(w-1) instead of 2^w - 1
             let window_size = {
                 let ws = ((div_ceil(initial_len / 2, work_units) as f64).log2() as usize) + 2;
                 std::cmp::min(ws, max_window_size)
             };
-            let bucket_len = 1 << window_size;
+            let signed_bucket_len = 1 << (window_size - 1);
 
             // SAFETY: GPU will initialize these buffers
-            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * bucket_len)? };
+            let bucket_buffer = unsafe { program.create_buffer::<G::Group>(work_units * signed_bucket_len)? };
             let result_buffer = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
             for challenge_idx in 0..num_challenges {
@@ -951,8 +1048,15 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let fix_var_kernel_name = format!("{}_fix_var_indexed", F::name());
                 let fix_var_kernel = program.create_kernel(&fix_var_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
 
+                // Input is either the original poly buffer or the previous intermediate
+                let input_buffer = if prev_buffer_is_poly {
+                    &poly_buffer
+                } else {
+                    &intermediate_gpu_buffers[challenge_idx - 1]
+                };
+
                 fix_var_kernel
-                    .arg(&current_buffer)
+                    .arg(input_buffer)
                     .arg(&fr_out_buffer)
                     .arg(&challenges_buffer)
                     .arg(&(next_len as u32))
@@ -964,7 +1068,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 program.read_into_buffer(&fr_out_buffer, &mut intermediate)?;
 
                 // Phase 2: Convert Fr from Montgomery to standard form ON GPU
-                // The output has the same limb layout as EXPONENT, so MSM can consume it directly.
                 // SAFETY: GPU will initialize this buffer
                 let scalar_buffer = unsafe { program.create_buffer::<F>(next_len)? };
 
@@ -977,7 +1080,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(next_len as u32))
                     .run()?;
 
-                // MSM commit using GPU-converted scalars
+                // Signed-digit MSM: preprocess + multiexp_signed
                 const BN254_SCALAR_BITS: usize = 254;
                 let effective_bits = BN254_SCALAR_BITS;
                 let window_size_for_len = {
@@ -988,15 +1091,31 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let num_groups = work_units / num_windows;
                 assert!(num_groups > 0, "MSM num_groups must be > 0 (work_units={work_units}, num_windows={num_windows})");
 
+                // Preprocess exponents to signed digits
+                let digits_len = next_len * num_windows;
+                // SAFETY: GPU will initialize this buffer
+                let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+                let preprocess_global = div_ceil(next_len, LOCAL_WORK_SIZE);
+                let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
+                let preprocess_kernel = program.create_kernel(&preprocess_kernel_name, preprocess_global, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(next_len as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size_for_len as u32))
+                    .run()?;
+
+                // Signed multiexp with half the buckets
                 let msm_global_work_size = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
-                let msm_kernel_name = format!("{}_multiexp", G::name());
+                let msm_kernel_name = format!("{}_multiexp_signed", G::name());
                 let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size, MSM_LOCAL_WORK_SIZE)?;
 
                 msm_kernel
                     .arg(&base_buffer)
                     .arg(&bucket_buffer)
                     .arg(&result_buffer)
-                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
                     .arg(&(next_len as u32))
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
@@ -1021,31 +1140,59 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 intermediates.push(intermediate);
                 commitments.push(acc);
 
-                current_buffer = fr_out_buffer;
+                // Keep the fr_out_buffer alive for GPU-side packing
+                intermediate_gpu_buffers.push(fr_out_buffer);
+                intermediate_lens.push(next_len);
+
+                prev_buffer_is_poly = false;
                 current_len = next_len;
             }
             } // end if num_challenges > 0
 
             // ================================================================
             // CPU callback: transcript work between Phase 2 and Phase 3
-            // GPU buffers (especially base_buffer) remain alive!
+            // GPU buffers (base_buffer, poly_buffer, intermediate_gpu_buffers) remain alive!
             // ================================================================
             let phase3 = middle_fn(&intermediates, &commitments);
 
             // ================================================================
-            // Phase 3: linear_combine + witness_poly_batch + witness MSMs
+            // Phase 3: GPU-side packing + linear_combine + witness + MSMs
             // ================================================================
-            let num_polys = phase3.padded_polys.len();
-            let poly_len = phase3.padded_polys[0].len();
+            // Build flat padded polynomial buffer ON GPU using copy_and_pad kernel.
+            // This eliminates the ~2.8GB CPU→GPU upload of padded_polys.
+            let num_polys = 1 + num_challenges; // original poly + intermediates
+            let poly_len = initial_len;          // all padded to max length
             let num_points = phase3.eval_points.len();
 
-            // Upload padded polys (flattened)
-            let mut flat_polys: Vec<F> = Vec::with_capacity(num_polys * poly_len);
-            for p in &phase3.padded_polys {
-                assert_eq!(p.len(), poly_len, "All padded polys must have the same length");
-                flat_polys.extend_from_slice(p);
+            // Allocate flat buffer: num_polys * poly_len elements
+            // SAFETY: GPU will initialize this buffer via copy_and_pad kernels
+            let polys_buffer = unsafe { program.create_buffer::<F>(num_polys * poly_len)? };
+
+            // Copy original polynomial (full length, no padding needed)
+            let copy_pad_kernel_name = format!("{}_copy_and_pad", F::name());
+            let pad_global_work_size = div_ceil(poly_len, LOCAL_WORK_SIZE);
+            let copy_kernel_0 = program.create_kernel(&copy_pad_kernel_name, pad_global_work_size, LOCAL_WORK_SIZE)?;
+            copy_kernel_0
+                .arg(&poly_buffer)
+                .arg(&polys_buffer)
+                .arg(&(initial_len as u32))
+                .arg(&(poly_len as u32))
+                .arg(&(0u32))
+                .run()?;
+
+            // Copy each intermediate (shorter, padded with zeros to poly_len)
+            for (idx, (buf, &src_len)) in intermediate_gpu_buffers.iter()
+                .zip(intermediate_lens.iter()).enumerate()
+            {
+                let copy_kernel = program.create_kernel(&copy_pad_kernel_name, pad_global_work_size, LOCAL_WORK_SIZE)?;
+                copy_kernel
+                    .arg(buf)
+                    .arg(&polys_buffer)
+                    .arg(&(src_len as u32))
+                    .arg(&(poly_len as u32))
+                    .arg(&((idx + 1) as u32))
+                    .run()?;
             }
-            let polys_buffer = program.create_buffer_from_slice(&flat_polys)?;
 
             // Upload coefficients and eval points
             let coeffs_buffer = program.create_buffer_from_slice(&phase3.lc_coeffs)?;
@@ -1067,25 +1214,73 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 .arg(&(poly_len as u32))
                 .run()?;
 
-            // Witness polynomial batch computation on GPU
+            // Parallel witness polynomial batch computation on GPU (3-phase)
             let witness_len = poly_len - 1;
             let total_witness_elements = num_points * witness_len;
             // SAFETY: GPU will initialize this buffer
             let witnesses_buffer = unsafe { program.create_buffer::<F>(total_witness_elements)? };
 
-            let witness_global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
-            let witness_kernel_name = format!("{}_witness_poly_batch", F::name());
-            let witness_kernel = program.create_kernel(&witness_kernel_name, witness_global_work_size, LOCAL_WORK_SIZE)?;
+            // Choose chunk_size so we get enough threads for GPU saturation.
+            // Target ~4096 chunks per point, but at least 1 element per chunk.
+            let chunk_size = std::cmp::max(1, witness_len / 4096);
+            let num_chunks = div_ceil(witness_len, chunk_size);
 
-            witness_kernel
+            // Phase 1: each thread processes one (point, chunk) pair independently
+            let total_phase1_threads = num_points * num_chunks;
+            let carries_len = num_points * num_chunks;
+            // SAFETY: GPU will initialize these buffers
+            let carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+
+            let phase1_global_work_size = div_ceil(total_phase1_threads, LOCAL_WORK_SIZE);
+            let phase1_kernel_name = format!("{}_witness_poly_batch_phase1", F::name());
+            let phase1_kernel = program.create_kernel(&phase1_kernel_name, phase1_global_work_size, LOCAL_WORK_SIZE)?;
+
+            phase1_kernel
                 .arg(&combined_buffer)
-                .arg(&points_buffer)
                 .arg(&witnesses_buffer)
+                .arg(&carries_buffer)
+                .arg(&points_buffer)
                 .arg(&(poly_len as u32))
                 .arg(&(num_points as u32))
+                .arg(&(chunk_size as u32))
+                .arg(&(num_chunks as u32))
+                .run()?;
+
+            // Phase 2: propagate carries across chunks (one thread per eval point)
+            // SAFETY: GPU will initialize this buffer
+            let propagated_carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
+
+            let phase2_global_work_size = div_ceil(num_points, LOCAL_WORK_SIZE);
+            let phase2_kernel_name = format!("{}_witness_carry_propagate", F::name());
+            let phase2_kernel = program.create_kernel(&phase2_kernel_name, phase2_global_work_size, LOCAL_WORK_SIZE)?;
+
+            phase2_kernel
+                .arg(&carries_buffer)
+                .arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(num_chunks as u32))
+                .arg(&(num_points as u32))
+                .arg(&(chunk_size as u32))
+                .arg(&(poly_len as u32))
+                .run()?;
+
+            // Phase 3: apply carry corrections to each chunk's witness values
+            let phase3_global_work_size = div_ceil(total_phase1_threads, LOCAL_WORK_SIZE);
+            let phase3_kernel_name = format!("{}_witness_poly_batch_phase3", F::name());
+            let phase3_kernel = program.create_kernel(&phase3_kernel_name, phase3_global_work_size, LOCAL_WORK_SIZE)?;
+
+            phase3_kernel
+                .arg(&witnesses_buffer)
+                .arg(&propagated_carries_buffer)
+                .arg(&points_buffer)
+                .arg(&(poly_len as u32))
+                .arg(&(num_points as u32))
+                .arg(&(chunk_size as u32))
+                .arg(&(num_chunks as u32))
                 .run()?;
 
             // MSM for each witness polynomial, reusing base_buffer from Phase 2
+            // Uses signed-digit decomposition for half the buckets
             let witness_window_size = {
                 let ws = ((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2;
                 std::cmp::min(ws, max_window_size)
@@ -1098,14 +1293,17 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             assert!(num_groups_p3 > 0, "Phase 3 MSM num_groups must be > 0 (work_units={work_units}, num_windows={num_windows_p3})");
             let msm_global_work_size_p3 = div_ceil(num_windows_p3 * num_groups_p3, MSM_LOCAL_WORK_SIZE);
 
-            // Reuse or reallocate bucket/result buffers if witness_len needs bigger buckets
-            let witness_bucket_len = 1 << witness_window_size;
-            let bucket_buffer_p3 = unsafe { program.create_buffer::<G::Group>(work_units * witness_bucket_len)? };
+            // Signed-digit: half the buckets
+            let witness_signed_bucket_len = 1 << (witness_window_size - 1);
+            let bucket_buffer_p3 = unsafe { program.create_buffer::<G::Group>(work_units * witness_signed_bucket_len)? };
             let result_buffer_p3 = unsafe { program.create_buffer::<G::Group>(work_units)? };
 
             // Scalar buffer for witness conversion (FIELD layout = EXPONENT layout after unmont)
             // SAFETY: GPU will initialize this buffer
             let scalar_buffer_p3 = unsafe { program.create_buffer::<F>(witness_len)? };
+            // Signed digits buffer for witness MSMs
+            let digits_len_p3 = witness_len * num_windows_p3;
+            let digits_buffer_p3 = unsafe { program.create_buffer::<u16>(digits_len_p3)? };
 
             let mut witness_commitments = Vec::with_capacity(num_points);
 
@@ -1124,15 +1322,27 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_offset as u32))
                     .run()?;
 
-                // MSM commit reusing base_buffer
-                let msm_kernel_name = format!("{}_multiexp", G::name());
+                // Preprocess to signed digits
+                let preprocess_global_p3 = div_ceil(witness_len, LOCAL_WORK_SIZE);
+                let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
+                let preprocess_kernel = program.create_kernel(&preprocess_kernel_name, preprocess_global_p3, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer_p3)
+                    .arg(&digits_buffer_p3)
+                    .arg(&(witness_len as u32))
+                    .arg(&(num_windows_p3 as u32))
+                    .arg(&(witness_window_size as u32))
+                    .run()?;
+
+                // Signed MSM commit reusing base_buffer
+                let msm_kernel_name = format!("{}_multiexp_signed", G::name());
                 let msm_kernel = program.create_kernel(&msm_kernel_name, msm_global_work_size_p3, MSM_LOCAL_WORK_SIZE)?;
 
                 msm_kernel
                     .arg(&base_buffer)
                     .arg(&bucket_buffer_p3)
                     .arg(&result_buffer_p3)
-                    .arg(&scalar_buffer_p3)
+                    .arg(&digits_buffer_p3)
                     .arg(&(witness_len as u32))
                     .arg(&(num_groups_p3 as u32))
                     .arg(&(num_windows_p3 as u32))

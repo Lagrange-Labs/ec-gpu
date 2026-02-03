@@ -510,10 +510,15 @@ DEVICE bool FIELD_get_bit_lsb(FIELD l, uint i) {
 }
 
 // Get `window` consecutive bits, (Starting from `skip`th bit from LSB) from the field.
+// Optimized: direct bit extraction via shift+mask instead of per-bit loop.
 DEVICE uint FIELD_get_bits_lsb(FIELD l, uint skip, uint window) {
-  uint ret = 0;
-  for(uint i = 0; i < window; i++) {
-    ret |= ((uint)FIELD_get_bit_lsb(l, skip + i)) << i;
+  uint limb_idx = skip / FIELD_LIMB_BITS;
+  uint bit_idx = skip % FIELD_LIMB_BITS;
+  uint mask = (1u << window) - 1;
+  uint ret = (uint)(l.val[limb_idx] >> bit_idx);
+  // Handle cross-limb boundary
+  if (bit_idx + window > FIELD_LIMB_BITS && limb_idx + 1 < FIELD_LIMBS) {
+    ret |= (uint)(l.val[limb_idx + 1]) << (FIELD_LIMB_BITS - bit_idx);
   }
-  return ret;
+  return ret & mask;
 }
