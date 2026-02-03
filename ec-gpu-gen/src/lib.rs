@@ -81,6 +81,14 @@ pub use source::{generate, SourceBuilder};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
-pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel};
+pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel, compute_work_units};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
+<<<<<<< Updated upstream
+||||||| Stash base
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult, FusedPolyCommit, FixVarsAndCommitResult};
+=======
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult, FusedPolyCommit, FixVarsAndCommitResult, Phase3Input, FusedOpenResult};
+>>>>>>> Stashed changes

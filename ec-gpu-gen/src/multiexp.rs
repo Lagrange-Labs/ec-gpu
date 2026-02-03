@@ -56,6 +56,14 @@ const fn work_units(compute_units: u32, compute_capabilities: Option<(u32, u32)>
     }
 }
 
+/// Compute the number of work units for a device.
+///
+/// This is needed by [`FusedPolyCommit`](crate::gpu_buffer::FusedPolyCommit) to create
+/// a fused poly-commit handler without duplicating the work-unit calculation logic.
+pub fn compute_work_units(device: &Device) -> usize {
+    work_units(device.compute_units(), device.compute_capability())
+}
+
 /// Multiexp kernel for a single GPU.
 pub struct SingleMultiexpKernel<'a, G>
 where
