@@ -185,7 +185,8 @@ impl<P: GpuName, F: GpuName, Exp: GpuName> NameAndSource for Multiexp<P, F, Exp>
             .replace("POINT", &P::name());
         let multiexp = String::from(MULTIEXP_SRC)
             .replace("POINT", &P::name())
-            .replace("EXPONENT", &Exp::name());
+            .replace("EXPONENT", &Exp::name())
+            .replace("FIELD", &F::name());
         [ec, multiexp].concat()
     }
 }
