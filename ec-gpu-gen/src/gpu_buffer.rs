@@ -740,7 +740,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 2: Count buckets (re-init counts to zero via write_from_buffer)
-                program.write_from_buffer(&mut counts_buffer, &vec![0u32; total_buckets])?;
+                // Must write max_total_buckets elements to match buffer size
+                program.write_from_buffer(&mut counts_buffer, &vec![0u32; max_total_buckets])?;
                 let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
                 let count_kernel = program.create_kernel(
                     &format!("{}_count_buckets", G::name()),
@@ -768,8 +769,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let num_nonempty = num_nonempty_vec[0] as usize;
 
                 // Step 5: Copy offsets for scatter (scatter modifies them via atomicAdd)
-                program.read_into_buffer(&offsets_buffer, &mut offsets_copy[..total_buckets])?;
-                program.write_from_buffer(&mut scatter_offsets_buffer, &offsets_copy[..total_buckets])?;
+                // Read/write full buffer size; kernel only accesses [0..total_buckets)
+                program.read_into_buffer(&offsets_buffer, &mut offsets_copy)?;
+                program.write_from_buffer(&mut scatter_offsets_buffer, &offsets_copy)?;
 
                 // Step 6: Scatter to sorted (reuse pre-allocated sorted_values_buffer)
                 let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -785,12 +787,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 7: Accumulate sorted buckets (with chunked dispatch for large buckets)
-                // Re-init bucket_results to identity
-                program.write_from_buffer(&mut bucket_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; total_buckets])?;
+                // Re-init bucket_results to identity (full buffer size)
+                program.write_from_buffer(&mut bucket_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets])?;
                 if num_nonempty > 0 {
                     // Download counts and nonempty IDs for dispatch table construction
-                    program.read_into_buffer(&counts_buffer, &mut counts_cpu[..total_buckets])?;
-                    program.read_into_buffer(&nonempty_ids_buffer, &mut nonempty_ids_cpu[..total_buckets])?;
+                    // Read full buffer; only use [0..total_buckets) on CPU
+                    program.read_into_buffer(&counts_buffer, &mut counts_cpu)?;
+                    program.read_into_buffer(&nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
 
                     let (dispatch_table, reduce_table, num_dispatches) =
                         crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets], &nonempty_ids_cpu[..total_buckets], num_nonempty);
@@ -848,8 +851,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     }
                 }
 
-                // Step 8: Reduce buckets by window (re-init window_results to identity)
-                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; num_windows])?;
+                // Step 8: Reduce buckets by window (re-init window_results to identity, full buffer size)
+                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows])?;
                 let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
                 let reduce_buckets_kernel = program.create_kernel(
                     &format!("{}_reduce_buckets_by_window", G::name()),
@@ -1479,7 +1482,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 2: Count buckets (re-init counts to zero via write_from_buffer)
-                program.write_from_buffer(&mut counts_buffer_p2, &vec![0u32; total_buckets])?;
+                // Must write max size to match buffer allocation
+                program.write_from_buffer(&mut counts_buffer_p2, &vec![0u32; max_total_buckets_p2])?;
                 let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
                 let count_kernel = program.create_kernel(
                     &format!("{}_count_buckets", G::name()),
@@ -1507,8 +1511,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let num_nonempty = num_nonempty_vec[0] as usize;
 
                 // Step 5: Copy offsets for scatter (scatter modifies them via atomicAdd)
-                program.read_into_buffer(&offsets_buffer_p2, &mut offsets_copy_p2[..total_buckets])?;
-                program.write_from_buffer(&mut scatter_offsets_buffer_p2, &offsets_copy_p2[..total_buckets])?;
+                // Read/write full buffer size; kernel only accesses [0..total_buckets)
+                program.read_into_buffer(&offsets_buffer_p2, &mut offsets_copy_p2)?;
+                program.write_from_buffer(&mut scatter_offsets_buffer_p2, &offsets_copy_p2)?;
 
                 // Step 6: Scatter to sorted (reuse pre-allocated sorted_values_buffer_p2)
                 let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -1524,12 +1529,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 7: Accumulate sorted buckets (with chunked dispatch for large buckets)
-                // Re-init bucket_results to identity
-                program.write_from_buffer(&mut bucket_results_buffer_p2, &vec![<G::Group as AdditiveGroup>::ZERO; total_buckets])?;
+                // Re-init bucket_results to identity (full buffer size)
+                program.write_from_buffer(&mut bucket_results_buffer_p2, &vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets_p2])?;
                 if num_nonempty > 0 {
                     // Download counts and nonempty IDs for dispatch table construction
-                    program.read_into_buffer(&counts_buffer_p2, &mut counts_cpu_p2[..total_buckets])?;
-                    program.read_into_buffer(&nonempty_ids_buffer_p2, &mut nonempty_ids_cpu_p2[..total_buckets])?;
+                    // Read full buffer; only use [0..total_buckets) on CPU
+                    program.read_into_buffer(&counts_buffer_p2, &mut counts_cpu_p2)?;
+                    program.read_into_buffer(&nonempty_ids_buffer_p2, &mut nonempty_ids_cpu_p2)?;
 
                     let (dispatch_table, reduce_table, num_dispatches) =
                         crate::multiexp::build_dispatch_tables(&counts_cpu_p2[..total_buckets], &nonempty_ids_cpu_p2[..total_buckets], num_nonempty);
@@ -1587,8 +1593,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     }
                 }
 
-                // Step 8: Reduce buckets by window (re-init window_results to identity)
-                program.write_from_buffer(&mut window_results_buffer_p2, &vec![<G::Group as AdditiveGroup>::ZERO; num_windows])?;
+                // Step 8: Reduce buckets by window (re-init window_results to identity, full buffer size)
+                program.write_from_buffer(&mut window_results_buffer_p2, &vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows_p2])?;
                 let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
                 let reduce_buckets_kernel = program.create_kernel(
                     &format!("{}_reduce_buckets_by_window", G::name()),
