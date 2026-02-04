@@ -693,7 +693,7 @@ where
                     // Download counts and nonempty IDs for dispatch table construction
                     let mut counts_cpu = vec![0u32; total_buckets];
                     program.read_into_buffer(&counts_buffer, &mut counts_cpu)?;
-                    let mut nonempty_ids_cpu = vec![0u32; num_nonempty];
+                    let mut nonempty_ids_cpu = vec![0u32; total_buckets];
                     program.read_into_buffer(&nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
 
                     let (dispatch_table, reduce_table, num_dispatches) =
