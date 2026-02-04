@@ -106,6 +106,55 @@ where
     (max_memory - buckets_size - results_size) / term_size
 }
 
+/// Calculates the maximum number of terms that can be put onto the GPU memory for sorted MSM.
+///
+/// The sorted MSM uses a different memory layout:
+/// - Bases and exponents (same as regular MSM)
+/// - Signed digits: n * num_windows * sizeof(u16)
+/// - Pairs (keys + values): n * num_windows * sizeof(u32) * 2
+/// - Sorted values: n * num_windows * sizeof(u32)
+/// - Counts, offsets, nonempty_ids: total_buckets * sizeof(u32) * 3
+/// - Bucket results: total_buckets * proj_size
+/// - Window results: num_windows * proj_size
+/// - Final result: 1 * proj_size
+#[allow(dead_code)]
+fn calc_chunk_size_sorted<G>(mem: u64) -> usize
+where
+    G: GpuAffine,
+{
+    let aff_size = std::mem::size_of::<G::GpuRepr>();
+    let exp_size = exp_size::<G::ScalarField>();
+    let proj_size = std::mem::size_of::<G::Group>();
+
+    // Leave `MEMORY_PADDING` percent of the memory free.
+    let max_memory = ((mem as f64) * (1f64 - MEMORY_PADDING)) as usize;
+
+    // For sorted MSM, we use max window size to calculate worst-case memory
+    let num_windows = div_ceil(256, MAX_WINDOW_SIZE); // 256 bits max for Fr
+    let buckets_per_window = 1 << (MAX_WINDOW_SIZE - 1); // signed digit
+    let total_buckets = num_windows * buckets_per_window;
+
+    // Per-base memory
+    let term_size = aff_size + exp_size;
+
+    // Per-base intermediate buffers (digits, pairs, sorted values)
+    let per_base_intermediate =
+        num_windows * 2 +        // digits (u16)
+        num_windows * 4 * 2 +    // pairs (u32 key, u32 value)
+        num_windows * 4;         // sorted values (u32)
+
+    // Fixed-size buffers (independent of n)
+    let fixed_buffers =
+        total_buckets * 4 * 3 +  // counts, offsets, nonempty_ids (u32)
+        total_buckets * proj_size +  // bucket_results
+        num_windows * proj_size +    // window_results
+        proj_size +                  // final_result
+        4;                           // num_nonempty (u32)
+
+    // n * (term_size + per_base_intermediate) + fixed_buffers <= max_memory
+    (max_memory - fixed_buffers) / (term_size + per_base_intermediate)
+}
+
 /// The size of the exponent in bytes.
 ///
 /// It's the actual bytes size it needs in memory, not it's theoretical bit size.
@@ -444,6 +493,322 @@ where
         let window_size = ((div_ceil(num_terms, self.work_units) as f64).log2() as usize) + 2;
         std::cmp::min(window_size, MAX_WINDOW_SIZE)
     }
+
+    /// Run MSM using sort-based bucket accumulation.
+    ///
+    /// This replaces per-thread private buckets with a counting-sort approach
+    /// where bases are sorted by bucket index, giving sequential memory reads
+    /// and better GPU utilization.
+    pub fn multiexp_sorted(
+        &self,
+        bases: &[G::GpuRepr],
+        exponents: &[<G::ScalarField as ark_ff::PrimeField>::BigInt],
+    ) -> EcResult<G::Group> {
+        let _span = debug_span!("single_multiexp_sorted", n = bases.len()).entered();
+        assert_eq!(bases.len(), exponents.len());
+
+        let exponents: Vec<_> = {
+            let _span = debug_span!("convert_exponents").entered();
+            exponents
+                .iter()
+                .map(|b| {
+                    let mut out = [0u8; 32];
+                    let le = b.to_bytes_le();
+                    out[..le.len()].copy_from_slice(&le);
+                    out
+                })
+                .collect()
+        };
+
+        if let Some(maybe_abort) = &self.maybe_abort {
+            if maybe_abort() {
+                return Err(EcError::Aborted);
+            }
+        }
+
+        // Compute actual bit length needed for small scalar optimization
+        let effective_bits = compute_max_scalar_bits(&exponents);
+
+        let window_size = self.calc_window_size(bases.len());
+        let num_windows = div_ceil(effective_bits + 1, window_size);
+        let buckets_per_window = 1 << (window_size - 1); // signed digit
+        let total_buckets = num_windows * buckets_per_window;
+        let n_bases = bases.len();
+
+        let closures = program_closures!(|program, _arg| -> EcResult<G::Group> {
+            // Upload bases and exponents
+            let base_buffer = {
+                let _span = debug_span!("upload_bases").entered();
+                program.create_buffer_from_slice(bases)?
+            };
+            let exp_buffer = {
+                let _span = debug_span!("upload_exponents").entered();
+                program.create_buffer_from_slice(&exponents)?
+            };
+
+            // Step 1: Preprocess signed digits (same as regular multiexp)
+            let digits_buffer = {
+                let _span = debug_span!("preprocess_signed_digits").entered();
+                let digits_len = n_bases * num_windows;
+                // SAFETY: GPU will initialize this buffer
+                let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+
+                let preprocess_global = div_ceil(n_bases, LOCAL_WORK_SIZE);
+                let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
+                let preprocess_kernel = program.create_kernel(
+                    &preprocess_kernel_name, preprocess_global, LOCAL_WORK_SIZE)?;
+
+                preprocess_kernel
+                    .arg(&exp_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(n_bases as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                digits_buffer
+            };
+
+            // Step 2: Decompose to (key, value) pairs
+            let (keys_buffer, values_buffer) = {
+                let _span = debug_span!("decompose_to_pairs").entered();
+                let pairs_len = n_bases * num_windows;
+                // SAFETY: GPU will initialize these buffers
+                let keys_buffer = unsafe { program.create_buffer::<u32>(pairs_len)? };
+                let values_buffer = unsafe { program.create_buffer::<u32>(pairs_len)? };
+
+                let total_pairs = n_bases * num_windows;
+                let decompose_global = div_ceil(total_pairs, LOCAL_WORK_SIZE);
+                let decompose_kernel_name = format!("{}_decompose_to_pairs", G::name());
+                let decompose_kernel = program.create_kernel(
+                    &decompose_kernel_name, decompose_global, LOCAL_WORK_SIZE)?;
+
+                decompose_kernel
+                    .arg(&digits_buffer)
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&(n_bases as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(buckets_per_window as u32))
+                    .run()?;
+
+                (keys_buffer, values_buffer)
+            };
+
+            // Step 3: Allocate and zero-initialize counts buffer
+            let counts_buffer = {
+                let _span = debug_span!("allocate_counts").entered();
+                program.create_buffer_from_slice(&vec![0u32; total_buckets])?
+            };
+
+            // Step 4: Count buckets (atomic histogram)
+            {
+                let _span = debug_span!("count_buckets").entered();
+                let count_global = div_ceil(n_bases * num_windows, LOCAL_WORK_SIZE);
+                let count_kernel_name = format!("{}_count_buckets", G::name());
+                let count_kernel = program.create_kernel(
+                    &count_kernel_name, count_global, LOCAL_WORK_SIZE)?;
+
+                let total_pairs = (n_bases * num_windows) as u32;
+                count_kernel
+                    .arg(&keys_buffer)
+                    .arg(&counts_buffer)
+                    .arg(&total_pairs)
+                    .run()?;
+            }
+
+            // Step 5: Prefix sum (single thread)
+            let (offsets_buffer, nonempty_ids_buffer, num_nonempty_buffer) = {
+                let _span = debug_span!("prefix_sum").entered();
+                // SAFETY: GPU will initialize these buffers
+                let offsets_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+                let nonempty_ids_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+                let num_nonempty_buffer = unsafe { program.create_buffer::<u32>(1)? };
+
+                let prefix_kernel_name = format!("{}_prefix_sum", G::name());
+                let prefix_kernel = program.create_kernel(&prefix_kernel_name, 1, 1)?;
+
+                prefix_kernel
+                    .arg(&counts_buffer)
+                    .arg(&offsets_buffer)
+                    .arg(&nonempty_ids_buffer)
+                    .arg(&num_nonempty_buffer)
+                    .arg(&(total_buckets as u32))
+                    .run()?;
+
+                (offsets_buffer, nonempty_ids_buffer, num_nonempty_buffer)
+            };
+
+            // Step 6: Download num_nonempty
+            let num_nonempty = {
+                let _span = debug_span!("download_num_nonempty").entered();
+                let mut num_nonempty = vec![0u32; 1];
+                program.read_into_buffer(&num_nonempty_buffer, &mut num_nonempty)?;
+                num_nonempty[0] as usize
+            };
+
+            // Step 7: Copy offsets for scatter (scatter will modify them via atomicAdd)
+            let scatter_offsets_buffer = {
+                let _span = debug_span!("copy_offsets_for_scatter").entered();
+                let mut offsets = vec![0u32; total_buckets];
+                program.read_into_buffer(&offsets_buffer, &mut offsets)?;
+                program.create_buffer_from_slice(&offsets)?
+            };
+
+            // Step 8: Allocate sorted_values buffer and scatter
+            let sorted_values_buffer = {
+                let _span = debug_span!("scatter_to_sorted").entered();
+                let sorted_len = n_bases * num_windows;
+                // SAFETY: GPU will initialize this buffer
+                let sorted_values_buffer = unsafe { program.create_buffer::<u32>(sorted_len)? };
+
+                let scatter_global = div_ceil(n_bases * num_windows, LOCAL_WORK_SIZE);
+                let scatter_kernel_name = format!("{}_scatter_to_sorted", G::name());
+                let scatter_kernel = program.create_kernel(
+                    &scatter_kernel_name, scatter_global, LOCAL_WORK_SIZE)?;
+
+                let total_pairs = (n_bases * num_windows) as u32;
+                scatter_kernel
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&scatter_offsets_buffer)
+                    .arg(&sorted_values_buffer)
+                    .arg(&total_pairs)
+                    .run()?;
+
+                sorted_values_buffer
+            };
+
+            // Step 9: Allocate and initialize bucket_results (identity points)
+            let bucket_results_buffer = {
+                let _span = debug_span!("allocate_bucket_results").entered();
+                let identity_points = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets];
+                program.create_buffer_from_slice(&identity_points)?
+            };
+
+            // Step 10: Accumulate sorted buckets (with chunked dispatch for large buckets)
+            {
+                let _span = debug_span!("accumulate_sorted_buckets").entered();
+                if num_nonempty > 0 {
+                    // Download counts and nonempty IDs for dispatch table construction
+                    let mut counts_cpu = vec![0u32; total_buckets];
+                    program.read_into_buffer(&counts_buffer, &mut counts_cpu)?;
+                    let mut nonempty_ids_cpu = vec![0u32; num_nonempty];
+                    program.read_into_buffer(&nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
+
+                    let (dispatch_table, reduce_table, num_dispatches) =
+                        build_dispatch_tables(&counts_cpu, &nonempty_ids_cpu, num_nonempty);
+
+                    if num_dispatches == num_nonempty {
+                        // No large buckets — use simple 1-thread-per-bucket kernel (faster for small buckets)
+                        let accum_global = div_ceil(num_nonempty, LOCAL_WORK_SIZE);
+                        let accum_kernel = program.create_kernel(
+                            &format!("{}_accumulate_sorted_buckets", G::name()),
+                            accum_global, LOCAL_WORK_SIZE)?;
+                        accum_kernel
+                            .arg(&base_buffer)
+                            .arg(&sorted_values_buffer)
+                            .arg(&offsets_buffer)
+                            .arg(&counts_buffer)
+                            .arg(&nonempty_ids_buffer)
+                            .arg(&bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run()?;
+                    } else {
+                        // Large buckets detected — use chunked accumulation
+                        let dispatch_buffer = program.create_buffer_from_slice(&dispatch_table)?;
+                        let partial_results_buffer = {
+                            let partials = vec![<G::Group as AdditiveGroup>::ZERO; num_dispatches];
+                            program.create_buffer_from_slice(&partials)?
+                        };
+
+                        // Phase 3b: Chunked accumulation
+                        let chunked_global = div_ceil(num_dispatches, LOCAL_WORK_SIZE);
+                        let chunked_kernel = program.create_kernel(
+                            &format!("{}_accumulate_chunked", G::name()),
+                            chunked_global, LOCAL_WORK_SIZE)?;
+                        chunked_kernel
+                            .arg(&base_buffer)
+                            .arg(&sorted_values_buffer)
+                            .arg(&offsets_buffer)
+                            .arg(&dispatch_buffer)
+                            .arg(&partial_results_buffer)
+                            .arg(&(num_dispatches as u32))
+                            .run()?;
+
+                        // Phase 3c: Reduce partial results per bucket
+                        let reduce_table_buffer = program.create_buffer_from_slice(&reduce_table)?;
+                        let reduce_global = div_ceil(num_nonempty, LOCAL_WORK_SIZE);
+                        let reduce_kernel = program.create_kernel(
+                            &format!("{}_reduce_partial_buckets", G::name()),
+                            reduce_global, LOCAL_WORK_SIZE)?;
+                        reduce_kernel
+                            .arg(&partial_results_buffer)
+                            .arg(&nonempty_ids_buffer)
+                            .arg(&reduce_table_buffer)
+                            .arg(&bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run()?;
+                    }
+                }
+            }
+
+            // Step 11: Allocate window_results and reduce buckets by window
+            let window_results_buffer = {
+                let _span = debug_span!("reduce_buckets_by_window").entered();
+                let window_results = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
+                let window_results_buffer = program.create_buffer_from_slice(&window_results)?;
+
+                let reduce_buckets_global = div_ceil(num_windows, LOCAL_WORK_SIZE);
+                let reduce_buckets_kernel_name = format!("{}_reduce_buckets_by_window", G::name());
+                let reduce_buckets_kernel = program.create_kernel(
+                    &reduce_buckets_kernel_name, reduce_buckets_global, LOCAL_WORK_SIZE)?;
+
+                reduce_buckets_kernel
+                    .arg(&bucket_results_buffer)
+                    .arg(&window_results_buffer)
+                    .arg(&(num_windows as u32))
+                    .arg(&(buckets_per_window as u32))
+                    .run()?;
+
+                window_results_buffer
+            };
+
+            // Step 12: Final Horner reduction (single thread)
+            let final_result_buffer = {
+                let _span = debug_span!("reduce_windows").entered();
+                let final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
+                let final_result_buffer = program.create_buffer_from_slice(&final_result)?;
+
+                let reduce_windows_kernel_name = format!("{}_reduce_windows", G::name());
+                let reduce_windows_kernel = program.create_kernel(
+                    &reduce_windows_kernel_name, 1, 1)?;
+
+                reduce_windows_kernel
+                    .arg(&window_results_buffer)
+                    .arg(&final_result_buffer)
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .arg(&(effective_bits as u32))
+                    .run()?;
+
+                final_result_buffer
+            };
+
+            // Step 13: Download final result
+            let result = {
+                let _span = debug_span!("download_result").entered();
+                let mut result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
+                program.read_into_buffer(&final_result_buffer, &mut result)?;
+                result[0]
+            };
+
+            Ok(result)
+        });
+
+        let result = self.program.run(closures, ())?;
+        Ok(result)
+    }
 }
 
 /// A struct that contains several multiexp kernels for different devices.
@@ -600,5 +965,90 @@ where
     /// Returns the number of kernels (one per device).
     pub fn num_kernels(&self) -> usize {
         self.kernels.len()
+    }
+}
+
+/// Parameters for running sort-based MSM within an existing GPU session.
+/// This is used by gpu_buffer.rs fused paths where bases and digits are already on GPU.
+pub struct SortedMsmParams {
+    /// Number of bases in the MSM.
+    pub n_bases: usize,
+    /// Number of windows for scalar decomposition.
+    pub num_windows: usize,
+    /// Number of buckets per window (2^(window_size-1) for signed digits).
+    pub buckets_per_window: usize,
+    /// Window size in bits.
+    pub window_size: usize,
+    /// Actual bit length needed for the scalars.
+    pub effective_bits: usize,
+}
+
+/// Maximum number of points per chunk when splitting large buckets.
+/// Buckets with more points than this are split across multiple threads.
+const CHUNK_SIZE: usize = 256;
+
+/// Build dispatch and reduce tables for chunked bucket accumulation.
+///
+/// For each non-empty bucket, if it has <= CHUNK_SIZE points, create one dispatch entry.
+/// If it has > CHUNK_SIZE points, split it into ceil(count/CHUNK_SIZE) chunks.
+///
+/// Returns (dispatch_table, reduce_table, num_dispatches) where:
+/// - dispatch_table: Vec<u32> with [bucket_id, chunk_start, chunk_count] per dispatch
+/// - reduce_table: Vec<u32> with [partial_start, num_partials] per non-empty bucket
+/// - num_dispatches: total number of dispatch entries
+pub fn build_dispatch_tables(
+    bucket_sizes: &[u32],
+    nonempty_bucket_ids: &[u32],
+    num_nonempty: usize,
+) -> (Vec<u32>, Vec<u32>, usize) {
+    let mut dispatch_table = Vec::new();
+    let mut reduce_table = Vec::with_capacity(num_nonempty * 2);
+    let mut dispatch_idx = 0;
+
+    for &bid in &nonempty_bucket_ids[..num_nonempty] {
+        let count = bucket_sizes[bid as usize];
+        let num_chunks = div_ceil(count as usize, CHUNK_SIZE);
+        let partial_start = dispatch_idx;
+
+        for chunk in 0..num_chunks {
+            let chunk_start = chunk * CHUNK_SIZE;
+            let chunk_count = std::cmp::min(CHUNK_SIZE, count as usize - chunk_start);
+            dispatch_table.push(bid);
+            dispatch_table.push(chunk_start as u32);
+            dispatch_table.push(chunk_count as u32);
+            dispatch_idx += 1;
+        }
+
+        reduce_table.push(partial_start as u32);
+        reduce_table.push(num_chunks as u32);
+    }
+
+    (dispatch_table, reduce_table, dispatch_idx)
+}
+
+/// Computes MSM parameters for the sort-based approach.
+///
+/// This determines optimal window size and derived parameters based on the number
+/// of bases. The window size calculation balances parallelism and memory usage.
+pub fn compute_sorted_msm_params(n_bases: usize, effective_bits: usize) -> SortedMsmParams {
+    // Use the same window size calculation as the regular multiexp for now.
+    // For sorted MSM, larger windows mean fewer total pairs but more buckets per window.
+    // The sweet spot is typically larger than per-thread buckets since bucket processing
+    // is more efficient with sorting, but we can tune this later based on benchmarks.
+    let work_units = LOCAL_WORK_SIZE * 32; // Dummy work_units for calculation
+    let window_size = {
+        let ws = ((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2;
+        std::cmp::min(ws, MAX_WINDOW_SIZE)
+    };
+
+    let num_windows = div_ceil(effective_bits + 1, window_size);
+    let buckets_per_window = 1 << (window_size - 1); // signed digit
+
+    SortedMsmParams {
+        n_bases,
+        num_windows,
+        buckets_per_window,
+        window_size,
+        effective_bits,
     }
 }
