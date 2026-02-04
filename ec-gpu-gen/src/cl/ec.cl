@@ -176,16 +176,20 @@ DEVICE POINT_xyzz POINT_xyzz_add_mixed(POINT_xyzz a, POINT_affine b) {
     return ret;
   }
 
-  const FIELD pp = FIELD_sqr(p);
-  const FIELD rr = FIELD_sqr(r);
-  const FIELD ppp = FIELD_mul(p, pp);
-  const FIELD q = FIELD_mul(a.x, rr);
+  // EFD madd-2008-s variable mapping:
+  //   U = p = Y2*ZZZ1 - Y1  (y-difference)
+  //   S = r = X2*ZZ1  - X1  (x-difference)
+  //   P = S² = rr,  R = S*P = S³ = rrr,  Q = X1*P = X1*rr
+  const FIELD uu = FIELD_sqr(p);       // U² (needed for X3)
+  const FIELD ss = FIELD_sqr(r);       // S² = P
+  const FIELD sss = FIELD_mul(r, ss);  // S³ = R = S*P
+  const FIELD q = FIELD_mul(a.x, ss);  // Q = X1*P
 
   POINT_xyzz ret;
-  ret.x = FIELD_sub(FIELD_sub(pp, ppp), FIELD_double(q));
-  ret.y = FIELD_sub(FIELD_mul(p, FIELD_sub(q, ret.x)), FIELD_mul(a.y, ppp));
-  ret.zz = FIELD_mul(a.zz, rr);
-  ret.zzz = FIELD_mul(a.zzz, ppp);
+  ret.x = FIELD_sub(FIELD_sub(uu, sss), FIELD_double(q)); // X3 = U² - R - 2Q
+  ret.y = FIELD_sub(FIELD_mul(p, FIELD_sub(q, ret.x)), FIELD_mul(a.y, sss)); // Y3 = U*(Q-X3) - Y1*R
+  ret.zz = FIELD_mul(a.zz, ss);   // ZZ3 = ZZ1*P
+  ret.zzz = FIELD_mul(a.zzz, sss); // ZZZ3 = ZZZ1*R
   return ret;
 }
 
