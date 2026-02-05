@@ -1273,6 +1273,284 @@ pub struct FusedOpenResult<F, AffineG, ProjectiveG> {
 }
 
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
+    /// Batch commit: computes MSM commitments for multiple polynomials in a single GPU session.
+    ///
+    /// Uses the sort-based MSM pipeline (same as fused_open) rather than the old
+    /// per-thread bucket approach. All polynomials must be the same length (caller
+    /// pads shorter ones).
+    ///
+    /// # Arguments
+    /// * `polys` - Polynomial evaluations in Montgomery form (all same length)
+    /// * `bases` - Pre-converted GPU bases (at least as long as each poly)
+    ///
+    /// # Returns
+    /// One commitment (projective point) per polynomial.
+    pub fn batch_commit(
+        &self,
+        polys: &[&[F]],
+        bases: &[G::GpuRepr],
+    ) -> EcResult<Vec<G::Group>> {
+        if polys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let max_len = polys.iter().map(|p| p.len()).max().unwrap();
+        assert!(max_len > 0, "All polynomials are empty");
+        assert!(
+            bases.len() >= max_len,
+            "Not enough bases for polynomial size"
+        );
+
+        let num_polys = polys.len();
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
+
+        // CPU-side scratch buffer for zero-padded poly data (reused per poly)
+        let mut padded_scratch: Vec<F> = vec![F::ZERO; max_len];
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
+            // Upload bases once (for all MSMs)
+            let base_buffer = program.create_buffer_from_slice(&bases[..max_len])?;
+
+            // Reusable GPU buffer for one poly at a time (replaces massive flat buffer)
+            let mut fr_buffer = program.create_buffer_from_slice(&padded_scratch)?;
+
+            // Compute MSM params (constant across all polys since using max_len)
+            const BN254_SCALAR_BITS: usize = 254;
+            let effective_bits = BN254_SCALAR_BITS;
+            let n_bases = max_len;
+            let window_size = {
+                let ws = ((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2;
+                std::cmp::min(ws, max_window_size)
+            };
+            let num_windows = div_ceil(effective_bits + 1, window_size);
+            let total_pairs = n_bases * num_windows;
+            let buckets_per_window = 1usize << (window_size - 1);
+            let total_buckets = num_windows * buckets_per_window;
+
+            // Pre-allocate all sort buffers once (constant size across iterations)
+            let scalar_buffer = unsafe { program.create_buffer::<F>(max_len)? };
+            let digits_len = max_len * num_windows;
+            let digits_buffer = unsafe { program.create_buffer::<u16>(digits_len)? };
+            let keys_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+            let values_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+            let sorted_values_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+            let mut counts_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+            let offsets_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+            let nonempty_ids_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+            let mut scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+            let num_nonempty_buffer = unsafe { program.create_buffer::<u32>(1)? };
+            let mut bucket_results_buffer = {
+                let identity_points = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets];
+                program.create_buffer_from_slice(&identity_points)?
+            };
+            let mut window_results_buffer = {
+                let window_results = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
+                program.create_buffer_from_slice(&window_results)?
+            };
+            let mut final_result_buffer = {
+                let final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
+                program.create_buffer_from_slice(&final_result)?
+            };
+            // CPU-side scratch vectors
+            let mut offsets_copy = vec![0u32; total_buckets];
+            let mut counts_cpu = vec![0u32; total_buckets];
+            let mut nonempty_ids_cpu = vec![0u32; total_buckets];
+
+            let mut commitments = Vec::with_capacity(num_polys);
+
+            for poly_idx in 0..num_polys {
+                // Build zero-padded poly on CPU and upload to reusable fr_buffer
+                let poly = polys[poly_idx];
+                padded_scratch[..poly.len()].copy_from_slice(poly);
+                // Zero-fill the tail (only needed if poly is shorter than max_len)
+                for v in padded_scratch[poly.len()..].iter_mut() {
+                    *v = F::ZERO;
+                }
+                program.write_from_buffer(&mut fr_buffer, &padded_scratch)?;
+
+                // Convert Montgomery → standard form on GPU via to_scalar_bytes
+                let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
+                let to_scalar_global_work_size = div_ceil(max_len, LOCAL_WORK_SIZE);
+                let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, to_scalar_global_work_size, LOCAL_WORK_SIZE)?;
+
+                to_scalar_kernel
+                    .arg(&fr_buffer)
+                    .arg(&scalar_buffer)
+                    .arg(&(max_len as u32))
+                    .run()?;
+
+                // Preprocess to signed digits
+                let preprocess_global = div_ceil(n_bases, LOCAL_WORK_SIZE);
+                let preprocess_kernel = program.create_kernel(
+                    &format!("{}_preprocess_signed_digits", G::name()),
+                    preprocess_global, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(n_bases as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                // Sort-based MSM pipeline (reuse pre-allocated buffers)
+
+                // Step 1: Decompose to (key, value) pairs
+                let decompose_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let decompose_kernel = program.create_kernel(
+                    &format!("{}_decompose_to_pairs", G::name()),
+                    decompose_global, MSM_LOCAL_WORK_SIZE)?;
+                decompose_kernel
+                    .arg(&digits_buffer)
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&(n_bases as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(buckets_per_window as u32))
+                    .run()?;
+
+                // Step 2: Count buckets (re-init counts to zero)
+                program.write_from_buffer(&mut counts_buffer, &vec![0u32; total_buckets])?;
+                let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let count_kernel = program.create_kernel(
+                    &format!("{}_count_buckets", G::name()),
+                    count_global, MSM_LOCAL_WORK_SIZE)?;
+                count_kernel
+                    .arg(&keys_buffer)
+                    .arg(&counts_buffer)
+                    .arg(&(total_pairs as u32))
+                    .run()?;
+
+                // Step 3: Prefix sum
+                let prefix_kernel = program.create_kernel(
+                    &format!("{}_prefix_sum", G::name()), 1, 1)?;
+                prefix_kernel
+                    .arg(&counts_buffer)
+                    .arg(&offsets_buffer)
+                    .arg(&nonempty_ids_buffer)
+                    .arg(&num_nonempty_buffer)
+                    .arg(&(total_buckets as u32))
+                    .run()?;
+
+                // Step 4: Download num_nonempty
+                let mut num_nonempty_vec = vec![0u32; 1];
+                program.read_into_buffer(&num_nonempty_buffer, &mut num_nonempty_vec)?;
+                let num_nonempty = num_nonempty_vec[0] as usize;
+
+                // Step 5: Copy offsets for scatter (scatter modifies them via atomicAdd)
+                program.read_into_buffer(&offsets_buffer, &mut offsets_copy)?;
+                program.write_from_buffer(&mut scatter_offsets_buffer, &offsets_copy)?;
+
+                // Step 6: Scatter to sorted
+                let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let scatter_kernel = program.create_kernel(
+                    &format!("{}_scatter_to_sorted", G::name()),
+                    scatter_global, MSM_LOCAL_WORK_SIZE)?;
+                scatter_kernel
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&scatter_offsets_buffer)
+                    .arg(&sorted_values_buffer)
+                    .arg(&(total_pairs as u32))
+                    .run()?;
+
+                // Step 7: Accumulate sorted buckets (with chunked dispatch for large buckets)
+                program.write_from_buffer(&mut bucket_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; total_buckets])?;
+                if num_nonempty > 0 {
+                    program.read_into_buffer(&counts_buffer, &mut counts_cpu)?;
+                    program.read_into_buffer(&nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
+
+                    let (dispatch_table, reduce_table, num_dispatches) =
+                        crate::multiexp::build_dispatch_tables(&counts_cpu, &nonempty_ids_cpu, num_nonempty);
+
+                    if num_dispatches == num_nonempty {
+                        // No large buckets — use simple 1-thread-per-bucket kernel
+                        let accum_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                        let accum_kernel = program.create_kernel(
+                            &format!("{}_accumulate_sorted_buckets", G::name()),
+                            accum_global, MSM_LOCAL_WORK_SIZE)?;
+                        accum_kernel
+                            .arg(&base_buffer)
+                            .arg(&sorted_values_buffer)
+                            .arg(&offsets_buffer)
+                            .arg(&counts_buffer)
+                            .arg(&nonempty_ids_buffer)
+                            .arg(&bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run()?;
+                    } else {
+                        // Large buckets detected — use chunked accumulation
+                        let dispatch_buffer = program.create_buffer_from_slice(&dispatch_table)?;
+                        let partial_results_buffer = {
+                            let partials = vec![<G::Group as AdditiveGroup>::ZERO; num_dispatches];
+                            program.create_buffer_from_slice(&partials)?
+                        };
+
+                        let chunked_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
+                        let chunked_kernel = program.create_kernel(
+                            &format!("{}_accumulate_chunked", G::name()),
+                            chunked_global, MSM_LOCAL_WORK_SIZE)?;
+                        chunked_kernel
+                            .arg(&base_buffer)
+                            .arg(&sorted_values_buffer)
+                            .arg(&offsets_buffer)
+                            .arg(&dispatch_buffer)
+                            .arg(&partial_results_buffer)
+                            .arg(&(num_dispatches as u32))
+                            .run()?;
+
+                        let reduce_table_buffer = program.create_buffer_from_slice(&reduce_table)?;
+                        let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                        let reduce_kernel = program.create_kernel(
+                            &format!("{}_reduce_partial_buckets", G::name()),
+                            reduce_global, MSM_LOCAL_WORK_SIZE)?;
+                        reduce_kernel
+                            .arg(&partial_results_buffer)
+                            .arg(&nonempty_ids_buffer)
+                            .arg(&reduce_table_buffer)
+                            .arg(&bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run()?;
+                    }
+                }
+
+                // Step 8: Reduce buckets by window
+                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; num_windows])?;
+                let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                let reduce_buckets_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_by_window", G::name()),
+                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
+                reduce_buckets_kernel
+                    .arg(&bucket_results_buffer)
+                    .arg(&window_results_buffer)
+                    .arg(&(num_windows as u32))
+                    .arg(&(buckets_per_window as u32))
+                    .run()?;
+
+                // Step 9: Horner reduction on GPU
+                program.write_from_buffer(&mut final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
+                let reduce_windows_kernel = program.create_kernel(
+                    &format!("{}_reduce_windows", G::name()), 1, 1)?;
+                reduce_windows_kernel
+                    .arg(&window_results_buffer)
+                    .arg(&final_result_buffer)
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .arg(&(effective_bits as u32))
+                    .run()?;
+
+                // Step 10: Download final result (just 1 point!)
+                let mut final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
+                program.read_into_buffer(&final_result_buffer, &mut final_result)?;
+                commitments.push(final_result[0]);
+            }
+
+            Ok(commitments)
+        });
+
+        self.program.run(closures, ())
+    }
+
     /// Fused HyperKZG open: runs the entire open operation in one GPU session.
     ///
     /// This keeps bases on GPU for both Phase 2 (intermediate commits) and Phase 3
