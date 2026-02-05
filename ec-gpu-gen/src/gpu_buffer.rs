@@ -1777,7 +1777,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .run()?;
 
                     // 2. Count buckets (reinitialize counts to zero)
-                    program.write_from_buffer(&shared_counts_buffer, &counts_zero[..total_buckets])?;
+                    program.write_from_buffer(&mut shared_counts_buffer, &counts_zero[..total_buckets])?;
                     let count_kernel = program.create_kernel(
                         &format!("{}_count_buckets", G::name()),
                         div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
@@ -1796,7 +1796,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // 5. Copy offsets for scatter
                     program.read_into_buffer(&shared_offsets_buffer, &mut offsets_cpu[..total_buckets])?;
-                    program.write_from_buffer(&shared_scatter_offsets_buffer, &offsets_cpu[..total_buckets])?;
+                    program.write_from_buffer(&mut shared_scatter_offsets_buffer, &offsets_cpu[..total_buckets])?;
 
                     // 6. Scatter to sorted
                     let scatter_kernel = program.create_kernel(
@@ -1808,7 +1808,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // 7. Accumulate sorted buckets (reinitialize bucket_results to zero)
                     let bucket_zeros = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets];
-                    program.write_from_buffer(&shared_bucket_results_buffer, &bucket_zeros)?;
+                    program.write_from_buffer(&mut shared_bucket_results_buffer, &bucket_zeros)?;
                     if num_nonempty > 0 {
                         let accum_kernel = program.create_kernel(
                             &format!("{}_accumulate_sorted_buckets", G::name()),
@@ -1821,7 +1821,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // 8. Reduce buckets by window (reinitialize window_results to zero)
                     let window_zeros = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
-                    program.write_from_buffer(&shared_window_results_buffer, &window_zeros)?;
+                    program.write_from_buffer(&mut shared_window_results_buffer, &window_zeros)?;
                     let reduce_buckets_kernel = program.create_kernel(
                         &format!("{}_reduce_buckets_by_window", G::name()),
                         div_ceil(num_windows, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
@@ -1831,7 +1831,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // 9. Reduce windows (Horner on GPU)
                     let final_zero = vec![<G::Group as AdditiveGroup>::ZERO; 1];
-                    program.write_from_buffer(&shared_final_result_buffer, &final_zero)?;
+                    program.write_from_buffer(&mut shared_final_result_buffer, &final_zero)?;
                     let reduce_windows_kernel = program.create_kernel(
                         &format!("{}_reduce_windows", G::name()), 1, 1)?;
                     reduce_windows_kernel
@@ -1903,7 +1903,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 // Need to pad with zeros to poly_len for memory layout
                 let mut padded = vec![F::ZERO; poly_len];
                 padded[..src_len].copy_from_slice(intermediate);
-                program.write_from_buffer(&streaming_poly_buffer, &padded)?;
+                program.write_from_buffer(&mut streaming_poly_buffer, &padded)?;
 
                 // Upload coefficient
                 let coeff_buffer = program.create_buffer_from_slice(&[coeffs_vec[idx + 1]])?;
@@ -2039,7 +2039,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 2: Count buckets (re-init counts to zero)
-                program.write_from_buffer(&shared_counts_buffer, &counts_zero[..total_buckets_p3])?;
+                program.write_from_buffer(&mut shared_counts_buffer, &counts_zero[..total_buckets_p3])?;
                 let count_global = div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE);
                 let count_kernel = program.create_kernel(
                     &format!("{}_count_buckets", G::name()),
@@ -2068,7 +2068,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                 // Step 5: Copy offsets for scatter (scatter modifies them via atomicAdd)
                 program.read_into_buffer(&shared_offsets_buffer, &mut offsets_cpu[..total_buckets_p3])?;
-                program.write_from_buffer(&shared_scatter_offsets_buffer, &offsets_cpu[..total_buckets_p3])?;
+                program.write_from_buffer(&mut shared_scatter_offsets_buffer, &offsets_cpu[..total_buckets_p3])?;
 
                 // Step 6: Scatter to sorted
                 let scatter_global = div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE);
@@ -2086,7 +2086,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 // Step 7: Accumulate sorted buckets (with chunked dispatch for large buckets)
                 // Re-init bucket_results to identity
                 let bucket_zeros = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets_p3];
-                program.write_from_buffer(&shared_bucket_results_buffer, &bucket_zeros)?;
+                program.write_from_buffer(&mut shared_bucket_results_buffer, &bucket_zeros)?;
                 if num_nonempty > 0 {
                     // Download counts and nonempty IDs for dispatch table construction
                     program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu[..total_buckets_p3])?;
@@ -2150,7 +2150,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                 // Step 8: Reduce buckets by window (re-init window_results to identity)
                 let window_zeros = vec![<G::Group as AdditiveGroup>::ZERO; num_windows_p3];
-                program.write_from_buffer(&shared_window_results_buffer, &window_zeros)?;
+                program.write_from_buffer(&mut shared_window_results_buffer, &window_zeros)?;
                 let reduce_buckets_global = div_ceil(num_windows_p3, MSM_LOCAL_WORK_SIZE);
                 let reduce_buckets_kernel = program.create_kernel(
                     &format!("{}_reduce_buckets_by_window", G::name()),
@@ -2163,7 +2163,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
-                program.write_from_buffer(&shared_final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
+                program.write_from_buffer(&mut shared_final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
                 let reduce_windows_kernel = program.create_kernel(
                     &format!("{}_reduce_windows", G::name()), 1, 1)?;
                 reduce_windows_kernel
