@@ -637,3 +637,49 @@ KERNEL void POINT_accumulate_chunked_precomp(
     partial_results[gid] = jac;
   }
 }
+
+/*
+ * Batch scalar multiplication: compute s[i] * G for each scalar s[i].
+ * Uses windowed lookup table for efficiency.
+ *
+ * The table is organized as: table[outer][inner] = (2^(outer*window)) * inner * G
+ * where outer in [0, num_windows) and inner in [0, 2^window).
+ *
+ * Parameters:
+ * - table: Precomputed lookup table, flattened as [num_windows * (1 << window)] affine points
+ * - scalars: Input scalars in standard (non-Montgomery) form
+ * - results: Output points in Jacobian form
+ * - n: Number of scalars
+ * - window: Window size in bits
+ * - num_windows: Number of windows (ceil(scalar_bits / window))
+ * - scalar_bits: Number of bits in the scalar field (unused, for documentation)
+ */
+KERNEL void POINT_batch_scalar_mul(
+    GLOBAL POINT_affine *table,
+    GLOBAL EXPONENT *scalars,
+    GLOBAL POINT_jacobian *results,
+    uint n,
+    uint window,
+    uint num_windows,
+    uint scalar_bits) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= n) return;
+
+  const uint in_window = 1u << window;
+  EXPONENT scalar = scalars[gid];
+
+  POINT_jacobian acc = POINT_ZERO;
+
+  for (uint outer = 0; outer < num_windows; outer++) {
+    // Extract window bits from scalar using the existing helper
+    uint inner = EXPONENT_get_bits_lsb(scalar, outer * window, window);
+
+    if (inner > 0) {
+      // Lookup table[outer * in_window + inner]
+      POINT_affine entry = table[outer * in_window + inner];
+      acc = POINT_add_mixed(acc, entry);
+    }
+  }
+
+  results[gid] = acc;
+}

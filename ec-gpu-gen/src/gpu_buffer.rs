@@ -2289,6 +2289,123 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         self.program.run(closures, middle_fn)
     }
+
+    /// Batch scalar multiplication: computes `scalars[i] * base` for each scalar.
+    ///
+    /// This is used for GPU-accelerated SRS (trusted setup) generation, where we need
+    /// to compute [G, tau*G, tau^2*G, ..., tau^n*G] for the KZG powers.
+    ///
+    /// Uses a windowed lookup table for efficiency (same algorithm as arkworks batch_mul).
+    ///
+    /// # Arguments
+    /// * `base` - The base point (affine)
+    /// * `scalars` - Scalars to multiply (in standard form, NOT Montgomery)
+    ///
+    /// # Returns
+    /// One point per scalar, converted to affine form.
+    pub fn batch_scalar_mul(
+        &self,
+        base: &G::GpuRepr,
+        scalars: &[F],
+    ) -> EcResult<Vec<G::GpuRepr>> {
+        if scalars.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let n = scalars.len();
+
+        // Compute window size (same formula as arkworks)
+        let window = if n < 32 {
+            3
+        } else {
+            // ln_without_floats
+            let ln_n = ((n as f64).ln() * 100.0 / 69.0) as usize;
+            ln_n
+        };
+        let window = std::cmp::min(window, 16); // Cap at 16 bits for memory
+
+        const BN254_SCALAR_BITS: usize = 254;
+        let scalar_bits = BN254_SCALAR_BITS;
+        let num_windows = div_ceil(scalar_bits, window);
+        let in_window = 1usize << window;
+        let table_size = num_windows * in_window;
+
+        // Build precomputation table on CPU (same algorithm as arkworks BatchMulPreprocessing)
+        // table[outer][inner] = inner * (2^(outer*window) * base) = inner * g_outer
+        let mut table: Vec<G::GpuRepr> = vec![G::GpuRepr::default(); table_size];
+
+        // g_outer starts as base, then gets doubled `window` times per outer loop
+        let mut g_outer = G::Group::from(*base);
+        for outer in 0..num_windows {
+            let last_in_window = if outer == num_windows - 1 {
+                1 << (scalar_bits - (num_windows - 1) * window)
+            } else {
+                in_window
+            };
+
+            // table[outer][inner] = inner * g_outer
+            let mut g_inner = G::Group::zero();
+            for inner in 0..std::cmp::min(in_window, last_in_window) {
+                table[outer * in_window + inner] = g_inner.into();
+                g_inner += g_outer;
+            }
+
+            // Advance g_outer: g_outer *= 2^window (i.e., window doublings)
+            for _ in 0..window {
+                g_outer = g_outer.double();
+            }
+        }
+
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::GpuRepr>> {
+            // Upload precomputation table
+            let table_buffer = program.create_buffer_from_slice(&table)?;
+
+            // Upload scalars (in Montgomery form)
+            let fr_buffer = program.create_buffer_from_slice(scalars)?;
+
+            // Convert Montgomery → standard form on GPU
+            // SAFETY: GPU will initialize this buffer
+            let scalars_buffer = unsafe { program.create_buffer::<F>(n)? };
+            let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
+            let to_scalar_global = div_ceil(n, LOCAL_WORK_SIZE);
+            let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, to_scalar_global, LOCAL_WORK_SIZE)?;
+            to_scalar_kernel
+                .arg(&fr_buffer)
+                .arg(&scalars_buffer)
+                .arg(&(n as u32))
+                .run()?;
+
+            // Allocate output buffer
+            // SAFETY: GPU will initialize this buffer
+            let results_buffer = unsafe { program.create_buffer::<G::Group>(n)? };
+
+            // Run batch scalar multiplication kernel
+            let kernel_name = format!("{}_batch_scalar_mul", G::name());
+            let global_work_size = div_ceil(n, LOCAL_WORK_SIZE);
+            let kernel = program.create_kernel(&kernel_name, global_work_size, LOCAL_WORK_SIZE)?;
+
+            kernel
+                .arg(&table_buffer)
+                .arg(&scalars_buffer)
+                .arg(&results_buffer)
+                .arg(&(n as u32))
+                .arg(&(window as u32))
+                .arg(&(num_windows as u32))
+                .arg(&(scalar_bits as u32))
+                .run()?;
+
+            // Download results
+            let mut results_proj = vec![G::Group::zero(); n];
+            program.read_into_buffer(&results_buffer, &mut results_proj)?;
+
+            // Convert to affine
+            let results: Vec<G::GpuRepr> = results_proj.iter().map(|p| (*p).into()).collect();
+
+            Ok(results)
+        });
+
+        self.program.run(closures, ())
+    }
 }
 
 #[cfg(test)]
