@@ -2298,16 +2298,22 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
     /// Uses a windowed lookup table for efficiency (same algorithm as arkworks batch_mul).
     ///
     /// # Arguments
-    /// * `base` - The base point (affine)
-    /// * `scalars` - Scalars to multiply (in standard form, NOT Montgomery)
+    /// * `base` - The base point (affine, ec-gpu wrapper type)
+    /// * `scalars` - Scalars to multiply (in Montgomery form, will be converted on GPU)
     ///
     /// # Returns
-    /// One point per scalar, converted to affine form.
+    /// One affine point per scalar (arkworks affine type).
     pub fn batch_scalar_mul(
         &self,
-        base: &G::GpuRepr,
+        base: &G,
         scalars: &[F],
-    ) -> EcResult<Vec<G::GpuRepr>> {
+    ) -> EcResult<Vec<<G::Group as ark_ec::CurveGroup>::Affine>>
+    where
+        G: From<<G::Group as ark_ec::CurveGroup>::Affine>
+            + std::ops::Deref<Target = <G::Group as ark_ec::CurveGroup>::Affine>,
+    {
+        use ark_ec::CurveGroup;
+
         if scalars.is_empty() {
             return Ok(vec![]);
         }
@@ -2334,8 +2340,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         // table[outer][inner] = inner * (2^(outer*window) * base) = inner * g_outer
         let mut table: Vec<G::GpuRepr> = vec![G::GpuRepr::default(); table_size];
 
+        // Convert base (ec-gpu affine wrapper) to projective for arithmetic
+        // Deref gives us the inner arkworks affine, then convert to projective
+        let base_affine: &<G::Group as CurveGroup>::Affine = &*base;
+        let base_proj: G::Group = (*base_affine).into();
+
         // g_outer starts as base, then gets doubled `window` times per outer loop
-        let mut g_outer = G::Group::from(*base);
+        let mut g_outer = base_proj;
         for outer in 0..num_windows {
             let last_in_window = if outer == num_windows - 1 {
                 1 << (scalar_bits - (num_windows - 1) * window)
@@ -2344,9 +2355,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             };
 
             // table[outer][inner] = inner * g_outer
-            let mut g_inner = G::Group::zero();
+            let mut g_inner = <G::Group as AdditiveGroup>::ZERO;
             for inner in 0..std::cmp::min(in_window, last_in_window) {
-                table[outer * in_window + inner] = g_inner.into();
+                // Convert projective to affine then to GpuRepr
+                let affine: <G::Group as CurveGroup>::Affine = g_inner.into_affine();
+                table[outer * in_window + inner] = G::from(affine).to_gpu();
                 g_inner += g_outer;
             }
 
@@ -2356,7 +2369,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             }
         }
 
-        let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::GpuRepr>> {
+        let closures = program_closures!(|program, _arg| -> EcResult<Vec<<G::Group as CurveGroup>::Affine>> {
             // Upload precomputation table
             let table_buffer = program.create_buffer_from_slice(&table)?;
 
@@ -2395,11 +2408,14 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 .run()?;
 
             // Download results
-            let mut results_proj = vec![G::Group::zero(); n];
+            let mut results_proj = vec![<G::Group as AdditiveGroup>::ZERO; n];
             program.read_into_buffer(&results_buffer, &mut results_proj)?;
 
-            // Convert to affine
-            let results: Vec<G::GpuRepr> = results_proj.iter().map(|p| (*p).into()).collect();
+            // Convert projective to affine
+            let results: Vec<<G::Group as CurveGroup>::Affine> = results_proj
+                .iter()
+                .map(|p| p.into_affine())
+                .collect();
 
             Ok(results)
         });
