@@ -720,3 +720,102 @@ KERNEL void u32_copy_buffer(GLOBAL uint *src, GLOBAL uint *dst, uint count) {
   dst[gid] = src[gid];
 }
 
+/*
+ * GPU-only parallel bucket accumulation.
+ * Launches total_buckets * threads_per_bucket threads.
+ * Each bucket gets threads_per_bucket threads with strided access.
+ * Empty buckets (count==0) write identity and return immediately.
+ * Eliminates CPU-side dispatch table construction and all associated sync points.
+ */
+KERNEL void POINT_accumulate_parallel(
+    GLOBAL POINT_affine *bases,
+    GLOBAL uint *sorted_values,
+    GLOBAL uint *offsets,
+    GLOBAL uint *counts,
+    GLOBAL POINT_jacobian *partial_results,
+    uint total_buckets,
+    uint threads_per_bucket)
+{
+  const uint gid = GET_GLOBAL_ID();
+  const uint bucket_id = gid / threads_per_bucket;
+  const uint local_tid = gid % threads_per_bucket;
+
+  if (bucket_id >= total_buckets) return;
+
+  uint count = counts[bucket_id];
+  if (count == 0) {
+    partial_results[gid] = POINT_ZERO;
+    return;
+  }
+
+  uint start = offsets[bucket_id];
+
+  // Strided access: thread i handles points [i, i+stride, i+2*stride, ...]
+  POINT_xyzz acc = POINT_XYZZ_ZERO;
+  for (uint j = local_tid; j < count; j += threads_per_bucket) {
+    uint val = sorted_values[start + j];
+    uint base_idx = val & 0x7FFFFFFF;
+    uint sign = (val >> 31) & 1;
+
+    POINT_affine base = bases[base_idx];
+    if (sign) {
+      base.y = FIELD_sub(FIELD_ZERO, base.y);
+    }
+    acc = POINT_xyzz_add_mixed(acc, base);
+  }
+
+  // Convert XYZZ -> Jacobian
+  const FIELD local_zero = FIELD_ZERO;
+  if (FIELD_eq(acc.zz, local_zero)) {
+    partial_results[gid] = POINT_ZERO;
+  } else {
+    POINT_jacobian jac;
+    jac.x = FIELD_mul(acc.x, acc.zz);
+    jac.y = FIELD_mul(acc.y, acc.zzz);
+    jac.z = acc.zz;
+    partial_results[gid] = jac;
+  }
+}
+
+/*
+ * Reduce parallel partial results: 1 thread per bucket.
+ * Sums threads_per_bucket partial Jacobian results into one bucket result.
+ * Empty buckets (count==0) get identity.
+ */
+KERNEL void POINT_reduce_parallel(
+    GLOBAL POINT_jacobian *partial_results,
+    GLOBAL uint *counts,
+    GLOBAL POINT_jacobian *bucket_results,
+    uint total_buckets,
+    uint threads_per_bucket)
+{
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= total_buckets) return;
+
+  if (counts[gid] == 0) {
+    bucket_results[gid] = POINT_ZERO;
+    return;
+  }
+
+  uint base_idx = gid * threads_per_bucket;
+  POINT_jacobian acc = partial_results[base_idx];
+  for (uint i = 1; i < threads_per_bucket; i++) {
+    acc = POINT_add(acc, partial_results[base_idx + i]);
+  }
+  bucket_results[gid] = acc;
+}
+
+/*
+ * Copy a single Jacobian point from src[0] to dst[dst_idx].
+ * Used to save MSM results into a commitments array on GPU,
+ * enabling batched download instead of per-MSM sync.
+ */
+KERNEL void POINT_copy_at_offset(
+    GLOBAL POINT_jacobian *src,
+    GLOBAL POINT_jacobian *dst,
+    uint dst_idx)
+{
+  if (GET_GLOBAL_ID() != 0) return;
+  dst[dst_idx] = src[0];
+}
+
