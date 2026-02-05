@@ -1670,15 +1670,15 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let shared_keys_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
             let shared_values_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
             let shared_sorted_values_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
-            let shared_counts_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
+            let mut shared_counts_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
             let shared_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
             let shared_nonempty_ids_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
-            let shared_scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
-            let shared_bucket_results_buffer = program.create_buffer_from_slice(
+            let mut shared_scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
+            let mut shared_bucket_results_buffer = program.create_buffer_from_slice(
                 &vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets])?;
-            let shared_window_results_buffer = program.create_buffer_from_slice(
+            let mut shared_window_results_buffer = program.create_buffer_from_slice(
                 &vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows])?;
-            let shared_final_result_buffer = program.create_buffer_from_slice(
+            let mut shared_final_result_buffer = program.create_buffer_from_slice(
                 &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
             let num_nonempty_buffer = unsafe { program.create_buffer::<u32>(1)? };
 
@@ -1868,7 +1868,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let num_points = phase3_input.eval_points.len();
 
             // Reusable single-poly buffer for streaming LC
-            let streaming_poly_buffer = unsafe { program.create_buffer::<F>(poly_len)? };
+            let mut streaming_poly_buffer = unsafe { program.create_buffer::<F>(poly_len)? };
 
             // Allocate combined_buffer initialized to zeros
             let combined_buffer = program.create_buffer_from_slice(&vec![F::ZERO; poly_len])?;
