@@ -542,3 +542,36 @@ KERNEL void FIELD_copy_and_pad(
         dst[dst_offset] = FIELD_ZERO;
     }
 }
+
+/*
+ * Streaming linear combination: accumulate one polynomial at a time.
+ * Performs: out[i] += coeff * poly[i] for i in [0, poly_len)
+ * where poly is zero-padded beyond src_len.
+ *
+ * This avoids allocating a massive flat buffer for all polynomials.
+ * Instead, we accumulate each polynomial one at a time into the output.
+ *
+ * poly:     input polynomial (length src_len, conceptually zero-padded to poly_len)
+ * out:      in/out accumulator (length poly_len)
+ * coeff:    scalar coefficient buffer (single element)
+ * src_len:  actual length of input polynomial
+ * poly_len: target length (for bounds)
+ */
+KERNEL void FIELD_linear_combine_accumulate(
+    GLOBAL FIELD* poly,
+    GLOBAL FIELD* out,
+    GLOBAL FIELD* coeff_buf,
+    uint src_len,
+    uint poly_len)
+{
+    const uint gid = GET_GLOBAL_ID();
+    if (gid >= poly_len) return;
+
+    FIELD coeff = coeff_buf[0];
+
+    if (gid < src_len) {
+        FIELD scaled = FIELD_mul(poly[gid], coeff);
+        out[gid] = FIELD_add(out[gid], scaled);
+    }
+    /* Elements beyond src_len contribute 0 * coeff = 0, so no change needed */
+}
