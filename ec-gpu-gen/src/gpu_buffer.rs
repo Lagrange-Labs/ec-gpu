@@ -1702,6 +1702,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let mut input_is_poly = true;
             // We need two Fr buffers to ping-pong (input/output)
             let mut fr_alt_buffer = unsafe { program.create_buffer::<F>(max_intermediate_len)? };
+            // CPU buffer for reading intermediates (must match GPU buffer size)
+            let mut intermediate_read_buf = vec![F::ZERO; max_intermediate_len];
 
             if num_challenges > 0 {
                 // Upload challenges in a single buffer
@@ -1735,8 +1737,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .run()?;
 
                     // Download intermediate (needed for CPU eval in middle_fn and Phase 3 streaming LC)
-                    let mut intermediate = vec![F::ZERO; next_len];
-                    program.read_into_buffer(&*output_buf, &mut intermediate)?;
+                    // Read into max-sized buffer (required by read_into_buffer) then truncate
+                    program.read_into_buffer(&*output_buf, &mut intermediate_read_buf)?;
+                    let intermediate = intermediate_read_buf[..next_len].to_vec();
 
                     // === Phase 2: Convert Fr from Montgomery to standard form ON GPU ===
                     let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
