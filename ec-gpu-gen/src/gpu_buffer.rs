@@ -1606,6 +1606,25 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // ================================================================
             let base_buffer = program.create_buffer_from_slice(bases)?;
 
+            // ================================================================
+            // Conditionally precompute negated bases (Change 6)
+            // ================================================================
+            // Only allocate if poly size <= 2^24 (neg bases cost n * 64B)
+            let neg_base_buffer = if initial_len <= (1 << 24) {
+                let buf = unsafe { program.create_buffer::<G::GpuRepr>(initial_len)? };
+                let negate_kernel_name = format!("{}_negate_bases", G::name());
+                let negate_global = div_ceil(initial_len, LOCAL_WORK_SIZE);
+                let negate_kernel = program.create_kernel(&negate_kernel_name, negate_global, LOCAL_WORK_SIZE)?;
+                negate_kernel
+                    .arg(&base_buffer)
+                    .arg(&buf)
+                    .arg(&(initial_len as u32))
+                    .run()?;
+                Some(buf)
+            } else {
+                None
+            };
+
             // Upload polynomial
             let poly_buffer = program.create_buffer_from_slice(&poly_vec)?;
             let mut current_len = initial_len;
@@ -1618,20 +1637,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // ================================================================
             // Pre-allocate shared MSM sort buffers for Phase 2 and Phase 3
             // ================================================================
-            // Compute max buffer sizes across all Phase 2 and Phase 3 MSM operations.
-            // Phase 2: n_bases halves each iteration (n/2, n/4, ..., 2)
-            // Phase 3: n_bases = initial_len - 1 (constant for all witness MSMs)
-            //
-            // For Phase 2, smaller n_bases can mean larger num_windows (smaller window_size
-            // for the same work_units), so we must scan all iterations.
             const BN254_SCALAR_BITS: usize = 254;
-            let effective_bits = BN254_SCALAR_BITS;
 
             let mut max_total_pairs: usize = 0;
             let mut max_total_buckets: usize = 0;
             let mut max_num_windows: usize = 0;
 
-            // Scan Phase 2 iterations
+            // Scan Phase 2 iterations (use worst-case BN254_SCALAR_BITS for shared buffer sizing)
             let mut scan_len = initial_len;
             for _ in 0..num_challenges {
                 scan_len /= 2;
@@ -1639,7 +1651,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let w = ((div_ceil(scan_len, work_units) as f64).log2() as usize) + 2;
                     std::cmp::min(w, max_window_size)
                 };
-                let nw = div_ceil(effective_bits + 1, ws);
+                let nw = div_ceil(BN254_SCALAR_BITS + 1, ws);
                 let bpw = 1 << (ws - 1);
                 let tp = scan_len * nw;
                 let tb = nw * bpw;
@@ -1654,60 +1666,70 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let ws = ((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2;
                 std::cmp::min(ws, max_window_size)
             };
-            let num_windows_p3 = div_ceil(effective_bits + 1, witness_window_size);
+            let num_windows_p3_max = div_ceil(BN254_SCALAR_BITS + 1, witness_window_size);
             let buckets_per_window_p3 = 1 << (witness_window_size - 1);
-            let total_pairs_p3 = witness_len * num_windows_p3;
-            let total_buckets_p3 = num_windows_p3 * buckets_per_window_p3;
+            let total_pairs_p3_max = witness_len * num_windows_p3_max;
+            let total_buckets_p3_max = num_windows_p3_max * buckets_per_window_p3;
 
-            max_total_pairs = max_total_pairs.max(total_pairs_p3);
-            max_total_buckets = max_total_buckets.max(total_buckets_p3);
-            max_num_windows = max_num_windows.max(num_windows_p3);
+            max_total_pairs = max_total_pairs.max(total_pairs_p3_max);
+            max_total_buckets = max_total_buckets.max(total_buckets_p3_max);
+            max_num_windows = max_num_windows.max(num_windows_p3_max);
 
             // Pre-allocate shared MSM buffers at max sizes
-            // These buffers are reused across all Phase 2 and Phase 3 MSMs.
-            // SAFETY: GPU will initialize these buffers before use
+            // SAFETY: GPU will initialize these buffers before use via GPU kernels
             let shared_digits_buffer = unsafe { program.create_buffer::<u16>(max_total_pairs)? };
             let shared_keys_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
             let shared_values_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
             let shared_sorted_values_buffer = unsafe { program.create_buffer::<u32>(max_total_pairs)? };
-            let mut shared_counts_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
+            let shared_counts_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
             let shared_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
-            let shared_nonempty_ids_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
-            let mut shared_scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
-            let mut shared_bucket_results_buffer = program.create_buffer_from_slice(
-                &vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets])?;
-            let mut shared_window_results_buffer = program.create_buffer_from_slice(
-                &vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows])?;
-            let mut shared_final_result_buffer = program.create_buffer_from_slice(
-                &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
-            let num_nonempty_buffer = unsafe { program.create_buffer::<u32>(1)? };
+            let shared_scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
+            let shared_bucket_results_buffer = unsafe { program.create_buffer::<G::Group>(max_total_buckets)? };
+            let shared_window_results_buffer = unsafe { program.create_buffer::<G::Group>(max_num_windows)? };
+            let shared_final_result_buffer = unsafe { program.create_buffer::<G::Group>(1)? };
+            // Buffer for max_bits output from to_scalar_bytes_max_bits
+            let max_bits_buffer = unsafe { program.create_buffer::<u32>(1)? };
 
-            // CPU scratch vectors (reused across all MSM operations)
-            let mut offsets_cpu = vec![0u32; max_total_buckets];
-            let counts_zero = vec![0u32; max_total_buckets];
-            let bucket_zeros = vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets];
-            let window_zeros = vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows];
-            let final_zero = vec![<G::Group as AdditiveGroup>::ZERO; 1];
+            // GPU kernel names for buffer init (no token replacement needed for u32_fill_zero)
+            let u32_fill_zero_name = "u32_fill_zero".to_string();
+            let point_fill_identity_name = format!("{}_fill_identity", G::name());
+            let u32_copy_buffer_name = "u32_copy_buffer".to_string();
+            let point_copy_at_offset_name = format!("{}_copy_at_offset", G::name());
+
+            // Commitments buffer: stores all Phase 2 MSM results on GPU (batch download later)
+            let commitments_buffer = unsafe { program.create_buffer::<G::Group>(std::cmp::max(num_challenges, 1))? };
+
+            // Scratch buffers for prefix_sum output (nonempty_ids and num_nonempty are unused
+            // since we use accumulate_all_buckets, but the kernel still writes to them)
+            let scratch_nonempty_ids = unsafe { program.create_buffer::<u32>(max_total_buckets)? };
+            let scratch_num_nonempty = unsafe { program.create_buffer::<u32>(1)? };
 
             // ================================================================
             // Phase 1+2: fix_vars + intermediate MSM commits
             // ================================================================
-            // Reusable scalar buffer for the current intermediate (max size = initial_len/2)
+            // Per-iteration output buffers (sizes n/2, n/4, ..., 2)
+            // These stay alive for Phase 3 LC to avoid re-uploading intermediates from CPU.
             let max_intermediate_len = if num_challenges > 0 { initial_len / 2 } else { 1 };
             let shared_scalar_buffer = unsafe { program.create_buffer::<F>(max_intermediate_len)? };
 
-            // Reusable intermediate output buffer
-            let mut fr_out_buffer = unsafe { program.create_buffer::<F>(max_intermediate_len)? };
-            // Track input buffer: initially poly_buffer, then fr_out_buffer alternates
-            let mut input_is_poly = true;
-            // We need two Fr buffers to ping-pong (input/output)
-            let mut fr_alt_buffer = unsafe { program.create_buffer::<F>(max_intermediate_len)? };
-            // CPU buffer for reading intermediates (must match GPU buffer size)
-            let mut intermediate_read_buf = vec![F::ZERO; max_intermediate_len];
+            // Pre-allocate per-iteration Fr buffers
+            let mut per_iter_buffers = Vec::with_capacity(num_challenges);
+            {
+                let mut iter_len = initial_len;
+                for _ in 0..num_challenges {
+                    iter_len /= 2;
+                    let buf = unsafe { program.create_buffer::<F>(iter_len)? };
+                    per_iter_buffers.push(buf);
+                }
+            }
 
             if num_challenges > 0 {
                 // Upload challenges in a single buffer
                 let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
+
+                // Kernel name for to_scalar_bytes_max_bits
+                let to_scalar_max_bits_kernel_name = format!("{}_to_scalar_bytes_max_bits", F::name());
+                let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
 
                 for challenge_idx in 0..num_challenges {
                     let next_len = current_len / 2;
@@ -1717,39 +1739,41 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let fix_var_kernel_name = format!("{}_fix_var_indexed", F::name());
                     let fix_var_kernel = program.create_kernel(&fix_var_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
 
-                    // Determine input and output buffers (ping-pong pattern)
-                    // First iteration: input=poly_buffer, output=fr_out_buffer
-                    // Subsequent: alternate between fr_out_buffer and fr_alt_buffer
-                    let (input_buf, output_buf) = if input_is_poly {
-                        (&poly_buffer, &mut fr_out_buffer)
-                    } else if challenge_idx % 2 == 1 {
-                        (&fr_out_buffer, &mut fr_alt_buffer)
+                    // Determine input buffer
+                    let input_buf = if challenge_idx == 0 {
+                        &poly_buffer
                     } else {
-                        (&fr_alt_buffer, &mut fr_out_buffer)
+                        &per_iter_buffers[challenge_idx - 1]
                     };
 
                     fix_var_kernel
                         .arg(input_buf)
-                        .arg(&*output_buf)
+                        .arg(&per_iter_buffers[challenge_idx])
                         .arg(&challenges_buffer)
                         .arg(&(next_len as u32))
                         .arg(&(challenge_idx as u32))
                         .run()?;
 
-                    // Download intermediate (needed for CPU eval in middle_fn and Phase 3 streaming LC)
-                    // Read into max-sized buffer (required by read_into_buffer) then truncate
-                    program.read_into_buffer(&*output_buf, &mut intermediate_read_buf)?;
-                    let intermediate = intermediate_read_buf[..next_len].to_vec();
+                    // === Phase 2: Convert Fr → scalar bytes with max_bits tracking ===
+                    // Reset max_bits_buffer to 0
+                    let fill_zero_kernel = program.create_kernel(&u32_fill_zero_name, 1, 1)?;
+                    fill_zero_kernel
+                        .arg(&max_bits_buffer)
+                        .arg(&1u32)
+                        .run()?;
 
-                    // === Phase 2: Convert Fr from Montgomery to standard form ON GPU ===
-                    let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
-                    let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
-
+                    let to_scalar_kernel = program.create_kernel(&to_scalar_max_bits_kernel_name, fix_var_global_work_size, LOCAL_WORK_SIZE)?;
                     to_scalar_kernel
-                        .arg(&*output_buf)
+                        .arg(&per_iter_buffers[challenge_idx])
                         .arg(&shared_scalar_buffer)
+                        .arg(&max_bits_buffer)
                         .arg(&(next_len as u32))
                         .run()?;
+
+                    // Download max_bits (just 4 bytes — essentially free, needed before preprocess)
+                    let mut max_bits_cpu = vec![0u32; 1];
+                    program.read_into_buffer(&max_bits_buffer, &mut max_bits_cpu)?;
+                    let effective_bits = std::cmp::max(max_bits_cpu[0] as usize, 1);
 
                     // === Sort-based MSM commit using shared buffers ===
                     let window_size_for_len = {
@@ -1763,7 +1787,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // Preprocess to signed digits
                     let preprocess_global = div_ceil(next_len, LOCAL_WORK_SIZE);
-                    let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
                     let preprocess_kernel = program.create_kernel(&preprocess_kernel_name, preprocess_global, LOCAL_WORK_SIZE)?;
                     preprocess_kernel
                         .arg(&shared_scalar_buffer)
@@ -1782,29 +1805,28 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(next_len as u32)).arg(&(num_windows as u32)).arg(&(buckets_per_window as u32))
                         .run()?;
 
-                    // 2. Count buckets (reinitialize counts to zero)
-                    program.write_from_buffer(&mut shared_counts_buffer, &counts_zero)?;
+                    // 2. Count buckets (GPU zero-init instead of CPU upload)
+                    let counts_fill_kernel = program.create_kernel(&u32_fill_zero_name,
+                        div_ceil(total_buckets, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                    counts_fill_kernel.arg(&shared_counts_buffer).arg(&(total_buckets as u32)).run()?;
+
                     let count_kernel = program.create_kernel(
                         &format!("{}_count_buckets", G::name()),
                         div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
                     count_kernel.arg(&shared_keys_buffer).arg(&shared_counts_buffer).arg(&(total_pairs as u32)).run()?;
 
-                    // 3. Prefix sum
+                    // 3. Prefix sum (writes nonempty_ids/num_nonempty to scratch — unused with accumulate_all_buckets)
                     let prefix_kernel = program.create_kernel(&format!("{}_prefix_sum", G::name()), 1, 1)?;
                     prefix_kernel
-                        .arg(&shared_counts_buffer).arg(&shared_offsets_buffer).arg(&shared_nonempty_ids_buffer)
-                        .arg(&num_nonempty_buffer).arg(&(total_buckets as u32)).run()?;
+                        .arg(&shared_counts_buffer).arg(&shared_offsets_buffer).arg(&scratch_nonempty_ids)
+                        .arg(&scratch_num_nonempty).arg(&(total_buckets as u32)).run()?;
 
-                    // 4. Download num_nonempty
-                    let mut num_nonempty_vec = vec![0u32; 1];
-                    program.read_into_buffer(&num_nonempty_buffer, &mut num_nonempty_vec)?;
-                    let num_nonempty = num_nonempty_vec[0] as usize;
+                    // 4. Copy offsets for scatter (GPU device-to-device, no CPU roundtrip)
+                    let copy_offsets_kernel = program.create_kernel(&u32_copy_buffer_name,
+                        div_ceil(total_buckets, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                    copy_offsets_kernel.arg(&shared_offsets_buffer).arg(&shared_scatter_offsets_buffer).arg(&(total_buckets as u32)).run()?;
 
-                    // 5. Copy offsets for scatter
-                    program.read_into_buffer(&shared_offsets_buffer, &mut offsets_cpu)?;
-                    program.write_from_buffer(&mut shared_scatter_offsets_buffer, &offsets_cpu)?;
-
-                    // 6. Scatter to sorted
+                    // 5. Scatter to sorted
                     let scatter_kernel = program.create_kernel(
                         &format!("{}_scatter_to_sorted", G::name()),
                         div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
@@ -1812,20 +1834,34 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_keys_buffer).arg(&shared_values_buffer).arg(&shared_scatter_offsets_buffer)
                         .arg(&shared_sorted_values_buffer).arg(&(total_pairs as u32)).run()?;
 
-                    // 7. Accumulate sorted buckets (reinitialize bucket_results to zero)
-                    program.write_from_buffer(&mut shared_bucket_results_buffer, &bucket_zeros)?;
-                    if num_nonempty > 0 {
+                    // 6. Accumulate ALL buckets (no num_nonempty download needed)
+                    let bucket_fill_kernel = program.create_kernel(&point_fill_identity_name,
+                        div_ceil(total_buckets, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                    bucket_fill_kernel.arg(&shared_bucket_results_buffer).arg(&(total_buckets as u32)).run()?;
+
+                    if let Some(ref neg_buf) = neg_base_buffer {
                         let accum_kernel = program.create_kernel(
-                            &format!("{}_accumulate_sorted_buckets", G::name()),
-                            div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
+                            &format!("{}_accumulate_all_buckets_precomp", G::name()),
+                            div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
                         accum_kernel
-                            .arg(&base_buffer).arg(&shared_sorted_values_buffer).arg(&shared_offsets_buffer)
-                            .arg(&shared_counts_buffer).arg(&shared_nonempty_ids_buffer).arg(&shared_bucket_results_buffer)
-                            .arg(&(num_nonempty as u32)).run()?;
+                            .arg(&base_buffer).arg(neg_buf).arg(&shared_sorted_values_buffer)
+                            .arg(&shared_offsets_buffer).arg(&shared_counts_buffer)
+                            .arg(&shared_bucket_results_buffer).arg(&(total_buckets as u32)).run()?;
+                    } else {
+                        let accum_kernel = program.create_kernel(
+                            &format!("{}_accumulate_all_buckets", G::name()),
+                            div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
+                        accum_kernel
+                            .arg(&base_buffer).arg(&shared_sorted_values_buffer)
+                            .arg(&shared_offsets_buffer).arg(&shared_counts_buffer)
+                            .arg(&shared_bucket_results_buffer).arg(&(total_buckets as u32)).run()?;
                     }
 
-                    // 8. Reduce buckets by window (reinitialize window_results to zero)
-                    program.write_from_buffer(&mut shared_window_results_buffer, &window_zeros)?;
+                    // 7. Reduce buckets by window (GPU zero-init)
+                    let window_fill_kernel = program.create_kernel(&point_fill_identity_name,
+                        div_ceil(num_windows, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                    window_fill_kernel.arg(&shared_window_results_buffer).arg(&(num_windows as u32)).run()?;
+
                     let reduce_buckets_kernel = program.create_kernel(
                         &format!("{}_reduce_buckets_by_window", G::name()),
                         div_ceil(num_windows, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
@@ -1833,26 +1869,39 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_bucket_results_buffer).arg(&shared_window_results_buffer)
                         .arg(&(num_windows as u32)).arg(&(buckets_per_window as u32)).run()?;
 
-                    // 9. Reduce windows (Horner on GPU)
-                    program.write_from_buffer(&mut shared_final_result_buffer, &final_zero)?;
+                    // 8. Reduce windows (Horner on GPU, GPU zero-init)
+                    let final_fill_kernel = program.create_kernel(&point_fill_identity_name, 1, 1)?;
+                    final_fill_kernel.arg(&shared_final_result_buffer).arg(&1u32).run()?;
+
                     let reduce_windows_kernel = program.create_kernel(
                         &format!("{}_reduce_windows", G::name()), 1, 1)?;
                     reduce_windows_kernel
                         .arg(&shared_window_results_buffer).arg(&shared_final_result_buffer)
                         .arg(&(num_windows as u32)).arg(&(window_size_for_len as u32)).arg(&(effective_bits as u32)).run()?;
 
-                    // 10. Download final result (just 1 point!)
-                    let mut final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
-                    program.read_into_buffer(&shared_final_result_buffer, &mut final_result)?;
-                    let commitment = final_result[0];
+                    // 9. Copy MSM result into commitments_buffer[challenge_idx] (no download!)
+                    let copy_result_kernel = program.create_kernel(&point_copy_at_offset_name, 1, 1)?;
+                    copy_result_kernel
+                        .arg(&shared_final_result_buffer).arg(&commitments_buffer).arg(&(challenge_idx as u32)).run()?;
 
-                    intermediates.push(intermediate);
-                    commitments.push(commitment);
                     intermediate_lens.push(next_len);
-
-                    input_is_poly = false;
                     current_len = next_len;
                 }
+
+                // Batch download ALL intermediates from per-iteration GPU buffers
+                for (challenge_idx, iter_buf) in per_iter_buffers.iter().enumerate() {
+                    let next_len = intermediate_lens[challenge_idx];
+                    // read_into_buffer requires matching size — read into max-sized buffer then truncate
+                    // But per_iter_buffers[i] has exact size next_len, so we need a matching CPU buffer
+                    let mut read_buf = vec![F::ZERO; next_len];
+                    program.read_into_buffer(iter_buf, &mut read_buf)?;
+                    intermediates.push(read_buf);
+                }
+
+                // Batch download ALL commitments
+                let mut all_commitments = vec![<G::Group as AdditiveGroup>::ZERO; num_challenges];
+                program.read_into_buffer(&commitments_buffer, &mut all_commitments)?;
+                commitments = all_commitments;
             } // end if num_challenges > 0
 
             // ================================================================
@@ -1861,17 +1910,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let phase3_input = middle_fn(&intermediates, &commitments);
 
             // ================================================================
-            // Phase 3: Streaming linear_combine + witness + MSMs
+            // Phase 3: Linear combination using on-GPU per-iteration buffers
             // ================================================================
-            // Memory optimization: Instead of allocating polys_buffer (num_polys * poly_len),
-            // we stream each polynomial through a reusable single-poly buffer and accumulate
-            // the linear combination incrementally.
             let num_polys = 1 + num_challenges;
             let poly_len = initial_len;
             let num_points = phase3_input.eval_points.len();
-
-            // Reusable single-poly buffer for streaming LC
-            let mut streaming_poly_buffer = unsafe { program.create_buffer::<F>(poly_len)? };
 
             // Allocate combined_buffer initialized to zeros
             let combined_buffer = program.create_buffer_from_slice(&vec![F::ZERO; poly_len])?;
@@ -1894,44 +1937,36 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 .arg(&poly_buffer)
                 .arg(&combined_buffer)
                 .arg(&coeff0_buffer)
-                .arg(&(poly_len as u32))  // src_len = poly_len (original poly is full length)
+                .arg(&(poly_len as u32))
                 .arg(&(poly_len as u32))
                 .run()?;
 
-            // Streaming LC: accumulate each intermediate (re-upload from CPU)
-            for (idx, (intermediate, &src_len)) in intermediates.iter()
-                .zip(intermediate_lens.iter()).enumerate()
-            {
-                // Upload intermediate polynomial to streaming buffer
-                // Need to pad with zeros to poly_len for memory layout
-                let mut padded = vec![F::ZERO; poly_len];
-                padded[..src_len].copy_from_slice(intermediate);
-                program.write_from_buffer(&mut streaming_poly_buffer, &padded)?;
+            // Streaming LC: accumulate each intermediate directly from on-GPU per-iteration buffers
+            // No CPU re-upload needed! The per_iter_buffers are still alive on GPU.
+            for (idx, iter_buf) in per_iter_buffers.iter().enumerate() {
+                let src_len = intermediate_lens[idx];
 
                 // Upload coefficient
                 let coeff_buffer = program.create_buffer_from_slice(&[coeffs_vec[idx + 1]])?;
 
                 // Accumulate into combined_buffer
-                // Note: Pass src_len to only process non-zero elements (elements beyond
-                // src_len are zero-padded and would contribute 0 * coeff = 0 anyway)
+                // The lc_accum kernel guards `if (gid < src_len)` so smaller buffers work correctly
                 let lc_accum_kernel = program.create_kernel(&lc_accum_kernel_name, lc_global_work_size, LOCAL_WORK_SIZE)?;
                 lc_accum_kernel
-                    .arg(&streaming_poly_buffer)
+                    .arg(iter_buf)
                     .arg(&combined_buffer)
                     .arg(&coeff_buffer)
-                    .arg(&(src_len as u32))   // actual length of intermediate
-                    .arg(&(poly_len as u32))  // bounds for kernel
+                    .arg(&(src_len as u32))
+                    .arg(&(poly_len as u32))
                     .run()?;
             }
 
-            // Upload eval points
-            let points_buffer = program.create_buffer_from_slice(&phase3_input.eval_points)?;
+            // Per-iteration buffers no longer needed after LC — drop them to free GPU memory
+            drop(per_iter_buffers);
 
             // ================================================================
-            // Streaming witness computation: one eval point at a time
+            // Phase 3: Streaming witness computation + MSMs (zero-sync pattern)
             // ================================================================
-            // Instead of allocating witnesses_buffer for all points, compute one witness
-            // at a time and immediately run MSM, reusing the witness buffer.
             let witness_len = poly_len - 1;
 
             // Single witness buffer (reusable across all eval points)
@@ -1940,7 +1975,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // Witness computation uses 3-phase parallel approach
             let chunk_size = std::cmp::max(1, witness_len / 4096);
             let num_chunks = div_ceil(witness_len, chunk_size);
-            let carries_len = num_chunks; // Only 1 point at a time now
+            let carries_len = num_chunks;
             let carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
             let propagated_carries_buffer = unsafe { program.create_buffer::<F>(carries_len)? };
 
@@ -1951,21 +1986,18 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let phase1_kernel_name = format!("{}_witness_poly_batch_phase1", F::name());
             let phase2_kernel_name = format!("{}_witness_carry_propagate", F::name());
             let phase3_kernel_name = format!("{}_witness_poly_batch_phase3", F::name());
-            let to_scalar_kernel_name = format!("{}_to_scalar_bytes", F::name());
+            let to_scalar_max_bits_kernel_name = format!("{}_to_scalar_bytes_max_bits", F::name());
             let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
 
-            // CPU scratch vectors for dispatch table construction (reused across all witness MSMs)
-            let mut counts_cpu = vec![0u32; max_total_buckets];
-            let mut nonempty_ids_cpu = vec![0u32; max_total_buckets];
-
-            let mut witness_commitments = Vec::with_capacity(num_points);
+            // Witness commitments buffer on GPU (batch download at end)
+            let witness_commitments_buffer = unsafe { program.create_buffer::<G::Group>(std::cmp::max(num_points, 1))? };
 
             for point_idx in 0..num_points {
                 // Extract single point into a temporary buffer
                 let single_point_buffer = program.create_buffer_from_slice(&[phase3_input.eval_points[point_idx]])?;
 
                 // === Witness computation Phase 1 ===
-                let total_phase1_threads = num_chunks; // 1 point * num_chunks
+                let total_phase1_threads = num_chunks;
                 let phase1_global_work_size = div_ceil(total_phase1_threads, LOCAL_WORK_SIZE);
                 let phase1_kernel = program.create_kernel(&phase1_kernel_name, phase1_global_work_size, LOCAL_WORK_SIZE)?;
                 phase1_kernel
@@ -1974,7 +2006,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&carries_buffer)
                     .arg(&single_point_buffer)
                     .arg(&(poly_len as u32))
-                    .arg(&(1u32)) // num_points = 1
+                    .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(num_chunks as u32))
                     .run()?;
@@ -1986,7 +2018,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&propagated_carries_buffer)
                     .arg(&single_point_buffer)
                     .arg(&(num_chunks as u32))
-                    .arg(&(1u32)) // num_points = 1
+                    .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(poly_len as u32))
                     .run()?;
@@ -1999,22 +2031,34 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&propagated_carries_buffer)
                     .arg(&single_point_buffer)
                     .arg(&(poly_len as u32))
-                    .arg(&(1u32)) // num_points = 1
+                    .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(num_chunks as u32))
                     .run()?;
 
-                // === MSM for this witness using shared buffers ===
-                // Convert witness Fr → scalar bytes
+                // === MSM: Convert witness → scalar bytes with max_bits ===
+                let fill_zero_kernel = program.create_kernel(&u32_fill_zero_name, 1, 1)?;
+                fill_zero_kernel.arg(&max_bits_buffer).arg(&1u32).run()?;
+
                 let to_scalar_global_work_size = div_ceil(witness_len, LOCAL_WORK_SIZE);
-                let to_scalar_kernel = program.create_kernel(&to_scalar_kernel_name, to_scalar_global_work_size, LOCAL_WORK_SIZE)?;
+                let to_scalar_kernel = program.create_kernel(&to_scalar_max_bits_kernel_name, to_scalar_global_work_size, LOCAL_WORK_SIZE)?;
                 to_scalar_kernel
                     .arg(&single_witness_buffer)
                     .arg(&witness_scalar_buffer)
+                    .arg(&max_bits_buffer)
                     .arg(&(witness_len as u32))
                     .run()?;
 
-                // Preprocess to signed digits (using shared buffers)
+                // Download max_bits (4 bytes — essentially free)
+                let mut max_bits_cpu = vec![0u32; 1];
+                program.read_into_buffer(&max_bits_buffer, &mut max_bits_cpu)?;
+                let effective_bits = std::cmp::max(max_bits_cpu[0] as usize, 1);
+
+                let num_windows_p3 = div_ceil(effective_bits + 1, witness_window_size);
+                let total_pairs_p3 = witness_len * num_windows_p3;
+                let total_buckets_p3 = num_windows_p3 * buckets_per_window_p3;
+
+                // Preprocess to signed digits
                 let preprocess_global = div_ceil(witness_len, LOCAL_WORK_SIZE);
                 let preprocess_kernel = program.create_kernel(&preprocess_kernel_name, preprocess_global, LOCAL_WORK_SIZE)?;
                 preprocess_kernel
@@ -2025,13 +2069,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_window_size as u32))
                     .run()?;
 
-                // Sort-based MSM pipeline (using shared buffers)
-
-                // Step 1: Decompose to (key, value) pairs
-                let decompose_global = div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE);
+                // 1. Decompose to (key, value) pairs
                 let decompose_kernel = program.create_kernel(
                     &format!("{}_decompose_to_pairs", G::name()),
-                    decompose_global, MSM_LOCAL_WORK_SIZE)?;
+                    div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
                 decompose_kernel
                     .arg(&shared_digits_buffer)
                     .arg(&shared_keys_buffer)
@@ -2041,146 +2082,90 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(buckets_per_window_p3 as u32))
                     .run()?;
 
-                // Step 2: Count buckets (re-init counts to zero)
-                program.write_from_buffer(&mut shared_counts_buffer, &counts_zero)?;
-                let count_global = div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE);
+                // 2. Count buckets (GPU zero-init)
+                let counts_fill_kernel = program.create_kernel(&u32_fill_zero_name,
+                    div_ceil(total_buckets_p3, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                counts_fill_kernel.arg(&shared_counts_buffer).arg(&(total_buckets_p3 as u32)).run()?;
+
                 let count_kernel = program.create_kernel(
                     &format!("{}_count_buckets", G::name()),
-                    count_global, MSM_LOCAL_WORK_SIZE)?;
-                count_kernel
-                    .arg(&shared_keys_buffer)
-                    .arg(&shared_counts_buffer)
-                    .arg(&(total_pairs_p3 as u32))
-                    .run()?;
+                    div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
+                count_kernel.arg(&shared_keys_buffer).arg(&shared_counts_buffer).arg(&(total_pairs_p3 as u32)).run()?;
 
-                // Step 3: Prefix sum
-                let prefix_kernel = program.create_kernel(
-                    &format!("{}_prefix_sum", G::name()), 1, 1)?;
+                // 3. Prefix sum (we don't need nonempty_ids with accumulate_all_buckets, but kernel still outputs them)
+                let prefix_kernel = program.create_kernel(&format!("{}_prefix_sum", G::name()), 1, 1)?;
                 prefix_kernel
-                    .arg(&shared_counts_buffer)
-                    .arg(&shared_offsets_buffer)
-                    .arg(&shared_nonempty_ids_buffer)
-                    .arg(&num_nonempty_buffer)
-                    .arg(&(total_buckets_p3 as u32))
-                    .run()?;
+                    .arg(&shared_counts_buffer).arg(&shared_offsets_buffer).arg(&scratch_nonempty_ids)
+                    .arg(&scratch_num_nonempty).arg(&(total_buckets_p3 as u32)).run()?;
 
-                // Step 4: Download num_nonempty
-                let mut num_nonempty_vec = vec![0u32; 1];
-                program.read_into_buffer(&num_nonempty_buffer, &mut num_nonempty_vec)?;
-                let num_nonempty = num_nonempty_vec[0] as usize;
+                // 4. Copy offsets for scatter (GPU device-to-device)
+                let copy_offsets_kernel = program.create_kernel(&u32_copy_buffer_name,
+                    div_ceil(total_buckets_p3, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                copy_offsets_kernel.arg(&shared_offsets_buffer).arg(&shared_scatter_offsets_buffer).arg(&(total_buckets_p3 as u32)).run()?;
 
-                // Step 5: Copy offsets for scatter (scatter modifies them via atomicAdd)
-                program.read_into_buffer(&shared_offsets_buffer, &mut offsets_cpu)?;
-                program.write_from_buffer(&mut shared_scatter_offsets_buffer, &offsets_cpu)?;
-
-                // Step 6: Scatter to sorted
-                let scatter_global = div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE);
+                // 5. Scatter to sorted
                 let scatter_kernel = program.create_kernel(
                     &format!("{}_scatter_to_sorted", G::name()),
-                    scatter_global, MSM_LOCAL_WORK_SIZE)?;
+                    div_ceil(total_pairs_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
                 scatter_kernel
-                    .arg(&shared_keys_buffer)
-                    .arg(&shared_values_buffer)
-                    .arg(&shared_scatter_offsets_buffer)
-                    .arg(&shared_sorted_values_buffer)
-                    .arg(&(total_pairs_p3 as u32))
-                    .run()?;
+                    .arg(&shared_keys_buffer).arg(&shared_values_buffer).arg(&shared_scatter_offsets_buffer)
+                    .arg(&shared_sorted_values_buffer).arg(&(total_pairs_p3 as u32)).run()?;
 
-                // Step 7: Accumulate sorted buckets (with chunked dispatch for large buckets)
-                // Re-init bucket_results to identity
-                program.write_from_buffer(&mut shared_bucket_results_buffer, &bucket_zeros)?;
-                if num_nonempty > 0 {
-                    // Download counts and nonempty IDs for dispatch table construction
-                    program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu)?;
-                    program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
+                // 6. Accumulate ALL buckets (no num_nonempty download)
+                let bucket_fill_kernel = program.create_kernel(&point_fill_identity_name,
+                    div_ceil(total_buckets_p3, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                bucket_fill_kernel.arg(&shared_bucket_results_buffer).arg(&(total_buckets_p3 as u32)).run()?;
 
-                    let (dispatch_table, reduce_table, num_dispatches) =
-                        crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets_p3], &nonempty_ids_cpu[..total_buckets_p3], num_nonempty);
-
-                    if num_dispatches == num_nonempty {
-                        // No large buckets — use simple 1-thread-per-bucket kernel (faster for small buckets)
-                        let accum_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
-                        let accum_kernel = program.create_kernel(
-                            &format!("{}_accumulate_sorted_buckets", G::name()),
-                            accum_global, MSM_LOCAL_WORK_SIZE)?;
-                        accum_kernel
-                            .arg(&base_buffer)
-                            .arg(&shared_sorted_values_buffer)
-                            .arg(&shared_offsets_buffer)
-                            .arg(&shared_counts_buffer)
-                            .arg(&shared_nonempty_ids_buffer)
-                            .arg(&shared_bucket_results_buffer)
-                            .arg(&(num_nonempty as u32))
-                            .run()?;
-                    } else {
-                        // Large buckets detected — use chunked accumulation
-                        let dispatch_buffer = program.create_buffer_from_slice(&dispatch_table)?;
-                        let partial_results_buffer = {
-                            let partials = vec![<G::Group as AdditiveGroup>::ZERO; num_dispatches];
-                            program.create_buffer_from_slice(&partials)?
-                        };
-
-                        // Chunked accumulation
-                        let chunked_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
-                        let chunked_kernel = program.create_kernel(
-                            &format!("{}_accumulate_chunked", G::name()),
-                            chunked_global, MSM_LOCAL_WORK_SIZE)?;
-                        chunked_kernel
-                            .arg(&base_buffer)
-                            .arg(&shared_sorted_values_buffer)
-                            .arg(&shared_offsets_buffer)
-                            .arg(&dispatch_buffer)
-                            .arg(&partial_results_buffer)
-                            .arg(&(num_dispatches as u32))
-                            .run()?;
-
-                        // Reduce partial results per bucket
-                        let reduce_table_buffer = program.create_buffer_from_slice(&reduce_table)?;
-                        let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
-                        let reduce_kernel = program.create_kernel(
-                            &format!("{}_reduce_partial_buckets", G::name()),
-                            reduce_global, MSM_LOCAL_WORK_SIZE)?;
-                        reduce_kernel
-                            .arg(&partial_results_buffer)
-                            .arg(&shared_nonempty_ids_buffer)
-                            .arg(&reduce_table_buffer)
-                            .arg(&shared_bucket_results_buffer)
-                            .arg(&(num_nonempty as u32))
-                            .run()?;
-                    }
+                if let Some(ref neg_buf) = neg_base_buffer {
+                    let accum_kernel = program.create_kernel(
+                        &format!("{}_accumulate_all_buckets_precomp", G::name()),
+                        div_ceil(total_buckets_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
+                    accum_kernel
+                        .arg(&base_buffer).arg(neg_buf).arg(&shared_sorted_values_buffer)
+                        .arg(&shared_offsets_buffer).arg(&shared_counts_buffer)
+                        .arg(&shared_bucket_results_buffer).arg(&(total_buckets_p3 as u32)).run()?;
+                } else {
+                    let accum_kernel = program.create_kernel(
+                        &format!("{}_accumulate_all_buckets", G::name()),
+                        div_ceil(total_buckets_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
+                    accum_kernel
+                        .arg(&base_buffer).arg(&shared_sorted_values_buffer)
+                        .arg(&shared_offsets_buffer).arg(&shared_counts_buffer)
+                        .arg(&shared_bucket_results_buffer).arg(&(total_buckets_p3 as u32)).run()?;
                 }
 
-                // Step 8: Reduce buckets by window (re-init window_results to identity)
-                program.write_from_buffer(&mut shared_window_results_buffer, &window_zeros)?;
-                let reduce_buckets_global = div_ceil(num_windows_p3, MSM_LOCAL_WORK_SIZE);
+                // 7. Reduce buckets by window (GPU zero-init)
+                let window_fill_kernel = program.create_kernel(&point_fill_identity_name,
+                    div_ceil(num_windows_p3, LOCAL_WORK_SIZE), LOCAL_WORK_SIZE)?;
+                window_fill_kernel.arg(&shared_window_results_buffer).arg(&(num_windows_p3 as u32)).run()?;
+
                 let reduce_buckets_kernel = program.create_kernel(
                     &format!("{}_reduce_buckets_by_window", G::name()),
-                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
+                    div_ceil(num_windows_p3, MSM_LOCAL_WORK_SIZE), MSM_LOCAL_WORK_SIZE)?;
                 reduce_buckets_kernel
-                    .arg(&shared_bucket_results_buffer)
-                    .arg(&shared_window_results_buffer)
-                    .arg(&(num_windows_p3 as u32))
-                    .arg(&(buckets_per_window_p3 as u32))
-                    .run()?;
+                    .arg(&shared_bucket_results_buffer).arg(&shared_window_results_buffer)
+                    .arg(&(num_windows_p3 as u32)).arg(&(buckets_per_window_p3 as u32)).run()?;
 
-                // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
-                program.write_from_buffer(&mut shared_final_result_buffer, &final_zero)?;
+                // 8. Reduce windows (Horner on GPU, GPU zero-init)
+                let final_fill_kernel = program.create_kernel(&point_fill_identity_name, 1, 1)?;
+                final_fill_kernel.arg(&shared_final_result_buffer).arg(&1u32).run()?;
+
                 let reduce_windows_kernel = program.create_kernel(
                     &format!("{}_reduce_windows", G::name()), 1, 1)?;
                 reduce_windows_kernel
-                    .arg(&shared_window_results_buffer)
-                    .arg(&shared_final_result_buffer)
-                    .arg(&(num_windows_p3 as u32))
-                    .arg(&(witness_window_size as u32))
-                    .arg(&(effective_bits as u32))
-                    .run()?;
+                    .arg(&shared_window_results_buffer).arg(&shared_final_result_buffer)
+                    .arg(&(num_windows_p3 as u32)).arg(&(witness_window_size as u32)).arg(&(effective_bits as u32)).run()?;
 
-                // Step 10: Download final result (just 1 point!)
-                let mut final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
-                program.read_into_buffer(&shared_final_result_buffer, &mut final_result)?;
-                let commitment = final_result[0];
+                // 9. Copy result to witness_commitments_buffer[point_idx] (no download!)
+                let copy_result_kernel = program.create_kernel(&point_copy_at_offset_name, 1, 1)?;
+                copy_result_kernel
+                    .arg(&shared_final_result_buffer).arg(&witness_commitments_buffer).arg(&(point_idx as u32)).run()?;
+            }
 
-                witness_commitments.push(commitment);
+            // Batch download ALL witness commitments at end
+            let mut witness_commitments = vec![<G::Group as AdditiveGroup>::ZERO; num_points];
+            if num_points > 0 {
+                program.read_into_buffer(&witness_commitments_buffer, &mut witness_commitments)?;
             }
 
             Ok(FusedOpenResult {

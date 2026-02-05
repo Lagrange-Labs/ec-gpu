@@ -683,3 +683,148 @@ KERNEL void POINT_batch_scalar_mul(
 
   results[gid] = acc;
 }
+
+/*
+ * ============================================================================
+ * GPU utility kernels for eliminating CPU-GPU sync points
+ * ============================================================================
+ */
+
+/*
+ * Fill a u32 buffer with zeros on the GPU.
+ * Replaces CPU-side write_from_buffer with a zero vector.
+ */
+KERNEL void u32_fill_zero(GLOBAL uint *buffer, uint count) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= count) return;
+  buffer[gid] = 0;
+}
+
+/*
+ * Fill a Jacobian point buffer with identity points on the GPU.
+ * Replaces CPU-side write_from_buffer with an identity vector.
+ */
+KERNEL void POINT_fill_identity(GLOBAL POINT_jacobian *buffer, uint count) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= count) return;
+  buffer[gid] = POINT_ZERO;
+}
+
+/*
+ * Device-to-device u32 buffer copy.
+ * Replaces the CPU roundtrip of downloading offsets and re-uploading to scatter_offsets.
+ */
+KERNEL void u32_copy_buffer(GLOBAL uint *src, GLOBAL uint *dst, uint count) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= count) return;
+  dst[gid] = src[gid];
+}
+
+/*
+ * Copy a single Jacobian point to a specific index in a destination array.
+ * Used to save each MSM result into a commitments array without CPU sync.
+ */
+KERNEL void POINT_copy_at_offset(
+    GLOBAL POINT_jacobian *src,
+    GLOBAL POINT_jacobian *dst,
+    uint dst_idx) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid != 0) return;
+  dst[dst_idx] = src[0];
+}
+
+/*
+ * Accumulate over ALL buckets (not just non-empty ones).
+ * Each thread checks its bucket's count; if zero, it returns immediately.
+ * This eliminates the need to download num_nonempty and nonempty_ids from GPU.
+ *
+ * Uses XYZZ accumulator for performance, same as POINT_accumulate_sorted_buckets.
+ */
+KERNEL void POINT_accumulate_all_buckets(
+    GLOBAL POINT_affine *bases,
+    GLOBAL uint *sorted_values,
+    GLOBAL uint *offsets,
+    GLOBAL uint *counts,
+    GLOBAL POINT_jacobian *bucket_results,
+    uint total_buckets) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= total_buckets) return;
+
+  uint count = counts[gid];
+  if (count == 0) {
+    bucket_results[gid] = POINT_ZERO;
+    return;
+  }
+
+  uint start = offsets[gid];
+
+  POINT_xyzz acc = POINT_XYZZ_ZERO;
+  for (uint j = 0; j < count; j++) {
+    uint val = sorted_values[start + j];
+    uint base_idx = val & 0x7FFFFFFF;
+    uint sign = (val >> 31) & 1;
+
+    POINT_affine base = bases[base_idx];
+    if (sign) {
+      base.y = FIELD_sub(FIELD_ZERO, base.y);
+    }
+    acc = POINT_xyzz_add_mixed(acc, base);
+  }
+
+  // Convert XYZZ → Jacobian: (X*ZZ, Y*ZZZ, ZZ), costs 2M
+  const FIELD local_zero = FIELD_ZERO;
+  if (FIELD_eq(acc.zz, local_zero)) {
+    bucket_results[gid] = POINT_ZERO;
+  } else {
+    POINT_jacobian jac;
+    jac.x = FIELD_mul(acc.x, acc.zz);
+    jac.y = FIELD_mul(acc.y, acc.zzz);
+    jac.z = acc.zz;
+    bucket_results[gid] = jac;
+  }
+}
+
+/*
+ * Same as POINT_accumulate_all_buckets but with precomputed negation bases.
+ * Uses ternary select between bases and neg_bases instead of runtime FIELD_sub.
+ */
+KERNEL void POINT_accumulate_all_buckets_precomp(
+    GLOBAL POINT_affine *bases,
+    GLOBAL POINT_affine *neg_bases,
+    GLOBAL uint *sorted_values,
+    GLOBAL uint *offsets,
+    GLOBAL uint *counts,
+    GLOBAL POINT_jacobian *bucket_results,
+    uint total_buckets) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= total_buckets) return;
+
+  uint count = counts[gid];
+  if (count == 0) {
+    bucket_results[gid] = POINT_ZERO;
+    return;
+  }
+
+  uint start = offsets[gid];
+
+  POINT_xyzz acc = POINT_XYZZ_ZERO;
+  for (uint j = 0; j < count; j++) {
+    uint val = sorted_values[start + j];
+    uint base_idx = val & 0x7FFFFFFF;
+    uint sign = (val >> 31) & 1;
+
+    POINT_affine base = sign ? neg_bases[base_idx] : bases[base_idx];
+    acc = POINT_xyzz_add_mixed(acc, base);
+  }
+
+  const FIELD local_zero = FIELD_ZERO;
+  if (FIELD_eq(acc.zz, local_zero)) {
+    bucket_results[gid] = POINT_ZERO;
+  } else {
+    POINT_jacobian jac;
+    jac.x = FIELD_mul(acc.x, acc.zz);
+    jac.y = FIELD_mul(acc.y, acc.zzz);
+    jac.z = acc.zz;
+    bucket_results[gid] = jac;
+  }
+}
