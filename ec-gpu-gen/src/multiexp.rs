@@ -5,7 +5,7 @@ use ark_ec::CurveGroup;
 use ark_ff::{AdditiveGroup, BigInteger, PrimeField};
 use ec_gpu::GpuName;
 use log::{error, info};
-use rust_gpu_tools::{program_closures, Device, Program};
+use rust_gpu_tools::{program_closures, Device, LocalBuffer, Program};
 use tracing::debug_span;
 use yastl::Scope;
 
@@ -753,22 +753,44 @@ where
                 }
             }
 
-            // Step 11: Allocate window_results and reduce buckets by window
+            // Step 11: Parallel chunked bucket reduction + combine to windows
             let window_results_buffer = {
-                let _span = debug_span!("reduce_buckets_by_window").entered();
+                let _span = debug_span!("reduce_buckets_chunked").entered();
+                const REDUCTION_CHUNK_SIZE: usize = 256;
+                let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+                let total_blocks = num_windows * num_chunks_per_window;
+                let total_chunks = total_blocks;
+
+                let chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+                let chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+
+                // Level 1: Parallel suffix sum + reduction per chunk
+                let chunked_reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_chunked", G::name()),
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
+                    .arg(&bucket_results_buffer)
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // Level 2: Combine chunks to window results
                 let window_results = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
                 let window_results_buffer = program.create_buffer_from_slice(&window_results)?;
-
-                let reduce_buckets_global = div_ceil(num_windows, LOCAL_WORK_SIZE);
-                let reduce_buckets_kernel_name = format!("{}_reduce_buckets_by_window", G::name());
-                let reduce_buckets_kernel = program.create_kernel(
-                    &reduce_buckets_kernel_name, reduce_buckets_global, LOCAL_WORK_SIZE)?;
-
-                reduce_buckets_kernel
-                    .arg(&bucket_results_buffer)
+                let combine_global = div_ceil(num_windows, LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(
+                    &format!("{}_combine_chunks_to_windows", G::name()),
+                    combine_global, LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
                     .arg(&window_results_buffer)
                     .arg(&(num_windows as u32))
-                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
                 window_results_buffer

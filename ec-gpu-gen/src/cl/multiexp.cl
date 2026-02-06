@@ -380,34 +380,127 @@ KERNEL void POINT_accumulate_sorted_buckets(
 }
 
 /*
- * Phase 4: Summation-by-parts per window.
+ * Phase 4a: Parallel chunked bucket reduction.
  *
- * One thread per window. For window w, iterates over buckets
- * [w * buckets_per_window .. (w+1) * buckets_per_window) in reverse
- * and computes the weighted sum using the running-sum technique.
+ * Replaces the sequential POINT_reduce_buckets_by_window with a two-level
+ * parallel reduction. This kernel (Level 1) splits each window's buckets
+ * into chunks of CHUNK_SIZE (= block size) threads and computes:
+ *   1. Hillis-Steele suffix sum in shared memory
+ *   2. Parallel tree reduction to sum all suffix values = local SBP
  *
- * Output: one result per window in window_results.
+ * Launch: num_windows * num_chunks_per_window blocks, each with CHUNK_SIZE threads.
+ * Output: chunk_sbp[block_id] and chunk_sum[block_id].
+ *
+ * Math: After suffix sum, smem[j] = B[j] + B[j+1] + ... + B[T-1].
+ * The sum of all suffix values equals the SBP for that chunk.
+ * chunk_sum = smem[0] = total sum of the chunk.
  */
-KERNEL void POINT_reduce_buckets_by_window(
+KERNEL void POINT_reduce_buckets_chunked(
     GLOBAL POINT_jacobian *bucket_results,
-    GLOBAL POINT_jacobian *window_results,
-    uint num_windows,
-    uint buckets_per_window) {
-  const uint gid = GET_GLOBAL_ID();
-  if (gid >= num_windows) return;
+    GLOBAL POINT_jacobian *chunk_sbp_out,
+    GLOBAL POINT_jacobian *chunk_sum_out,
+    uint buckets_per_window,
+    uint num_chunks_per_window) {
 
-  const uint window = gid;
-  const uint base_bucket = window * buckets_per_window;
+  const uint block_id = GET_GROUP_ID();
+  const uint tid = GET_LOCAL_ID();
+  const uint T = GET_LOCAL_SIZE();
+  const uint window = block_id / num_chunks_per_window;
+  const uint chunk_idx = block_id % num_chunks_per_window;
+  const uint base_bucket = window * buckets_per_window + chunk_idx * T;
 
-  POINT_jacobian acc = POINT_ZERO;
-  POINT_jacobian res = POINT_ZERO;
+#ifdef CUDA
+  POINT_jacobian *smem = (POINT_jacobian *)cuda_shared;
+#else
+  // OpenCL: not supported for now (fused_open is CUDA-only)
+  return;
+#endif
 
-  for (int j = (int)buckets_per_window - 1; j >= 0; j--) {
-    acc = POINT_add(acc, bucket_results[base_bucket + (uint)j]);
-    res = POINT_add(res, acc);
+  // Load bucket results into shared memory (pad with identity for partial last chunk)
+  if (base_bucket + tid < (window + 1) * buckets_per_window) {
+    smem[tid] = bucket_results[base_bucket + tid];
+  } else {
+    smem[tid] = POINT_ZERO;
+  }
+  BARRIER_LOCAL();
+
+  // Hillis-Steele suffix sum: after log2(T) rounds, smem[j] = B[j] + B[j+1] + ... + B[T-1]
+  for (uint d = 1; d < T; d <<= 1) {
+    POINT_jacobian temp = POINT_ZERO;
+    if (tid + d < T)
+      temp = smem[tid + d];
+    BARRIER_LOCAL();
+    smem[tid] = POINT_add(smem[tid], temp);
+    BARRIER_LOCAL();
   }
 
-  window_results[window] = res;
+  // Save chunk_sum = smem[0] = total sum of chunk
+  // Save each thread's suffix value before reduction overwrites it
+  POINT_jacobian my_suffix = smem[tid];
+  if (tid == 0)
+    chunk_sum_out[block_id] = smem[0];
+  BARRIER_LOCAL();
+
+  // Parallel tree reduction: sum of all suffix values = local SBP
+  smem[tid] = my_suffix;
+  BARRIER_LOCAL();
+  for (uint s = T / 2; s > 0; s >>= 1) {
+    if (tid < s)
+      smem[tid] = POINT_add(smem[tid], smem[tid + s]);
+    BARRIER_LOCAL();
+  }
+
+  if (tid == 0)
+    chunk_sbp_out[block_id] = smem[0];
+}
+
+/*
+ * Phase 4b: Combine chunk results into per-window SBP values.
+ *
+ * One thread per window. Combines Level 1 chunk results using:
+ *   SBP(full_window) = sum(chunk_sbp[c]) + CHUNK_SIZE * sum_c(suffix_S[c])
+ * where suffix_S[c] = chunk_sum[c] + ... + chunk_sum[B-1], computed with B additions.
+ * The CHUNK_SIZE multiplication uses log2(CHUNK_SIZE) EC point doublings.
+ *
+ * Cost per window: ~3B + log2(chunk_size) EC operations (vs. bpw sequential ops before).
+ */
+KERNEL void POINT_combine_chunks_to_windows(
+    GLOBAL POINT_jacobian *chunk_sbp,
+    GLOBAL POINT_jacobian *chunk_sum,
+    GLOBAL POINT_jacobian *window_results,
+    uint num_windows,
+    uint num_chunks_per_window,
+    uint chunk_size) {
+
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= num_windows) return;
+  const uint w = gid;
+  const uint B = num_chunks_per_window;
+  const uint base = w * B;
+
+  // Compute suffix sums of chunk_sums and accumulate correction
+  POINT_jacobian ss = POINT_ZERO;
+  POINT_jacobian correction = POINT_ZERO;
+  for (int c = (int)B - 1; c >= 0; c--) {
+    ss = POINT_add(ss, chunk_sum[base + (uint)c]);
+    if (c > 0)
+      correction = POINT_add(correction, ss);
+  }
+
+  // Multiply correction by chunk_size using repeated doubling
+  // chunk_size is always a power of 2 (256)
+  uint cs = chunk_size;
+  while (cs > 1) {
+    correction = POINT_double(correction);
+    cs >>= 1;
+  }
+
+  // Sum all chunk SBPs
+  POINT_jacobian sbp_total = POINT_ZERO;
+  for (uint c = 0; c < B; c++)
+    sbp_total = POINT_add(sbp_total, chunk_sbp[base + c]);
+
+  window_results[w] = POINT_add(sbp_total, correction);
 }
 
 /*

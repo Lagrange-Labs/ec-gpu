@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use ark_ff::{AdditiveGroup, PrimeField};
 use ec_gpu::GpuName;
-use rust_gpu_tools::{program_closures, Program};
+use rust_gpu_tools::{program_closures, LocalBuffer, Program};
 
 use crate::error::EcResult;
 use crate::multiexp::GpuAffine;
@@ -533,6 +533,10 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
 const MAX_WINDOW_SIZE: usize = 16;
 /// In CUDA this is the number of blocks per grid (grid size) for MSM
 const MSM_LOCAL_WORK_SIZE: usize = 128;
+/// Chunk size for parallel bucket reduction (shared memory suffix sum).
+/// Each thread block processes this many buckets. Must be a power of 2.
+/// 256 threads × 96 bytes (Jacobian point) = 24 KB shared memory per block.
+const REDUCTION_CHUNK_SIZE: usize = 256;
 
 /// Compute sort-based MSM window size.
 ///
@@ -637,6 +641,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let mut max_total_buckets = 0usize;
             let mut max_digits_len = 0usize;
             let mut max_num_windows = 0usize;
+            let mut max_total_chunks = 0usize;
             {
                 let mut len = initial_len;
                 for _ in 0..num_challenges {
@@ -646,10 +651,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let tp = nb * nw;
                     let bpw = 1usize << (ws - 1);
                     let tb = nw * bpw;
+                    let num_chunks_pw = div_ceil(bpw, REDUCTION_CHUNK_SIZE);
+                    let total_chunks = nw * num_chunks_pw;
                     max_total_pairs = std::cmp::max(max_total_pairs, tp);
                     max_total_buckets = std::cmp::max(max_total_buckets, tb);
                     max_digits_len = std::cmp::max(max_digits_len, nb * nw);
                     max_num_windows = std::cmp::max(max_num_windows, nw);
+                    max_total_chunks = std::cmp::max(max_total_chunks, total_chunks);
                     len = nb;
                 }
             }
@@ -668,7 +676,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let identity_points = vec![<G::Group as AdditiveGroup>::ZERO; max_total_buckets];
                 program.create_buffer_from_slice(&identity_points)?
             };
-            let mut window_results_buffer = {
+            let window_results_buffer = {
                 let window_results = vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows];
                 program.create_buffer_from_slice(&window_results)?
             };
@@ -676,6 +684,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
                 program.create_buffer_from_slice(&final_result)?
             };
+            // Chunk buffers for parallel bucket reduction
+            let chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
+            let chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
             // CPU-side scratch vectors
             let mut offsets_copy = vec![0u32; max_total_buckets];
             let mut counts_cpu = vec![0u32; max_total_buckets];
@@ -866,17 +877,33 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     }
                 }
 
-                // Step 8: Reduce buckets by window (re-init window_results to identity, full buffer size)
-                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; max_num_windows])?;
-                let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                let reduce_buckets_kernel = program.create_kernel(
-                    &format!("{}_reduce_buckets_by_window", G::name()),
-                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
-                reduce_buckets_kernel
+                // Step 8: Parallel chunked bucket reduction (Level 1)
+                let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+                let total_blocks = num_windows * num_chunks_per_window;
+                let chunked_reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_chunked", G::name()),
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
                     .arg(&bucket_results_buffer)
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // Step 8b: Combine chunks to windows (Level 2)
+                let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(
+                    &format!("{}_combine_chunks_to_windows", G::name()),
+                    combine_global, MSM_LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
                     .arg(&window_results_buffer)
                     .arg(&(num_windows as u32))
-                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
                 // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
@@ -1046,7 +1073,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let identity_points = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets];
                 program.create_buffer_from_slice(&identity_points)?
             };
-            let mut window_results_buffer = {
+            let window_results_buffer = {
                 let window_results = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
                 program.create_buffer_from_slice(&window_results)?
             };
@@ -1054,6 +1081,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
                 program.create_buffer_from_slice(&final_result)?
             };
+            // Chunk buffers for parallel bucket reduction
+            let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+            let total_chunks = num_windows * num_chunks_per_window;
+            let chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+            let chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
             // CPU-side scratch vectors
             let mut offsets_copy = vec![0u32; total_buckets];
             let mut counts_cpu = vec![0u32; total_buckets];
@@ -1212,17 +1244,32 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     }
                 }
 
-                // Step 8: Reduce buckets by window (re-init window_results to identity)
-                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; num_windows])?;
-                let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                let reduce_buckets_kernel = program.create_kernel(
-                    &format!("{}_reduce_buckets_by_window", G::name()),
-                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
-                reduce_buckets_kernel
+                // Step 8: Parallel chunked bucket reduction (Level 1)
+                let total_blocks = num_windows * num_chunks_per_window;
+                let chunked_reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_chunked", G::name()),
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
                     .arg(&bucket_results_buffer)
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // Step 8b: Combine chunks to windows (Level 2)
+                let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(
+                    &format!("{}_combine_chunks_to_windows", G::name()),
+                    combine_global, MSM_LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
                     .arg(&window_results_buffer)
                     .arg(&(num_windows as u32))
-                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
                 // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
@@ -1355,7 +1402,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let identity_points = vec![<G::Group as AdditiveGroup>::ZERO; total_buckets];
                 program.create_buffer_from_slice(&identity_points)?
             };
-            let mut window_results_buffer = {
+            let window_results_buffer = {
                 let window_results = vec![<G::Group as AdditiveGroup>::ZERO; num_windows];
                 program.create_buffer_from_slice(&window_results)?
             };
@@ -1363,6 +1410,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let final_result = vec![<G::Group as AdditiveGroup>::ZERO; 1];
                 program.create_buffer_from_slice(&final_result)?
             };
+            // Chunk buffers for parallel bucket reduction
+            let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+            let total_chunks = num_windows * num_chunks_per_window;
+            let chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+            let chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
             // CPU-side scratch vectors
             let mut offsets_copy = vec![0u32; total_buckets];
             let mut counts_cpu = vec![0u32; total_buckets];
@@ -1525,17 +1577,32 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     }
                 }
 
-                // Step 8: Reduce buckets by window
-                program.write_from_buffer(&mut window_results_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; num_windows])?;
-                let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                let reduce_buckets_kernel = program.create_kernel(
-                    &format!("{}_reduce_buckets_by_window", G::name()),
-                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
-                reduce_buckets_kernel
+                // Step 8: Parallel chunked bucket reduction (Level 1)
+                let total_blocks = num_windows * num_chunks_per_window;
+                let chunked_reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_chunked", G::name()),
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
                     .arg(&bucket_results_buffer)
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // Step 8b: Combine chunks to windows (Level 2)
+                let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(
+                    &format!("{}_combine_chunks_to_windows", G::name()),
+                    combine_global, MSM_LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
                     .arg(&window_results_buffer)
                     .arg(&(num_windows as u32))
-                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
                 // Step 9: Horner reduction on GPU
@@ -1629,6 +1696,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let mut max_total_pairs: usize = 0;
             let mut max_total_buckets: usize = 0;
             let mut max_num_windows: usize = 0;
+            let mut max_total_chunks: usize = 0;
 
             // Scan Phase 2 iterations to find max buffer sizes
             let mut scan_len = initial_len;
@@ -1639,10 +1707,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let tp = scan_len * nw;
                 let bpw = 1usize << (ws - 1);
                 let tb = nw * bpw;
+                let num_chunks_pw = div_ceil(bpw, REDUCTION_CHUNK_SIZE);
+                let total_chunks = nw * num_chunks_pw;
                 max_digits_len = max_digits_len.max(scan_len * nw);
                 max_total_pairs = max_total_pairs.max(tp);
                 max_total_buckets = max_total_buckets.max(tb);
                 max_num_windows = max_num_windows.max(nw);
+                max_total_chunks = max_total_chunks.max(total_chunks);
             }
 
             // Phase 3: witness MSMs use n_bases = initial_len - 1
@@ -1653,10 +1724,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let tp = witness_len * nw;
                 let bpw = 1usize << (ws - 1);
                 let tb = nw * bpw;
+                let num_chunks_pw = div_ceil(bpw, REDUCTION_CHUNK_SIZE);
+                let total_chunks = nw * num_chunks_pw;
                 max_digits_len = max_digits_len.max(witness_len * nw);
                 max_total_pairs = max_total_pairs.max(tp);
                 max_total_buckets = max_total_buckets.max(tb);
                 max_num_windows = max_num_windows.max(nw);
+                max_total_chunks = max_total_chunks.max(total_chunks);
             }
 
             // Pre-allocate shared sort-based MSM buffers at max sizes
@@ -1673,6 +1747,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let shared_bucket_results_buffer = unsafe { program.create_buffer::<G::Group>(max_total_buckets)? };
             let shared_window_results_buffer = unsafe { program.create_buffer::<G::Group>(max_num_windows)? };
             let shared_final_result_buffer = unsafe { program.create_buffer::<G::Group>(1)? };
+            // Chunk buffers for parallel bucket reduction
+            let shared_chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
+            let shared_chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
 
             // GPU kernel names
             let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
@@ -1683,7 +1760,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let u32_copy_buffer_name = "u32_copy_buffer".to_string();
             let scatter_kernel_name = format!("{}_scatter_to_sorted", G::name());
             let accumulate_all_name = format!("{}_accumulate_all_sorted_buckets", G::name());
-            let reduce_buckets_kernel_name = format!("{}_reduce_buckets_by_window", G::name());
+            let reduce_chunked_name = format!("{}_reduce_buckets_chunked", G::name());
+            let combine_chunks_name = format!("{}_combine_chunks_to_windows", G::name());
             let reduce_windows_kernel_name = format!("{}_reduce_windows", G::name());
             let copy_at_offset_name = format!("{}_copy_at_offset", G::name());
 
@@ -1844,15 +1922,31 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(total_buckets as u32))
                         .run()?;
 
-                    // 9. Reduce buckets by window
-                    let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                    let reduce_buckets_kernel = program.create_kernel(&reduce_buckets_kernel_name,
-                        reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
-                    reduce_buckets_kernel
+                    // 9. Parallel chunked bucket reduction (Level 1)
+                    let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+                    let total_blocks = num_windows * num_chunks_per_window;
+                    let chunked_reduce_kernel = program.create_kernel(&reduce_chunked_name,
+                        total_blocks, REDUCTION_CHUNK_SIZE)?;
+                    chunked_reduce_kernel
                         .arg(&shared_bucket_results_buffer)
+                        .arg(&shared_chunk_sbp_buffer)
+                        .arg(&shared_chunk_sum_buffer)
+                        .arg(&(buckets_per_window as u32))
+                        .arg(&(num_chunks_per_window as u32))
+                        .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                        .run()?;
+
+                    // 9b. Combine chunks to windows (Level 2)
+                    let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                    let combine_kernel = program.create_kernel(&combine_chunks_name,
+                        combine_global, MSM_LOCAL_WORK_SIZE)?;
+                    combine_kernel
+                        .arg(&shared_chunk_sbp_buffer)
+                        .arg(&shared_chunk_sum_buffer)
                         .arg(&shared_window_results_buffer)
                         .arg(&(num_windows as u32))
-                        .arg(&(buckets_per_window as u32))
+                        .arg(&(num_chunks_per_window as u32))
+                        .arg(&(REDUCTION_CHUNK_SIZE as u32))
                         .run()?;
 
                     // 10. Horner reduction across windows
@@ -2116,15 +2210,31 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(total_buckets as u32))
                     .run()?;
 
-                // 9. Reduce buckets by window
-                let reduce_buckets_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                let reduce_buckets_kernel = program.create_kernel(&reduce_buckets_kernel_name,
-                    reduce_buckets_global, MSM_LOCAL_WORK_SIZE)?;
-                reduce_buckets_kernel
+                // 9. Parallel chunked bucket reduction (Level 1)
+                let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+                let total_blocks = num_windows * num_chunks_per_window;
+                let chunked_reduce_kernel = program.create_kernel(&reduce_chunked_name,
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
                     .arg(&shared_bucket_results_buffer)
+                    .arg(&shared_chunk_sbp_buffer)
+                    .arg(&shared_chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // 9b. Combine chunks to windows (Level 2)
+                let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(&combine_chunks_name,
+                    combine_global, MSM_LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&shared_chunk_sbp_buffer)
+                    .arg(&shared_chunk_sum_buffer)
                     .arg(&shared_window_results_buffer)
                     .arg(&(num_windows as u32))
-                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
                 // 10. Horner reduction across windows
