@@ -522,6 +522,10 @@ pub struct FixVarsAndCommitResult<F, G> {
 /// minimizing transfers for the commit-open flow.
 pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     program: Program,
+    /// Maximum window size for MSM (used by non-fused methods)
+    max_window_size: usize,
+    /// Work units for MSM parallelization (used by non-fused methods)
+    work_units: usize,
     _phantom: std::marker::PhantomData<(F, G)>,
 }
 
@@ -546,9 +550,11 @@ fn calc_sort_window_size(n_bases: usize) -> usize {
 
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
     /// Create a new fused poly-commit handler.
-    pub fn create(program: Program, _work_units: usize) -> EcResult<Self> {
+    pub fn create(program: Program, work_units: usize) -> EcResult<Self> {
         Ok(Self {
             program,
+            max_window_size: MAX_WINDOW_SIZE,
+            work_units,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -599,6 +605,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let initial_len = poly.len();
         let challenges_vec = challenges.to_vec();
         let poly_vec = poly.to_vec();
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
 
         let closures = program_closures!(|program, _arg| -> EcResult<FixVarsAndCommitResult<F, G::Group>> {
             // Upload polynomial once
@@ -628,7 +636,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let mut len = initial_len;
                 for _ in 0..num_challenges {
                     let nb = len / 2;
-                    let ws = calc_sort_window_size(nb);
+                    let ws = std::cmp::min(((div_ceil(nb, work_units) as f64).log2() as usize) + 2, max_window_size);
                     let nw = div_ceil(effective_bits + 1, ws);
                     let tp = nb * nw;
                     let bpw = 1usize << (ws - 1);
@@ -705,7 +713,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // === Phase 3: Sort-based MSM commit ===
-                let window_size_for_len = calc_sort_window_size(next_len);
+                let window_size_for_len = std::cmp::min(((div_ceil(next_len, work_units) as f64).log2() as usize) + 2, max_window_size);
                 let num_windows = div_ceil(effective_bits + 1, window_size_for_len);
                 let n_bases = next_len;
 
@@ -936,6 +944,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         let poly_vec = poly.to_vec();
         let points_vec = points.to_vec();
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
             // Upload polynomial once
@@ -1006,7 +1016,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // Use fixed 254-bit assumption for bn254 scalars
             const BN254_SCALAR_BITS: usize = 254;
             let effective_bits = BN254_SCALAR_BITS;
-            let window_size = calc_sort_window_size(witness_len);
+            let window_size = std::cmp::min(((div_ceil(witness_len, work_units) as f64).log2() as usize) + 2, max_window_size);
             let num_windows = div_ceil(effective_bits + 1, window_size);
 
             // Signed digits buffer (reused for each witness)
@@ -1304,6 +1314,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         // CPU-side scratch buffer for zero-padded poly data (reused per poly)
         let mut padded_scratch: Vec<F> = vec![F::ZERO; max_len];
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
             // Upload bases once (for all MSMs)
@@ -1316,7 +1328,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             const BN254_SCALAR_BITS: usize = 254;
             let effective_bits = BN254_SCALAR_BITS;
             let n_bases = max_len;
-            let window_size = calc_sort_window_size(n_bases);
+            let window_size = std::cmp::min(((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2, max_window_size);
             let num_windows = div_ceil(effective_bits + 1, window_size);
             let total_pairs = n_bases * num_windows;
             let buckets_per_window = 1usize << (window_size - 1);
