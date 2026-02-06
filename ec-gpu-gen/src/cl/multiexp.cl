@@ -734,3 +734,41 @@ KERNEL void POINT_copy_at_offset(
   dst[dst_idx] = src[0];
 }
 
+/*
+ * GPU-side tree reduction for Pippenger multiexp results.
+ *
+ * Single-thread kernel that combines per-group, per-window results into a
+ * single final point using Horner's method (MSB-first), same algorithm as
+ * the CPU accumulation in SingleMultiexpKernel::multiexp.
+ *
+ * This eliminates the GPU→CPU download of `work_units` results and CPU-side
+ * reduction, removing a sync point per MSM.
+ *
+ * Parameters:
+ * - results: num_groups * num_windows partial results from multiexp_signed
+ * - output: single output point
+ * - num_groups: number of base groups
+ * - num_windows: number of digit windows
+ * - window_size: bits per window
+ * - effective_bits: actual number of significant bits in scalars
+ */
+KERNEL void POINT_reduce_multiexp(
+    GLOBAL POINT_jacobian *results,
+    GLOBAL POINT_jacobian *output,
+    uint num_groups,
+    uint num_windows,
+    uint window_size,
+    uint effective_bits) {
+  if(GET_GLOBAL_ID() > 0) return;
+  POINT_jacobian acc = POINT_ZERO;
+  for (int i = (int)num_windows - 1; i >= 0; i--) {
+    uint skip = (uint)i * window_size;
+    uint remaining = effective_bits - skip;
+    uint w = (remaining < window_size) ? remaining : window_size;
+    for (uint j = 0; j < w; j++) acc = POINT_double(acc);
+    for (uint g = 0; g < num_groups; g++)
+      acc = POINT_add(acc, results[g * num_windows + (uint)i]);
+  }
+  output[0] = acc;
+}
+
