@@ -28,7 +28,7 @@ pub trait GpuAffine: GpuName + Clone + Send + Sync + Sized {
 }
 
 /// On the GPU, the exponents are split into windows, this is the maximum number of such windows.
-const MAX_WINDOW_SIZE: usize = 10;
+const MAX_WINDOW_SIZE: usize = 16;
 /// In CUDA this is the number of blocks per grid (grid size).
 const LOCAL_WORK_SIZE: usize = 128;
 /// Let 20% of GPU memory be free, this is an arbitrary value.
@@ -985,7 +985,7 @@ pub struct SortedMsmParams {
 
 /// Maximum number of points per chunk when splitting large buckets.
 /// Buckets with more points than this are split across multiple threads.
-const CHUNK_SIZE: usize = 256;
+pub const CHUNK_SIZE: usize = 256;
 
 /// Build dispatch and reduce tables for chunked bucket accumulation.
 ///
@@ -1031,13 +1031,10 @@ pub fn build_dispatch_tables(
 /// This determines optimal window size and derived parameters based on the number
 /// of bases. The window size calculation balances parallelism and memory usage.
 pub fn compute_sorted_msm_params(n_bases: usize, effective_bits: usize) -> SortedMsmParams {
-    // Use the same window size calculation as the regular multiexp for now.
-    // For sorted MSM, larger windows mean fewer total pairs but more buckets per window.
-    // The sweet spot is typically larger than per-thread buckets since bucket processing
-    // is more efficient with sorting, but we can tune this later based on benchmarks.
-    let work_units = LOCAL_WORK_SIZE * 32; // Dummy work_units for calculation
+    // For sort-based MSM, each bucket is processed by 1 thread serially.
+    // Target ~1000 pts/bucket: ws ≈ log2(n) - 8.
     let window_size = {
-        let ws = ((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2;
+        let ws = std::cmp::max(3, (n_bases as f64).log2() as usize - 8);
         std::cmp::min(ws, MAX_WINDOW_SIZE)
     };
 

@@ -84,7 +84,7 @@ pub use source::{generate, SourceBuilder};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
-pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel, compute_work_units, SortedMsmParams, compute_sorted_msm_params, build_dispatch_tables};
+pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel, compute_work_units, SortedMsmParams, compute_sorted_msm_params, build_dispatch_tables, CHUNK_SIZE};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
 #[cfg(any(feature = "cuda", feature = "opencl"))]
