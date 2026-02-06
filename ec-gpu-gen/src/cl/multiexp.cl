@@ -735,40 +735,57 @@ KERNEL void POINT_copy_at_offset(
 }
 
 /*
- * GPU-side tree reduction for Pippenger multiexp results.
+ * Phase 3 (zero-sync): Accumulate ALL sorted buckets.
  *
- * Single-thread kernel that combines per-group, per-window results into a
- * single final point using Horner's method (MSB-first), same algorithm as
- * the CPU accumulation in SingleMultiexpKernel::multiexp.
+ * Unlike POINT_accumulate_sorted_buckets which uses nonempty_bucket_ids mapping,
+ * this kernel launches one thread per bucket (total_buckets threads) and checks
+ * counts[bid] > 0 to skip empty ones. This eliminates the need to download
+ * num_nonempty, counts, and nonempty_ids to CPU for dispatch table construction.
  *
- * This eliminates the GPU→CPU download of `work_units` results and CPU-side
- * reduction, removing a sync point per MSM.
+ * Empty buckets write POINT_ZERO, so no fill_identity pre-initialization needed.
  *
- * Parameters:
- * - results: num_groups * num_windows partial results from multiexp_signed
- * - output: single output point
- * - num_groups: number of base groups
- * - num_windows: number of digit windows
- * - window_size: bits per window
- * - effective_bits: actual number of significant bits in scalars
+ * Uses XYZZ accumulator for faster mixed additions (7M+2S vs 7M+4S).
  */
-KERNEL void POINT_reduce_multiexp(
-    GLOBAL POINT_jacobian *results,
-    GLOBAL POINT_jacobian *output,
-    uint num_groups,
-    uint num_windows,
-    uint window_size,
-    uint effective_bits) {
-  if(GET_GLOBAL_ID() > 0) return;
-  POINT_jacobian acc = POINT_ZERO;
-  for (int i = (int)num_windows - 1; i >= 0; i--) {
-    uint skip = (uint)i * window_size;
-    uint remaining = effective_bits - skip;
-    uint w = (remaining < window_size) ? remaining : window_size;
-    for (uint j = 0; j < w; j++) acc = POINT_double(acc);
-    for (uint g = 0; g < num_groups; g++)
-      acc = POINT_add(acc, results[g * num_windows + (uint)i]);
+KERNEL void POINT_accumulate_all_sorted_buckets(
+    GLOBAL POINT_affine *bases,
+    GLOBAL uint *sorted_values,
+    GLOBAL uint *bucket_offsets,
+    GLOBAL uint *bucket_counts,
+    GLOBAL POINT_jacobian *bucket_results,
+    uint total_buckets) {
+  const uint bid = GET_GLOBAL_ID();
+  if (bid >= total_buckets) return;
+
+  uint count = bucket_counts[bid];
+  if (count == 0) {
+    bucket_results[bid] = POINT_ZERO;
+    return;
   }
-  output[0] = acc;
+
+  uint start = bucket_offsets[bid];
+  POINT_xyzz acc = POINT_XYZZ_ZERO;
+  for (uint j = 0; j < count; j++) {
+    uint val = sorted_values[start + j];
+    uint base_idx = val & 0x7FFFFFFF;
+    uint sign = (val >> 31) & 1;
+
+    POINT_affine base = bases[base_idx];
+    if (sign) {
+      base.y = FIELD_sub(FIELD_ZERO, base.y);
+    }
+    acc = POINT_xyzz_add_mixed(acc, base);
+  }
+
+  // Convert XYZZ → Jacobian: (X*ZZ, Y*ZZZ, ZZ), costs 2M
+  const FIELD local_zero = FIELD_ZERO;
+  if (FIELD_eq(acc.zz, local_zero)) {
+    bucket_results[bid] = POINT_ZERO;
+  } else {
+    POINT_jacobian jac;
+    jac.x = FIELD_mul(acc.x, acc.zz);
+    jac.y = FIELD_mul(acc.y, acc.zzz);
+    jac.z = acc.zz;
+    bucket_results[bid] = jac;
+  }
 }
 
