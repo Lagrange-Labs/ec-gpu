@@ -1759,13 +1759,12 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let shared_chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
             let shared_chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
 
-            // Pre-allocate dispatch-table buffers for chunked accumulation (reused across all MSM iterations)
-            // Upper bound: each point generates at most 1 dispatch entry per window,
-            // but with CHUNK_SIZE chunking, it's total_pairs/CHUNK_SIZE + total_buckets
+            // Pre-allocate partial_results buffer for chunked accumulation (reused across all MSM iterations).
+            // dispatch_table and reduce_table are small (few KB) and variable-sized per iteration,
+            // so they use create_buffer_from_slice. partial_results is large (~39MB) and initialized
+            // via GPU fill_identity kernel, so pre-allocating it avoids cuMalloc + 39MB upload per iteration.
             let max_num_dispatches = max_total_pairs / crate::multiexp::CHUNK_SIZE + max_total_buckets;
-            let mut shared_dispatch_buffer = unsafe { program.create_buffer::<u32>(max_num_dispatches.max(1) * 3)? };
             let shared_partial_results_buffer = unsafe { program.create_buffer::<G::Group>(max_num_dispatches.max(1))? };
-            let mut shared_reduce_table_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets.max(1) * 2)? };
 
             // GPU kernel names
             let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
@@ -1970,10 +1969,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                                 .run_async()?;
                         } else {
                             // Chunked path: large buckets split across threads
-                            // Use pre-allocated dispatch buffers (no per-iteration cuMalloc)
-                            program.write_from_buffer(&mut shared_dispatch_buffer, &dispatch_table)?;
+                            // dispatch/reduce tables are small (few KB), allocate per-iteration
+                            let dispatch_buffer = program.create_buffer_from_slice(&dispatch_table)?;
 
-                            // Initialize partial results to identity via GPU kernel
+                            // Initialize partial results to identity via GPU kernel (avoids 39MB CPU upload)
                             let fill_partial_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
                             let fill_partial_kernel = program.create_kernel(&fill_identity_name,
                                 fill_partial_global, MSM_LOCAL_WORK_SIZE)?;
@@ -1989,19 +1988,19 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                                 .arg(&base_buffer)
                                 .arg(&shared_sorted_values_buffer)
                                 .arg(&shared_offsets_buffer)
-                                .arg(&shared_dispatch_buffer)
+                                .arg(&dispatch_buffer)
                                 .arg(&shared_partial_results_buffer)
                                 .arg(&(num_dispatches as u32))
                                 .run_async()?;
 
-                            program.write_from_buffer(&mut shared_reduce_table_buffer, &reduce_table)?;
+                            let reduce_table_buffer = program.create_buffer_from_slice(&reduce_table)?;
                             let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
                             let reduce_kernel = program.create_kernel(&reduce_partial_name,
                                 reduce_global, MSM_LOCAL_WORK_SIZE)?;
                             reduce_kernel
                                 .arg(&shared_partial_results_buffer)
                                 .arg(&shared_nonempty_ids_buffer)
-                                .arg(&shared_reduce_table_buffer)
+                                .arg(&reduce_table_buffer)
                                 .arg(&shared_bucket_results_buffer)
                                 .arg(&(num_nonempty as u32))
                                 .run_async()?;
@@ -2383,10 +2382,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             .run_async()?;
                     } else {
                         // Chunked path: large buckets split across threads
-                        // Use pre-allocated dispatch buffers (no per-iteration cuMalloc)
-                        program.write_from_buffer(&mut shared_dispatch_buffer, &dispatch_table)?;
+                        // dispatch/reduce tables are small (few KB), allocate per-iteration
+                        let dispatch_buffer = program.create_buffer_from_slice(&dispatch_table)?;
 
-                        // Initialize partial results to identity via GPU kernel
+                        // Initialize partial results to identity via GPU kernel (avoids 39MB CPU upload)
                         let fill_partial_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
                         let fill_partial_kernel = program.create_kernel(&fill_identity_name,
                             fill_partial_global, MSM_LOCAL_WORK_SIZE)?;
@@ -2402,19 +2401,19 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             .arg(&base_buffer)
                             .arg(&shared_sorted_values_buffer)
                             .arg(&shared_offsets_buffer)
-                            .arg(&shared_dispatch_buffer)
+                            .arg(&dispatch_buffer)
                             .arg(&shared_partial_results_buffer)
                             .arg(&(num_dispatches as u32))
                             .run_async()?;
 
-                        program.write_from_buffer(&mut shared_reduce_table_buffer, &reduce_table)?;
+                        let reduce_table_buffer = program.create_buffer_from_slice(&reduce_table)?;
                         let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
                         let reduce_kernel = program.create_kernel(&reduce_partial_name,
                             reduce_global, MSM_LOCAL_WORK_SIZE)?;
                         reduce_kernel
                             .arg(&shared_partial_results_buffer)
                             .arg(&shared_nonempty_ids_buffer)
-                            .arg(&shared_reduce_table_buffer)
+                            .arg(&reduce_table_buffer)
                             .arg(&shared_bucket_results_buffer)
                             .arg(&(num_nonempty as u32))
                             .run_async()?;
