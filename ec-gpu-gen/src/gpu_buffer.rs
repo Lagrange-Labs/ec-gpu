@@ -1759,19 +1759,35 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let shared_chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
             let shared_chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(max_total_chunks.max(1))? };
 
+            // Pre-allocate dispatch-table buffers for chunked accumulation (reused across all MSM iterations)
+            // Upper bound: each point generates at most 1 dispatch entry per window,
+            // but with CHUNK_SIZE chunking, it's total_pairs/CHUNK_SIZE + total_buckets
+            let max_num_dispatches = max_total_pairs / crate::multiexp::CHUNK_SIZE + max_total_buckets;
+            let mut shared_dispatch_buffer = unsafe { program.create_buffer::<u32>(max_num_dispatches.max(1) * 3)? };
+            let shared_partial_results_buffer = unsafe { program.create_buffer::<G::Group>(max_num_dispatches.max(1))? };
+            let mut shared_reduce_table_buffer = unsafe { program.create_buffer::<u32>(max_total_buckets.max(1) * 2)? };
+
             // GPU kernel names
             let preprocess_kernel_name = format!("{}_preprocess_signed_digits", G::name());
             let decompose_kernel_name = format!("{}_decompose_to_pairs", G::name());
             let count_buckets_kernel_name = format!("{}_count_buckets", G::name());
             let prefix_sum_kernel_name = format!("{}_prefix_sum", G::name());
             let scatter_kernel_name = format!("{}_scatter_to_sorted", G::name());
-            let accumulate_all_name = format!("{}_accumulate_all_sorted_buckets", G::name());
+            let accumulate_sorted_name = format!("{}_accumulate_sorted_buckets", G::name());
+            let accumulate_chunked_name = format!("{}_accumulate_chunked", G::name());
+            let reduce_partial_name = format!("{}_reduce_partial_buckets", G::name());
+            let fill_identity_name = format!("{}_fill_identity", G::name());
             let u32_fill_zero_name = "u32_fill_zero".to_string();
             let u32_copy_buffer_name = "u32_copy_buffer".to_string();
             let reduce_chunked_name = format!("{}_reduce_buckets_chunked", G::name());
             let combine_chunks_name = format!("{}_combine_chunks_to_windows", G::name());
             let reduce_windows_kernel_name = format!("{}_reduce_windows", G::name());
             let copy_at_offset_name = format!("{}_copy_at_offset", G::name());
+
+            // CPU-side scratch vectors for dispatch-table accumulation
+            let mut counts_cpu = vec![0u32; max_total_buckets];
+            let mut nonempty_ids_cpu = vec![0u32; max_total_buckets];
+            let mut num_nonempty_vec = vec![0u32; 1];
 
             // ================================================================
             // Phase 1+2: fix_vars + intermediate MSM commits
@@ -1885,7 +1901,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(total_pairs as u32))
                         .run_async()?;
 
-                    // 5. Prefix sum (outputs: offsets, nonempty_ids, num_nonempty)
+                    // 5. Prefix sum (CPU needs results for dispatch table — must sync)
                     let prefix_kernel = program.create_kernel(&prefix_sum_kernel_name, 1, 1)?;
                     prefix_kernel
                         .arg(&shared_counts_buffer)
@@ -1893,7 +1909,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_nonempty_ids_buffer)
                         .arg(&shared_num_nonempty_buffer)
                         .arg(&(total_buckets as u32))
-                        .run_async()?;
+                        .run()?;
 
                     // 6. Copy offsets → scatter_offsets via GPU kernel (no CPU sync)
                     let copy_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -1917,18 +1933,79 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(total_pairs as u32))
                         .run_async()?;
 
-                    // 8. Accumulate ALL sorted buckets (no CPU dependency, handles empty buckets)
-                    let accum_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
-                    let accum_kernel = program.create_kernel(&accumulate_all_name,
-                        accum_global, MSM_LOCAL_WORK_SIZE)?;
-                    accum_kernel
-                        .arg(&base_buffer)
-                        .arg(&shared_sorted_values_buffer)
-                        .arg(&shared_offsets_buffer)
-                        .arg(&shared_counts_buffer)
+                    // 8. Accumulate sorted buckets (dispatch-table approach for large bucket handling)
+                    // Initialize bucket results to identity via GPU kernel
+                    let fill_bucket_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
+                    let fill_bucket_kernel = program.create_kernel(&fill_identity_name,
+                        fill_bucket_global, MSM_LOCAL_WORK_SIZE)?;
+                    fill_bucket_kernel
                         .arg(&shared_bucket_results_buffer)
                         .arg(&(total_buckets as u32))
                         .run_async()?;
+
+                    // Download dispatch inputs from GPU (1 sync point)
+                    program.read_into_buffer(&shared_num_nonempty_buffer, &mut num_nonempty_vec)?;
+                    let num_nonempty = num_nonempty_vec[0] as usize;
+                    if num_nonempty > 0 {
+                        program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu[..total_buckets])?;
+                        program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu[..total_buckets])?;
+
+                        let (dispatch_table, reduce_table, num_dispatches) =
+                            crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets], &nonempty_ids_cpu[..total_buckets], num_nonempty);
+
+                        if num_dispatches == num_nonempty {
+                            // Simple path: 1 thread per non-empty bucket
+                            let accum_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                            let accum_kernel = program.create_kernel(&accumulate_sorted_name,
+                                accum_global, MSM_LOCAL_WORK_SIZE)?;
+                            accum_kernel
+                                .arg(&base_buffer)
+                                .arg(&shared_sorted_values_buffer)
+                                .arg(&shared_offsets_buffer)
+                                .arg(&shared_counts_buffer)
+                                .arg(&shared_nonempty_ids_buffer)
+                                .arg(&shared_bucket_results_buffer)
+                                .arg(&(num_nonempty as u32))
+                                .run_async()?;
+                        } else {
+                            // Chunked path: large buckets split across threads
+                            // Use pre-allocated dispatch buffers (no per-iteration cuMalloc)
+                            program.write_from_buffer(&mut shared_dispatch_buffer, &dispatch_table)?;
+
+                            // Initialize partial results to identity via GPU kernel
+                            let fill_partial_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
+                            let fill_partial_kernel = program.create_kernel(&fill_identity_name,
+                                fill_partial_global, MSM_LOCAL_WORK_SIZE)?;
+                            fill_partial_kernel
+                                .arg(&shared_partial_results_buffer)
+                                .arg(&(num_dispatches as u32))
+                                .run_async()?;
+
+                            let chunked_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
+                            let chunked_kernel = program.create_kernel(&accumulate_chunked_name,
+                                chunked_global, MSM_LOCAL_WORK_SIZE)?;
+                            chunked_kernel
+                                .arg(&base_buffer)
+                                .arg(&shared_sorted_values_buffer)
+                                .arg(&shared_offsets_buffer)
+                                .arg(&shared_dispatch_buffer)
+                                .arg(&shared_partial_results_buffer)
+                                .arg(&(num_dispatches as u32))
+                                .run_async()?;
+
+                            program.write_from_buffer(&mut shared_reduce_table_buffer, &reduce_table)?;
+                            let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                            let reduce_kernel = program.create_kernel(&reduce_partial_name,
+                                reduce_global, MSM_LOCAL_WORK_SIZE)?;
+                            reduce_kernel
+                                .arg(&shared_partial_results_buffer)
+                                .arg(&shared_nonempty_ids_buffer)
+                                .arg(&shared_reduce_table_buffer)
+                                .arg(&shared_bucket_results_buffer)
+                                .arg(&(num_nonempty as u32))
+                                .run_async()?;
+                        }
+                    }
 
                     // 9. Parallel chunked bucket reduction (Level 1)
                     let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
@@ -2236,7 +2313,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(total_pairs as u32))
                     .run_async()?;
 
-                // 5. Prefix sum (outputs: offsets, nonempty_ids, num_nonempty)
+                // 5. Prefix sum (CPU needs results for dispatch table — must sync)
                 let prefix_kernel = program.create_kernel(&prefix_sum_kernel_name, 1, 1)?;
                 prefix_kernel
                     .arg(&shared_counts_buffer)
@@ -2244,7 +2321,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_nonempty_ids_buffer)
                     .arg(&shared_num_nonempty_buffer)
                     .arg(&(total_buckets as u32))
-                    .run_async()?;
+                    .run()?;
 
                 // 6. Copy offsets → scatter_offsets via GPU kernel (no CPU sync)
                 let copy_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -2268,18 +2345,79 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(total_pairs as u32))
                     .run_async()?;
 
-                // 8. Accumulate ALL sorted buckets (no CPU dependency, handles empty buckets)
-                let accum_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
-                let accum_kernel = program.create_kernel(&accumulate_all_name,
-                    accum_global, MSM_LOCAL_WORK_SIZE)?;
-                accum_kernel
-                    .arg(&base_buffer)
-                    .arg(&shared_sorted_values_buffer)
-                    .arg(&shared_offsets_buffer)
-                    .arg(&shared_counts_buffer)
+                // 8. Accumulate sorted buckets (dispatch-table approach for large bucket handling)
+                // Initialize bucket results to identity via GPU kernel
+                let fill_bucket_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
+                let fill_bucket_kernel = program.create_kernel(&fill_identity_name,
+                    fill_bucket_global, MSM_LOCAL_WORK_SIZE)?;
+                fill_bucket_kernel
                     .arg(&shared_bucket_results_buffer)
                     .arg(&(total_buckets as u32))
                     .run_async()?;
+
+                // Download dispatch inputs from GPU (1 sync point)
+                program.read_into_buffer(&shared_num_nonempty_buffer, &mut num_nonempty_vec)?;
+                let num_nonempty = num_nonempty_vec[0] as usize;
+                if num_nonempty > 0 {
+                    program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu[..total_buckets])?;
+                    program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu[..total_buckets])?;
+
+                    let (dispatch_table, reduce_table, num_dispatches) =
+                        crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets], &nonempty_ids_cpu[..total_buckets], num_nonempty);
+
+                    if num_dispatches == num_nonempty {
+                        // Simple path: 1 thread per non-empty bucket
+                        let accum_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                        let accum_kernel = program.create_kernel(&accumulate_sorted_name,
+                            accum_global, MSM_LOCAL_WORK_SIZE)?;
+                        accum_kernel
+                            .arg(&base_buffer)
+                            .arg(&shared_sorted_values_buffer)
+                            .arg(&shared_offsets_buffer)
+                            .arg(&shared_counts_buffer)
+                            .arg(&shared_nonempty_ids_buffer)
+                            .arg(&shared_bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run_async()?;
+                    } else {
+                        // Chunked path: large buckets split across threads
+                        // Use pre-allocated dispatch buffers (no per-iteration cuMalloc)
+                        program.write_from_buffer(&mut shared_dispatch_buffer, &dispatch_table)?;
+
+                        // Initialize partial results to identity via GPU kernel
+                        let fill_partial_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
+                        let fill_partial_kernel = program.create_kernel(&fill_identity_name,
+                            fill_partial_global, MSM_LOCAL_WORK_SIZE)?;
+                        fill_partial_kernel
+                            .arg(&shared_partial_results_buffer)
+                            .arg(&(num_dispatches as u32))
+                            .run_async()?;
+
+                        let chunked_global = div_ceil(num_dispatches, MSM_LOCAL_WORK_SIZE);
+                        let chunked_kernel = program.create_kernel(&accumulate_chunked_name,
+                            chunked_global, MSM_LOCAL_WORK_SIZE)?;
+                        chunked_kernel
+                            .arg(&base_buffer)
+                            .arg(&shared_sorted_values_buffer)
+                            .arg(&shared_offsets_buffer)
+                            .arg(&shared_dispatch_buffer)
+                            .arg(&shared_partial_results_buffer)
+                            .arg(&(num_dispatches as u32))
+                            .run_async()?;
+
+                        program.write_from_buffer(&mut shared_reduce_table_buffer, &reduce_table)?;
+                        let reduce_global = div_ceil(num_nonempty, MSM_LOCAL_WORK_SIZE);
+                        let reduce_kernel = program.create_kernel(&reduce_partial_name,
+                            reduce_global, MSM_LOCAL_WORK_SIZE)?;
+                        reduce_kernel
+                            .arg(&shared_partial_results_buffer)
+                            .arg(&shared_nonempty_ids_buffer)
+                            .arg(&shared_reduce_table_buffer)
+                            .arg(&shared_bucket_results_buffer)
+                            .arg(&(num_nonempty as u32))
+                            .run_async()?;
+                    }
+                }
 
                 // 9. Parallel chunked bucket reduction (Level 1)
                 let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
