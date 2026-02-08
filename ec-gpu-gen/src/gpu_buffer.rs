@@ -1947,8 +1947,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     program.read_into_buffer(&shared_num_nonempty_buffer, &mut num_nonempty_vec)?;
                     let num_nonempty = num_nonempty_vec[0] as usize;
                     if num_nonempty > 0 {
-                        program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu[..total_buckets])?;
-                        program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu[..total_buckets])?;
+                        // read_into_buffer requires data.len() == buffer.len(), so read full vectors
+                        program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu)?;
+                        program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
 
                         let (dispatch_table, reduce_table, num_dispatches) =
                             crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets], &nonempty_ids_cpu[..total_buckets], num_nonempty);
@@ -2359,8 +2360,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 program.read_into_buffer(&shared_num_nonempty_buffer, &mut num_nonempty_vec)?;
                 let num_nonempty = num_nonempty_vec[0] as usize;
                 if num_nonempty > 0 {
-                    program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu[..total_buckets])?;
-                    program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu[..total_buckets])?;
+                    // read_into_buffer requires data.len() == buffer.len(), so read full vectors
+                    program.read_into_buffer(&shared_counts_buffer, &mut counts_cpu)?;
+                    program.read_into_buffer(&shared_nonempty_ids_buffer, &mut nonempty_ids_cpu)?;
 
                     let (dispatch_table, reduce_table, num_dispatches) =
                         crate::multiexp::build_dispatch_tables(&counts_cpu[..total_buckets], &nonempty_ids_cpu[..total_buckets], num_nonempty);
