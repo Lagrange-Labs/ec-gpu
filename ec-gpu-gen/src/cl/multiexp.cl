@@ -882,3 +882,48 @@ KERNEL void POINT_accumulate_all_sorted_buckets(
   }
 }
 
+/*
+ * Accumulate ALL sorted buckets with precomputed negations.
+ * Same as accumulate_all_sorted_buckets but uses ternary select between
+ * bases and neg_bases instead of runtime FIELD_sub for point negation.
+ */
+KERNEL void POINT_accumulate_all_sorted_buckets_precomp(
+    GLOBAL POINT_affine *bases,
+    GLOBAL POINT_affine *neg_bases,
+    GLOBAL uint *sorted_values,
+    GLOBAL uint *bucket_offsets,
+    GLOBAL uint *bucket_counts,
+    GLOBAL POINT_jacobian *bucket_results,
+    uint total_buckets) {
+  const uint bid = GET_GLOBAL_ID();
+  if (bid >= total_buckets) return;
+
+  uint count = bucket_counts[bid];
+  if (count == 0) {
+    bucket_results[bid] = POINT_ZERO;
+    return;
+  }
+
+  uint start = bucket_offsets[bid];
+  POINT_xyzz acc = POINT_XYZZ_ZERO;
+  for (uint j = 0; j < count; j++) {
+    uint val = sorted_values[start + j];
+    uint base_idx = val & 0x7FFFFFFF;
+    uint sign = (val >> 31) & 1;
+
+    POINT_affine base = sign ? neg_bases[base_idx] : bases[base_idx];
+    acc = POINT_xyzz_add_mixed(acc, base);
+  }
+
+  const FIELD local_zero_p = FIELD_ZERO;
+  if (FIELD_eq(acc.zz, local_zero_p)) {
+    bucket_results[bid] = POINT_ZERO;
+  } else {
+    POINT_jacobian jac;
+    jac.x = FIELD_mul(acc.x, acc.zz);
+    jac.y = FIELD_mul(acc.y, acc.zzz);
+    jac.z = acc.zz;
+    bucket_results[bid] = jac;
+  }
+}
+

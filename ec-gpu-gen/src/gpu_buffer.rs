@@ -16,12 +16,17 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ark_ec::{CurveGroup, VariableBaseMSM};
 use ark_ff::{AdditiveGroup, PrimeField};
 use ec_gpu::GpuName;
 use rust_gpu_tools::{program_closures, LocalBuffer, Program};
 
 use crate::error::EcResult;
 use crate::multiexp::GpuAffine;
+
+/// Below this number of bases, Phase 2 MSM iterations fall back to CPU.
+/// CPU is faster for small MSMs because GPU has per-kernel launch overhead.
+const GPU_MSM_THRESHOLD: usize = 4096;
 
 const LOCAL_WORK_SIZE: usize = 256;
 
@@ -554,7 +559,7 @@ fn calc_sort_window_size(n_bases: usize) -> usize {
             log_n - 8
         }
     };
-    std::cmp::max(3, std::cmp::min(ws, MAX_WINDOW_SIZE))
+    ws.clamp(3, MAX_WINDOW_SIZE)
 }
 
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
@@ -907,7 +912,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
-                program.write_from_buffer(&mut final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
+                program.write_from_buffer(&mut final_result_buffer, &[<G::Group as AdditiveGroup>::ZERO; 1])?;
                 let reduce_windows_kernel = program.create_kernel(
                     &format!("{}_reduce_windows", G::name()), 1, 1)?;
                 reduce_windows_kernel
@@ -1273,7 +1278,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 9: Horner reduction on GPU (single thread, re-init final_result to identity)
-                program.write_from_buffer(&mut final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
+                program.write_from_buffer(&mut final_result_buffer, &[<G::Group as AdditiveGroup>::ZERO; 1])?;
                 let reduce_windows_kernel = program.create_kernel(
                     &format!("{}_reduce_windows", G::name()), 1, 1)?;
                 reduce_windows_kernel
@@ -1422,9 +1427,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             let mut commitments = Vec::with_capacity(num_polys);
 
-            for poly_idx in 0..num_polys {
+            for poly in polys.iter().take(num_polys) {
                 // Build zero-padded poly on CPU and upload to reusable fr_buffer
-                let poly = polys[poly_idx];
                 padded_scratch[..poly.len()].copy_from_slice(poly);
                 // Zero-fill the tail (only needed if poly is shorter than max_len)
                 for v in padded_scratch[poly.len()..].iter_mut() {
@@ -1606,7 +1610,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run()?;
 
                 // Step 9: Horner reduction on GPU
-                program.write_from_buffer(&mut final_result_buffer, &vec![<G::Group as AdditiveGroup>::ZERO; 1])?;
+                program.write_from_buffer(&mut final_result_buffer, &[<G::Group as AdditiveGroup>::ZERO; 1])?;
                 let reduce_windows_kernel = program.create_kernel(
                     &format!("{}_reduce_windows", G::name()), 1, 1)?;
                 reduce_windows_kernel
@@ -1651,10 +1655,12 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         poly: &[F],
         challenges: &[F],
         bases: &[G::GpuRepr],
+        cpu_bases: &[<G::Group as CurveGroup>::Affine],
         middle_fn: MiddleFn,
     ) -> EcResult<FusedOpenResult<F, AffineG, G::Group>>
     where
         MiddleFn: FnOnce(&[Vec<F>], &[G::Group]) -> Phase3Input<F, AffineG>,
+        G::Group: VariableBaseMSM<MulBase = <G::Group as CurveGroup>::Affine>,
     {
         assert!(poly.len().is_power_of_two());
         let log_len = poly.len().ilog2() as usize;
@@ -1671,12 +1677,27 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let initial_len = poly.len();
         let challenges_vec = challenges.to_vec();
         let poly_vec = poly.to_vec();
+        let cpu_bases_vec = cpu_bases.to_vec();
 
         let closures = program_closures!(|program, middle_fn: MiddleFn| -> EcResult<FusedOpenResult<F, AffineG, G::Group>> {
             // ================================================================
             // Upload bases ONCE — reused for Phase 2 and Phase 3 MSMs
             // ================================================================
             let base_buffer = program.create_buffer_from_slice(bases)?;
+
+            // Precompute negated bases (x, -y) for all MSMs (amortized over ~24 MSMs)
+            let neg_base_buffer = unsafe { program.create_buffer::<G::GpuRepr>(bases.len())? };
+            {
+                let negate_global = div_ceil(bases.len(), LOCAL_WORK_SIZE);
+                let negate_kernel = program.create_kernel(
+                    &format!("{}_negate_bases", G::name()),
+                    negate_global, LOCAL_WORK_SIZE)?;
+                negate_kernel
+                    .arg(&base_buffer)
+                    .arg(&neg_base_buffer)
+                    .arg(&(bases.len() as u32))
+                    .run_async()?;
+            }
 
             // Upload polynomial
             let poly_buffer = program.create_buffer_from_slice(&poly_vec)?;
@@ -1698,9 +1719,25 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let mut max_num_windows: usize = 0;
             let mut max_total_chunks: usize = 0;
 
-            // Scan Phase 2 iterations to find max buffer sizes
+            // Determine how many Phase 2 iterations run on GPU vs CPU
+            // Below GPU_MSM_THRESHOLD, CPU MSM is faster than GPU (avoids kernel launch overhead)
+            let num_gpu_iterations = {
+                let mut count = 0;
+                let mut scan = initial_len;
+                for _ in 0..num_challenges {
+                    scan /= 2;
+                    if scan > GPU_MSM_THRESHOLD {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                }
+                count
+            };
+
+            // Scan Phase 2 GPU iterations to find max buffer sizes
             let mut scan_len = initial_len;
-            for _ in 0..num_challenges {
+            for _ in 0..num_gpu_iterations {
                 scan_len /= 2;
                 let ws = calc_sort_window_size(scan_len);
                 let nw = div_ceil(effective_bits + 1, ws);
@@ -1759,7 +1796,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let prefix_sum_kernel_name = format!("{}_prefix_sum", G::name());
             let u32_copy_buffer_name = "u32_copy_buffer".to_string();
             let scatter_kernel_name = format!("{}_scatter_to_sorted", G::name());
-            let accumulate_all_name = format!("{}_accumulate_all_sorted_buckets", G::name());
+            let accumulate_all_precomp_name = format!("{}_accumulate_all_sorted_buckets_precomp", G::name());
             let reduce_chunked_name = format!("{}_reduce_buckets_chunked", G::name());
             let combine_chunks_name = format!("{}_combine_chunks_to_windows", G::name());
             let reduce_windows_kernel_name = format!("{}_reduce_windows", G::name());
@@ -1789,10 +1826,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             if num_challenges > 0 {
                 let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
 
-                for challenge_idx in 0..num_challenges {
+                // === GPU iterations: fix_var on GPU + MSM on GPU ===
+                for challenge_idx in 0..num_gpu_iterations {
                     let next_len = current_len / 2;
 
-                    // === Phase 1: fix_var ===
+                    // === fix_var on GPU ===
                     let fix_var_global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
                     let fix_var_kernel = program.create_kernel(
                         &format!("{}_fix_var_indexed", F::name()),
@@ -1810,12 +1848,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&challenges_buffer)
                         .arg(&(next_len as u32))
                         .arg(&(challenge_idx as u32))
-                        .run()?;
+                        .run_async()?;
 
-                    // No intermediate download here — batched after the loop
                     intermediate_lens.push(next_len);
 
-                    // === Phase 2: Convert Fr → scalar bytes on GPU ===
+                    // === Convert Fr → scalar bytes on GPU ===
                     let to_scalar_kernel = program.create_kernel(
                         &format!("{}_to_scalar_bytes", F::name()),
                         fix_var_global_work_size, LOCAL_WORK_SIZE)?;
@@ -1823,9 +1860,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&per_iter_buffers[challenge_idx])
                         .arg(&shared_scalar_buffer)
                         .arg(&(next_len as u32))
-                        .run()?;
+                        .run_async()?;
 
-                    // === Sort-based MSM (zero CPU-GPU sync points) ===
+                    // === Sort-based MSM on GPU ===
                     let ws = calc_sort_window_size(next_len);
                     let num_windows = div_ceil(effective_bits + 1, ws);
                     let n_bases = next_len;
@@ -1843,7 +1880,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(n_bases as u32))
                         .arg(&(num_windows as u32))
                         .arg(&(ws as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 2. Decompose to (key, value) pairs
                     let decompose_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -1856,7 +1893,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(n_bases as u32))
                         .arg(&(num_windows as u32))
                         .arg(&(buckets_per_window as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 3. Zero counts
                     let fill_zero_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -1865,7 +1902,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     fill_zero_kernel
                         .arg(&shared_counts_buffer)
                         .arg(&(total_buckets as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 4. Count buckets
                     let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -1875,7 +1912,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_keys_buffer)
                         .arg(&shared_counts_buffer)
                         .arg(&(total_pairs as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 5. Prefix sum
                     let prefix_kernel = program.create_kernel(&prefix_sum_kernel_name, 1, 1)?;
@@ -1885,7 +1922,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_nonempty_ids_buffer)
                         .arg(&shared_num_nonempty_buffer)
                         .arg(&(total_buckets as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 6. Copy offsets → scatter_offsets (scatter modifies via atomicAdd)
                     let copy_offsets_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -1895,7 +1932,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_offsets_buffer)
                         .arg(&shared_scatter_offsets_buffer)
                         .arg(&(total_buckets as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 7. Scatter to sorted
                     let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -1907,20 +1944,21 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_scatter_offsets_buffer)
                         .arg(&shared_sorted_values_buffer)
                         .arg(&(total_pairs as u32))
-                        .run()?;
+                        .run_async()?;
 
-                    // 8. Accumulate ALL sorted buckets (no CPU dispatch, no sync)
+                    // 8. Accumulate ALL sorted buckets with precomputed negations
                     let accum_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
-                    let accum_kernel = program.create_kernel(&accumulate_all_name,
+                    let accum_kernel = program.create_kernel(&accumulate_all_precomp_name,
                         accum_global, MSM_LOCAL_WORK_SIZE)?;
                     accum_kernel
                         .arg(&base_buffer)
+                        .arg(&neg_base_buffer)
                         .arg(&shared_sorted_values_buffer)
                         .arg(&shared_offsets_buffer)
                         .arg(&shared_counts_buffer)
                         .arg(&shared_bucket_results_buffer)
                         .arg(&(total_buckets as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 9. Parallel chunked bucket reduction (Level 1)
                     let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
@@ -1934,7 +1972,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(buckets_per_window as u32))
                         .arg(&(num_chunks_per_window as u32))
                         .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
-                        .run()?;
+                        .run_async()?;
 
                     // 9b. Combine chunks to windows (Level 2)
                     let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
@@ -1947,7 +1985,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(num_windows as u32))
                         .arg(&(num_chunks_per_window as u32))
                         .arg(&(REDUCTION_CHUNK_SIZE as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 10. Horner reduction across windows
                     let reduce_windows_kernel = program.create_kernel(&reduce_windows_kernel_name, 1, 1)?;
@@ -1957,7 +1995,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&(num_windows as u32))
                         .arg(&(ws as u32))
                         .arg(&(effective_bits as u32))
-                        .run()?;
+                        .run_async()?;
 
                     // 11. Save commitment to GPU array (no per-iteration download)
                     let copy_kernel = program.create_kernel(&copy_at_offset_name, 1, 1)?;
@@ -1965,7 +2003,58 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .arg(&shared_final_result_buffer)
                         .arg(&commitments_gpu)
                         .arg(&(challenge_idx as u32))
-                        .run()?;
+                        .run_async()?;
+
+                    current_len = next_len;
+                }
+
+                // === CPU fallback iterations: fix_var on GPU, MSM on CPU ===
+                // For small n_bases (≤ GPU_MSM_THRESHOLD), CPU MSM is faster
+                // because it avoids ~14 kernel launches + cuMalloc per iteration.
+                for challenge_idx in num_gpu_iterations..num_challenges {
+                    let next_len = current_len / 2;
+
+                    // fix_var still runs on GPU (1 kernel, trivially fast, keeps data on GPU for LC)
+                    let fix_var_global_work_size = div_ceil(next_len, LOCAL_WORK_SIZE);
+                    let fix_var_kernel = program.create_kernel(
+                        &format!("{}_fix_var_indexed", F::name()),
+                        fix_var_global_work_size, LOCAL_WORK_SIZE)?;
+
+                    let input_buf = if challenge_idx == 0 {
+                        &poly_buffer
+                    } else {
+                        &per_iter_buffers[challenge_idx - 1]
+                    };
+
+                    fix_var_kernel
+                        .arg(input_buf)
+                        .arg(&per_iter_buffers[challenge_idx])
+                        .arg(&challenges_buffer)
+                        .arg(&(next_len as u32))
+                        .arg(&(challenge_idx as u32))
+                        .run_async()?;
+
+                    intermediate_lens.push(next_len);
+
+                    // Download intermediate for CPU MSM
+                    let mut intermediate = vec![F::ZERO; next_len];
+                    program.read_into_buffer(&per_iter_buffers[challenge_idx], &mut intermediate)?;
+
+                    // CPU MSM (arkworks VariableBaseMSM — faster than GPU for small n_bases)
+                    let commitment = <G::Group as VariableBaseMSM>::msm(
+                        &cpu_bases_vec[..next_len],
+                        &intermediate,
+                    ).map_err(|_| crate::error::EcError::Simple("CPU MSM fallback failed"))?;
+
+                    // Store commitment directly (write to GPU array for batch download)
+                    let commitment_vec = vec![commitment];
+                    let commitment_buf = program.create_buffer_from_slice(&commitment_vec)?;
+                    let copy_kernel = program.create_kernel(&copy_at_offset_name, 1, 1)?;
+                    copy_kernel
+                        .arg(&commitment_buf)
+                        .arg(&commitments_gpu)
+                        .arg(&(challenge_idx as u32))
+                        .run_async()?;
 
                     current_len = next_len;
                 }
@@ -2010,21 +2099,23 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let lc_global_work_size = div_ceil(poly_len, LOCAL_WORK_SIZE);
 
             // First polynomial: use scale_poly (writes combined = coeff * poly, no read of combined)
-            let coeff0_buffer = program.create_buffer_from_slice(&[coeffs_vec[0]])?;
+            // Reusable single-element coefficient buffer (avoids per-iteration cuMalloc)
+            let mut coeff_buffer = program.create_buffer_from_slice(&[coeffs_vec[0]])?;
             let scale_poly_kernel = program.create_kernel(
                 &format!("{}_scale_poly", F::name()),
                 lc_global_work_size, LOCAL_WORK_SIZE)?;
             scale_poly_kernel
                 .arg(&poly_buffer)
                 .arg(&combined_buffer)
-                .arg(&coeff0_buffer)
+                .arg(&coeff_buffer)
                 .arg(&(poly_len as u32))
-                .run()?;
+                .run_async()?;
 
             // Accumulate each intermediate directly from on-GPU per-iteration buffers
             for (idx, iter_buf) in per_iter_buffers.iter().enumerate() {
                 let src_len = intermediate_lens[idx];
-                let coeff_buffer = program.create_buffer_from_slice(&[coeffs_vec[idx + 1]])?;
+                // Reuse single coeff_buffer instead of allocating a new one each iteration
+                program.write_from_buffer(&mut coeff_buffer, &[coeffs_vec[idx + 1]])?;
 
                 let lc_accum_kernel = program.create_kernel(&lc_accum_kernel_name, lc_global_work_size, LOCAL_WORK_SIZE)?;
                 lc_accum_kernel
@@ -2033,7 +2124,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&coeff_buffer)
                     .arg(&(src_len as u32))
                     .arg(&(poly_len as u32))
-                    .run()?;
+                    .run_async()?;
             }
 
             // Per-iteration buffers no longer needed — free GPU memory
@@ -2061,8 +2152,18 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // GPU buffer to accumulate witness commitments (batch download after loop)
             let witness_commitments_gpu = unsafe { program.create_buffer::<G::Group>(num_points.max(1))? };
 
+            // Reusable single-element eval point buffer (avoids per-iteration cuMalloc)
+            let mut single_point_buffer = if num_points > 0 {
+                program.create_buffer_from_slice(&[phase3_input.eval_points[0]])?
+            } else {
+                // Dummy buffer, won't be used
+                unsafe { program.create_buffer::<F>(1)? }
+            };
+
             for point_idx in 0..num_points {
-                let single_point_buffer = program.create_buffer_from_slice(&[phase3_input.eval_points[point_idx]])?;
+                if point_idx > 0 {
+                    program.write_from_buffer(&mut single_point_buffer, &[phase3_input.eval_points[point_idx]])?;
+                }
 
                 // === Witness computation Phase 1: parallel chunk processing ===
                 let phase1_global_work_size = div_ceil(num_chunks, LOCAL_WORK_SIZE);
@@ -2076,7 +2177,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(num_chunks as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // === Witness computation Phase 2: carry propagation ===
                 let phase2_kernel = program.create_kernel(&phase2_carry_kernel_name, 1, LOCAL_WORK_SIZE)?;
@@ -2088,7 +2189,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(poly_len as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // === Witness computation Phase 3: apply carry corrections ===
                 let phase3_kernel = program.create_kernel(&phase3_apply_kernel_name, phase1_global_work_size, LOCAL_WORK_SIZE)?;
@@ -2100,7 +2201,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(1u32))
                     .arg(&(chunk_size as u32))
                     .arg(&(num_chunks as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // === Convert witness Fr → scalar bytes on GPU ===
                 let to_scalar_global_work_size = div_ceil(witness_len, LOCAL_WORK_SIZE);
@@ -2111,7 +2212,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&single_witness_buffer)
                     .arg(&witness_scalar_buffer)
                     .arg(&(witness_len as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // === Sort-based MSM (zero CPU-GPU sync points) ===
                 let ws = calc_sort_window_size(witness_len);
@@ -2131,7 +2232,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(n_bases as u32))
                     .arg(&(num_windows as u32))
                     .arg(&(ws as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 2. Decompose to (key, value) pairs
                 let decompose_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -2144,7 +2245,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(n_bases as u32))
                     .arg(&(num_windows as u32))
                     .arg(&(buckets_per_window as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 3. Zero counts
                 let fill_zero_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -2153,7 +2254,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 fill_zero_kernel
                     .arg(&shared_counts_buffer)
                     .arg(&(total_buckets as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 4. Count buckets
                 let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -2163,7 +2264,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_keys_buffer)
                     .arg(&shared_counts_buffer)
                     .arg(&(total_pairs as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 5. Prefix sum
                 let prefix_kernel = program.create_kernel(&prefix_sum_kernel_name, 1, 1)?;
@@ -2173,7 +2274,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_nonempty_ids_buffer)
                     .arg(&shared_num_nonempty_buffer)
                     .arg(&(total_buckets as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 6. Copy offsets → scatter_offsets
                 let copy_offsets_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
@@ -2183,7 +2284,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_offsets_buffer)
                     .arg(&shared_scatter_offsets_buffer)
                     .arg(&(total_buckets as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 7. Scatter to sorted
                 let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
@@ -2195,20 +2296,21 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_scatter_offsets_buffer)
                     .arg(&shared_sorted_values_buffer)
                     .arg(&(total_pairs as u32))
-                    .run()?;
+                    .run_async()?;
 
-                // 8. Accumulate ALL sorted buckets (no CPU dispatch, no sync)
+                // 8. Accumulate ALL sorted buckets with precomputed negations
                 let accum_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
-                let accum_kernel = program.create_kernel(&accumulate_all_name,
+                let accum_kernel = program.create_kernel(&accumulate_all_precomp_name,
                     accum_global, MSM_LOCAL_WORK_SIZE)?;
                 accum_kernel
                     .arg(&base_buffer)
+                    .arg(&neg_base_buffer)
                     .arg(&shared_sorted_values_buffer)
                     .arg(&shared_offsets_buffer)
                     .arg(&shared_counts_buffer)
                     .arg(&shared_bucket_results_buffer)
                     .arg(&(total_buckets as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 9. Parallel chunked bucket reduction (Level 1)
                 let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
@@ -2222,7 +2324,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(buckets_per_window as u32))
                     .arg(&(num_chunks_per_window as u32))
                     .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
-                    .run()?;
+                    .run_async()?;
 
                 // 9b. Combine chunks to windows (Level 2)
                 let combine_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
@@ -2235,7 +2337,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(num_windows as u32))
                     .arg(&(num_chunks_per_window as u32))
                     .arg(&(REDUCTION_CHUNK_SIZE as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 10. Horner reduction across windows
                 let reduce_windows_kernel = program.create_kernel(&reduce_windows_kernel_name, 1, 1)?;
@@ -2245,7 +2347,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(num_windows as u32))
                     .arg(&(ws as u32))
                     .arg(&(effective_bits as u32))
-                    .run()?;
+                    .run_async()?;
 
                 // 11. Save witness commitment to GPU array (no per-iteration download)
                 let copy_kernel = program.create_kernel(&copy_at_offset_name, 1, 1)?;
@@ -2253,7 +2355,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&shared_final_result_buffer)
                     .arg(&witness_commitments_gpu)
                     .arg(&(point_idx as u32))
-                    .run()?;
+                    .run_async()?;
             }
 
             // Batch download all witness commitments (1 sync instead of 3)
@@ -2308,8 +2410,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             3
         } else {
             // ln_without_floats
-            let ln_n = ((n as f64).ln() * 100.0 / 69.0) as usize;
-            ln_n
+            ((n as f64).ln() * 100.0 / 69.0) as usize
         };
         let window = std::cmp::min(window, 16); // Cap at 16 bits for memory
 
@@ -2325,7 +2426,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         // Convert base (ec-gpu affine wrapper) to projective for arithmetic
         // Deref gives us the inner arkworks affine, then convert to projective
-        let base_affine: &<G::Group as CurveGroup>::Affine = &*base;
+        let base_affine: &<G::Group as CurveGroup>::Affine = base;
         let base_proj: G::Group = (*base_affine).into();
 
         // g_outer starts as base, then gets doubled `window` times per outer loop
