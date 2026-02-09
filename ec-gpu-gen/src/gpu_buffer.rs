@@ -38,6 +38,19 @@ const fn div_ceil(a: usize, b: usize) -> usize {
     }
 }
 
+/// CPU synthetic division: h(x) = f(x) / (x - u)
+/// Returns Vec<F> of length f.len() - 1.
+fn compute_witness_poly_cpu<F: ark_ff::Field>(f: &[F], u: &F) -> Vec<F> {
+    let n = f.len();
+    let mut h = vec![F::ZERO; n - 1];
+    let mut carry = F::ZERO;
+    for i in (1..n).rev() {
+        carry = f[i] + carry * *u;
+        h[i - 1] = carry;
+    }
+    h
+}
+
 /// Unique identifier for a cached buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GpuBufferId(u64);
@@ -2163,21 +2176,30 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // because sort enables coalesced memory access (sequential bases per bucket).
             // ================================================================
             let witness_msm_start = std::time::Instant::now();
-            // Single witness buffer (reusable across all eval points)
-            let single_witness_buffer = unsafe { program.create_buffer::<F>(witness_len)? };
 
-            // Witness computation uses 3-phase parallel approach
-            let chunk_size = std::cmp::max(1, witness_len / 4096);
-            let num_chunks = div_ceil(witness_len, chunk_size);
-            let carries_buffer = unsafe { program.create_buffer::<F>(num_chunks)? };
-            let propagated_carries_buffer = unsafe { program.create_buffer::<F>(num_chunks)? };
+            // Download combined polynomial to CPU for witness computation
+            let download_start = std::time::Instant::now();
+            let mut combined_cpu = vec![F::ZERO; poly_len];
+            program.read_into_buffer(&combined_buffer, &mut combined_cpu)?;
+            eprintln!("[fused_open] phase3 download combined: {:?}", download_start.elapsed());
+
+            // Compute all witnesses on CPU in parallel (synthetic division is O(n) sequential — CPU excels)
+            let cpu_witness_start = std::time::Instant::now();
+            let witnesses_cpu: Vec<Vec<F>> = {
+                use rayon::prelude::*;
+                phase3_input.eval_points
+                    .par_iter()
+                    .map(|point| compute_witness_poly_cpu(&combined_cpu, point))
+                    .collect()
+            };
+            drop(combined_cpu);
+            eprintln!("[fused_open] phase3 CPU witness ({} points): {:?}", num_points, cpu_witness_start.elapsed());
+
+            // Single witness buffer (reusable across all eval points, written from CPU each iteration)
+            let mut single_witness_buffer = unsafe { program.create_buffer::<F>(witness_len)? };
 
             // Scalar buffer for witness MSM
             let witness_scalar_buffer = unsafe { program.create_buffer::<F>(witness_len)? };
-
-            let phase1_kernel_name = format!("{}_witness_poly_batch_phase1", F::name());
-            let phase2_carry_kernel_name = format!("{}_witness_carry_propagate", F::name());
-            let phase3_apply_kernel_name = format!("{}_witness_poly_batch_phase3", F::name());
 
             // Phase 3 sort-based MSM buffers (constant size across all 3 witness MSMs)
             let p3_keys_buffer = unsafe { program.create_buffer::<u32>(p3_total_pairs)? };
@@ -2202,63 +2224,15 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // GPU buffer to accumulate witness commitments (batch download after loop)
             let witness_commitments_gpu = unsafe { program.create_buffer::<G::Group>(num_points.max(1))? };
 
-            // Reusable single-element eval point buffer (avoids per-iteration cuMalloc)
-            let mut single_point_buffer = if num_points > 0 {
-                program.create_buffer_from_slice(&[phase3_input.eval_points[0]])?
-            } else {
-                // Dummy buffer, won't be used
-                unsafe { program.create_buffer::<F>(1)? }
-            };
-
             let n_bases = witness_len;
 
             for point_idx in 0..num_points {
                 let witness_iter_start = std::time::Instant::now();
-                if point_idx > 0 {
-                    program.write_from_buffer(&mut single_point_buffer, &[phase3_input.eval_points[point_idx]])?;
-                }
 
-                // === Witness computation Phase 1: parallel chunk processing ===
-                let phase1_global_work_size = div_ceil(num_chunks, LOCAL_WORK_SIZE);
-                let phase1_kernel = program.create_kernel(&phase1_kernel_name, phase1_global_work_size, LOCAL_WORK_SIZE)?;
-                phase1_kernel
-                    .arg(&combined_buffer)
-                    .arg(&single_witness_buffer)
-                    .arg(&carries_buffer)
-                    .arg(&single_point_buffer)
-                    .arg(&(poly_len as u32))
-                    .arg(&(1u32))
-                    .arg(&(chunk_size as u32))
-                    .arg(&(num_chunks as u32))
-                    .run_async()?;
-
-                // === Witness computation Phase 2: carry propagation ===
-                let phase2_kernel = program.create_kernel(&phase2_carry_kernel_name, 1, LOCAL_WORK_SIZE)?;
-                phase2_kernel
-                    .arg(&carries_buffer)
-                    .arg(&propagated_carries_buffer)
-                    .arg(&single_point_buffer)
-                    .arg(&(num_chunks as u32))
-                    .arg(&(1u32))
-                    .arg(&(chunk_size as u32))
-                    .arg(&(poly_len as u32))
-                    .run_async()?;
-
-                // === Witness computation Phase 3: apply carry corrections ===
-                let phase3_kernel = program.create_kernel(&phase3_apply_kernel_name, phase1_global_work_size, LOCAL_WORK_SIZE)?;
-                phase3_kernel
-                    .arg(&single_witness_buffer)
-                    .arg(&propagated_carries_buffer)
-                    .arg(&single_point_buffer)
-                    .arg(&(poly_len as u32))
-                    .arg(&(1u32))
-                    .arg(&(chunk_size as u32))
-                    .arg(&(num_chunks as u32))
-                    .run_async()?;
-
-                // Sync to measure witness computation separately
-                program.synchronize()?;
-                eprintln!("[fused_open]   witness[{}] compute (3-phase): {:?}", point_idx, witness_iter_start.elapsed());
+                // Upload pre-computed CPU witness to GPU
+                let upload_start = std::time::Instant::now();
+                program.write_from_buffer(&mut single_witness_buffer, &witnesses_cpu[point_idx])?;
+                eprintln!("[fused_open]   witness[{}] upload: {:?}", point_idx, upload_start.elapsed());
                 let to_scalar_start = std::time::Instant::now();
 
                 // === Convert witness Fr → scalar bytes on GPU ===
@@ -2454,7 +2428,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 eprintln!("[fused_open]   witness[{}] TOTAL: {:?}", point_idx, witness_iter_start.elapsed());
             }
 
-            eprintln!("[fused_open] phase3 witness+MSM ({} points): {:?}", num_points, witness_msm_start.elapsed());
+            eprintln!("[fused_open] phase3 total ({} points): {:?}", num_points, witness_msm_start.elapsed());
 
             // Batch download all witness commitments (1 sync instead of 3)
             let mut witness_commitments = vec![<G::Group as AdditiveGroup>::ZERO; num_points];
