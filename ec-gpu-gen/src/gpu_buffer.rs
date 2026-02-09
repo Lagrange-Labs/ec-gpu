@@ -2256,6 +2256,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(num_chunks as u32))
                     .run_async()?;
 
+                // Sync to measure witness computation separately
+                program.synchronize()?;
+                eprintln!("[fused_open]   witness[{}] compute (3-phase): {:?}", point_idx, witness_iter_start.elapsed());
+                let to_scalar_start = std::time::Instant::now();
+
                 // === Convert witness Fr → scalar bytes on GPU ===
                 let to_scalar_global_work_size = div_ceil(witness_len, LOCAL_WORK_SIZE);
                 let to_scalar_kernel = program.create_kernel(
@@ -2267,7 +2272,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_len as u32))
                     .run()?;
 
-                eprintln!("[fused_open]   witness[{}] compute+to_scalar: {:?}", point_idx, witness_iter_start.elapsed());
+                eprintln!("[fused_open]   witness[{}] to_scalar: {:?}", point_idx, to_scalar_start.elapsed());
                 let sort_msm_start = std::time::Instant::now();
 
                 // === Sort-based MSM (coalesced memory access for large MSMs) ===
