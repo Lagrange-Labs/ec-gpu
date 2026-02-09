@@ -531,7 +531,26 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     max_window_size: usize,
     /// Work units for MSM parallelization (used by non-fused methods)
     work_units: usize,
+    /// Persistent GPU buffer for SRS bases, uploaded once and reused across calls.
+    base_buffer: Option<rust_gpu_tools::PersistentBuffer<G::GpuRepr>>,
+    /// Number of elements in the persistent base buffer.
+    base_buffer_len: usize,
     _phantom: std::marker::PhantomData<(F, G)>,
+}
+
+impl<F: PrimeField + GpuName, G: GpuAffine> Drop for FusedPolyCommit<F, G> {
+    fn drop(&mut self) {
+        if self.base_buffer.is_some() {
+            // Push CUDA context before dropping the persistent buffer,
+            // so that cuMemFree runs with the correct context active.
+            if self.program.push_context().is_ok() {
+                self.base_buffer = None;
+                self.program.pop_context();
+            }
+            // If push_context fails, the buffer leaks (cuMemFree skipped).
+            // This is safer than panicking in Drop.
+        }
+    }
 }
 
 /// On the GPU, the exponents are split into windows
@@ -551,8 +570,40 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             program,
             max_window_size: MAX_WINDOW_SIZE,
             work_units,
+            base_buffer: None,
+            base_buffer_len: 0,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Upload SRS bases to GPU as a persistent buffer.
+    ///
+    /// The buffer persists across `program.run()` calls, eliminating the need to
+    /// re-upload ~256MB of bases on every `batch_commit` or `fused_open` call.
+    /// If a persistent buffer already exists with a different size, it is replaced.
+    pub fn upload_bases(&mut self, bases: &[G::GpuRepr]) -> EcResult<()> {
+        if self.base_buffer.as_ref().is_some() && self.base_buffer_len == bases.len() {
+            return Ok(());
+        }
+        // Drop old buffer inside a context scope (for CUDA cuMemFree)
+        if self.base_buffer.is_some() {
+            self.program.push_context()?;
+            self.base_buffer = None;
+            self.program.pop_context();
+        }
+        // Create new persistent buffer inside a context scope
+        self.program.push_context()?;
+        let buf = match self.program.create_persistent_buffer_from_slice(bases) {
+            Ok(b) => b,
+            Err(e) => {
+                self.program.pop_context();
+                return Err(e.into());
+            }
+        };
+        self.program.pop_context();
+        self.base_buffer = Some(buf);
+        self.base_buffer_len = bases.len();
+        Ok(())
     }
 
     /// Fused fix_vars + commit operation.
@@ -585,9 +636,14 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             challenges.len() <= log_len,
             "Too many challenges for polynomial size"
         );
+        let effective_base_len = if self.base_buffer.is_some() {
+            self.base_buffer_len
+        } else {
+            bases.len()
+        };
         assert!(
-            bases.len() >= poly.len(),
-            "Not enough bases for polynomial size"
+            effective_base_len >= poly.len(),
+            "Not enough bases for polynomial size (have {}, need {})", effective_base_len, poly.len()
         );
 
         if challenges.is_empty() {
@@ -603,14 +659,27 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let poly_vec = poly.to_vec();
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
+        let persistent_base = self.base_buffer.as_ref();
+        let persistent_base_len = self.base_buffer_len;
 
         let closures = program_closures!(|program, _arg| -> EcResult<FixVarsAndCommitResult<F, G::Group>> {
             // Upload polynomial once
             let mut current_buffer = program.create_buffer_from_slice(&poly_vec)?;
             let mut current_len = initial_len;
 
-            // Upload bases once (for all MSMs)
-            let base_buffer = program.create_buffer_from_slice(bases)?;
+            // Use persistent base buffer if available and large enough, otherwise upload fresh
+            let local_base_buf;
+            let base_buffer = if let Some(pb) = persistent_base {
+                if persistent_base_len >= initial_len {
+                    pb
+                } else {
+                    local_base_buf = program.create_persistent_buffer_from_slice(bases)?;
+                    &local_base_buf
+                }
+            } else {
+                local_base_buf = program.create_persistent_buffer_from_slice(bases)?;
+                &local_base_buf
+            };
 
             // Upload ALL challenges in a single buffer (optimization #9)
             let challenges_buffer = program.create_buffer_from_slice(&challenges_vec)?;
@@ -818,7 +887,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_sorted_buckets", G::name()),
                             accum_global, MSM_LOCAL_WORK_SIZE)?;
                         accum_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&counts_buffer)
@@ -840,7 +909,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_chunked", G::name()),
                             chunked_global, MSM_LOCAL_WORK_SIZE)?;
                         chunked_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&dispatch_buffer)
@@ -956,15 +1025,22 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let witness_len = n - 1;
         let num_points = points.len();
 
+        let effective_base_len = if self.base_buffer.is_some() {
+            self.base_buffer_len
+        } else {
+            bases.len()
+        };
         assert!(
-            bases.len() >= witness_len,
-            "Not enough bases for witness polynomial size"
+            effective_base_len >= witness_len,
+            "Not enough bases for witness polynomial size (have {}, need {})", effective_base_len, witness_len
         );
 
         let poly_vec = poly.to_vec();
         let points_vec = points.to_vec();
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
+        let persistent_base = self.base_buffer.as_ref();
+        let persistent_base_len = self.base_buffer_len;
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
             // Upload polynomial once
@@ -973,8 +1049,19 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // Upload points
             let points_buffer = program.create_buffer_from_slice(&points_vec)?;
 
-            // Upload bases once (for all witness MSMs)
-            let base_buffer = program.create_buffer_from_slice(&bases[..witness_len])?;
+            // Use persistent base buffer if available and large enough, otherwise upload fresh
+            let local_base_buf;
+            let base_buffer = if let Some(pb) = persistent_base {
+                if persistent_base_len >= witness_len {
+                    pb
+                } else {
+                    local_base_buf = program.create_persistent_buffer_from_slice(&bases[..witness_len])?;
+                    &local_base_buf
+                }
+            } else {
+                local_base_buf = program.create_persistent_buffer_from_slice(&bases[..witness_len])?;
+                &local_base_buf
+            };
 
             // Parallel witness polynomial batch computation (3-phase)
             // Output: num_points witness polynomials, each of length witness_len
@@ -1185,7 +1272,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_sorted_buckets", G::name()),
                             accum_global, MSM_LOCAL_WORK_SIZE)?;
                         accum_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&counts_buffer)
@@ -1207,7 +1294,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_chunked", G::name()),
                             chunked_global, MSM_LOCAL_WORK_SIZE)?;
                         chunked_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&dispatch_buffer)
@@ -1344,9 +1431,14 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         let max_len = polys.iter().map(|p| p.len()).max().unwrap();
         assert!(max_len > 0, "All polynomials are empty");
+        let effective_base_len = if self.base_buffer.is_some() {
+            self.base_buffer_len
+        } else {
+            bases.len()
+        };
         assert!(
-            bases.len() >= max_len,
-            "Not enough bases for polynomial size"
+            effective_base_len >= max_len,
+            "Not enough bases for polynomial size (have {}, need {})", effective_base_len, max_len
         );
 
         let num_polys = polys.len();
@@ -1355,10 +1447,23 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let mut padded_scratch: Vec<F> = vec![F::ZERO; max_len];
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
+        let persistent_base = self.base_buffer.as_ref();
+        let persistent_base_len = self.base_buffer_len;
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
-            // Upload bases once (for all MSMs)
-            let base_buffer = program.create_buffer_from_slice(&bases[..max_len])?;
+            // Use persistent base buffer if available and large enough, otherwise upload fresh
+            let local_base_buf;
+            let base_buffer = if let Some(pb) = persistent_base {
+                if persistent_base_len >= max_len {
+                    pb
+                } else {
+                    local_base_buf = program.create_persistent_buffer_from_slice(&bases[..max_len])?;
+                    &local_base_buf
+                }
+            } else {
+                local_base_buf = program.create_persistent_buffer_from_slice(&bases[..max_len])?;
+                &local_base_buf
+            };
 
             // Reusable GPU buffer for one poly at a time (replaces massive flat buffer)
             let mut fr_buffer = program.create_buffer_from_slice(&padded_scratch)?;
@@ -1519,7 +1624,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_sorted_buckets", G::name()),
                             accum_global, MSM_LOCAL_WORK_SIZE)?;
                         accum_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&counts_buffer)
@@ -1540,7 +1645,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             &format!("{}_accumulate_chunked", G::name()),
                             chunked_global, MSM_LOCAL_WORK_SIZE)?;
                         chunked_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&sorted_values_buffer)
                             .arg(&offsets_buffer)
                             .arg(&dispatch_buffer)
@@ -1651,9 +1756,15 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             challenges.len() <= log_len,
             "Too many challenges for polynomial size"
         );
+        // Bases can come from either the persistent buffer or the passed-in slice
+        let effective_base_len = if self.base_buffer.is_some() {
+            self.base_buffer_len
+        } else {
+            bases.len()
+        };
         assert!(
-            bases.len() >= poly.len(),
-            "Not enough bases for polynomial size"
+            effective_base_len >= poly.len(),
+            "Not enough bases for polynomial size (have {}, need {})", effective_base_len, poly.len()
         );
 
         let num_challenges = challenges.len();
@@ -1663,14 +1774,28 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let cpu_bases_vec = cpu_bases.to_vec();
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
+        let persistent_base = self.base_buffer.as_ref();
+        let persistent_base_len = self.base_buffer_len;
 
         let closures = program_closures!(|program, middle_fn: MiddleFn| -> EcResult<FusedOpenResult<F, AffineG, G::Group>> {
             let fused_open_start = std::time::Instant::now();
 
             // ================================================================
             // Upload bases ONCE — reused for Phase 2 and Phase 3 MSMs
+            // Use persistent buffer if available and large enough.
             // ================================================================
-            let base_buffer = program.create_buffer_from_slice(bases)?;
+            let local_base_buf;
+            let base_buffer = if let Some(pb) = persistent_base {
+                if persistent_base_len >= initial_len {
+                    pb
+                } else {
+                    local_base_buf = program.create_persistent_buffer_from_slice(bases)?;
+                    &local_base_buf
+                }
+            } else {
+                local_base_buf = program.create_persistent_buffer_from_slice(bases)?;
+                &local_base_buf
+            };
 
             // Upload polynomial
             let poly_buffer = program.create_buffer_from_slice(&poly_vec)?;
@@ -1768,7 +1893,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let reduce_chunked_name = format!("{}_reduce_buckets_chunked", G::name());
             let combine_chunks_name = format!("{}_combine_chunks_to_windows", G::name());
 
-            eprintln!("[fused_open] pre-alloc: {:?}", fused_open_start.elapsed());
+            eprintln!("[fused_open] pre-alloc (buffers+kernel names): {:?}", fused_open_start.elapsed());
 
             // ================================================================
             // Phase 1+2: fix_vars + intermediate MSM commits
@@ -1854,7 +1979,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let msm_kernel = program.create_kernel(&multiexp_signed_name,
                         msm_global, MSM_LOCAL_WORK_SIZE)?;
                     msm_kernel
-                        .arg(&base_buffer)
+                        .arg(base_buffer)
                         .arg(shared_bucket_buffer.as_ref().unwrap())
                         .arg(shared_multiexp_results.as_ref().unwrap())
                         .arg(&shared_digits_buffer)
@@ -2088,6 +2213,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let n_bases = witness_len;
 
             for point_idx in 0..num_points {
+                let witness_iter_start = std::time::Instant::now();
                 if point_idx > 0 {
                     program.write_from_buffer(&mut single_point_buffer, &[phase3_input.eval_points[point_idx]])?;
                 }
@@ -2141,6 +2267,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_len as u32))
                     .run()?;
 
+                eprintln!("[fused_open]   witness[{}] compute+to_scalar: {:?}", point_idx, witness_iter_start.elapsed());
+                let sort_msm_start = std::time::Instant::now();
+
                 // === Sort-based MSM (coalesced memory access for large MSMs) ===
 
                 // 1. Preprocess to signed digits
@@ -2189,6 +2318,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(p3_total_buckets as u32))
                     .run()?;
 
+                eprintln!("[fused_open]   witness[{}] sort prep (preprocess+decompose+count+prefix): {:?}", point_idx, sort_msm_start.elapsed());
+
                 // 5. Download num_nonempty
                 let mut num_nonempty_vec = vec![0u32; 1];
                 program.read_into_buffer(&p3_num_nonempty_buffer, &mut num_nonempty_vec)?;
@@ -2210,6 +2341,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(p3_total_pairs as u32))
                     .run()?;
 
+                let accum_start = std::time::Instant::now();
                 // 8. Accumulate sorted buckets (with chunked dispatch for large buckets)
                 program.write_from_buffer(&mut p3_bucket_results_buffer,
                     &vec![<G::Group as AdditiveGroup>::ZERO; p3_total_buckets])?;
@@ -2226,7 +2358,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         let accum_kernel = program.create_kernel(&accumulate_sorted_name,
                             accum_global, MSM_LOCAL_WORK_SIZE)?;
                         accum_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&p3_sorted_values_buffer)
                             .arg(&p3_offsets_buffer)
                             .arg(&p3_counts_buffer)
@@ -2246,7 +2378,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         let chunked_kernel = program.create_kernel(&accumulate_chunked_name,
                             chunked_global, MSM_LOCAL_WORK_SIZE)?;
                         chunked_kernel
-                            .arg(&base_buffer)
+                            .arg(base_buffer)
                             .arg(&p3_sorted_values_buffer)
                             .arg(&p3_offsets_buffer)
                             .arg(&dispatch_buffer)
@@ -2294,6 +2426,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
+                eprintln!("[fused_open]   witness[{}] accum+reduce: {:?}", point_idx, accum_start.elapsed());
+
                 // 10. Horner reduction on GPU
                 let reduce_windows_kernel = program.create_kernel(&reduce_windows_kernel_name, 1, 1)?;
                 reduce_windows_kernel
@@ -2311,6 +2445,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&witness_commitments_gpu)
                     .arg(&(point_idx as u32))
                     .run()?;
+
+                eprintln!("[fused_open]   witness[{}] TOTAL: {:?}", point_idx, witness_iter_start.elapsed());
             }
 
             eprintln!("[fused_open] phase3 witness+MSM ({} points): {:?}", num_points, witness_msm_start.elapsed());

@@ -28,6 +28,25 @@ pub use program::Program;
 #[cfg(not(any(feature = "cuda", feature = "opencl")))]
 compile_error!("At least one of the features `cuda` or `opencl` must be enabled.");
 
+/// A GPU buffer that persists across `program.run()` calls.
+///
+/// Wraps backend-specific buffer types so that it can be used as a kernel argument
+/// transparently inside `program_closures!`. This enables uploading large data (e.g. SRS bases)
+/// once and reusing across multiple GPU sessions.
+pub enum PersistentBuffer<T> {
+    /// CUDA persistent buffer.
+    #[cfg(feature = "cuda")]
+    Cuda(cuda::Buffer<T>),
+    /// OpenCL persistent buffer.
+    #[cfg(feature = "opencl")]
+    Opencl(opencl::Buffer<T>),
+}
+
+// SAFETY: PersistentBuffer wraps GPU device memory handles (pointers/IDs) that are safe to
+// send between threads. The GPU memory itself is not thread-local. Actual GPU operations
+// require the correct context to be active (handled by push_context/pop_context).
+unsafe impl<T> Send for PersistentBuffer<T> {}
+
 /// A buffer on the GPU.
 ///
 /// The concept of a local buffer is from OpenCL. In CUDA you don't allocate a buffer directly

@@ -119,6 +119,36 @@ impl Program {
             Self::Opencl(program) => program.device_name(),
         }
     }
+
+    /// Creates a persistent buffer from a slice that can outlive `program.run()`.
+    pub fn create_persistent_buffer_from_slice<T>(&self, slice: &[T]) -> Result<crate::PersistentBuffer<T>, GPUError> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(program) => program.create_persistent_buffer_from_slice(slice),
+            #[cfg(feature = "opencl")]
+            Self::Opencl(program) => program.create_persistent_buffer_from_slice(slice),
+        }
+    }
+
+    /// Push the GPU context for this program (required before dropping persistent buffers on CUDA).
+    pub fn push_context(&self) -> Result<(), GPUError> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(program) => program.push_context(),
+            #[cfg(feature = "opencl")]
+            Self::Opencl(program) => program.push_context(),
+        }
+    }
+
+    /// Pop the GPU context after done with persistent buffer operations.
+    pub fn pop_context(&self) {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(program) => program.pop_context_public(),
+            #[cfg(feature = "opencl")]
+            Self::Opencl(program) => program.pop_context_public(),
+        }
+    }
 }
 
 /// Creates two closures, one for CUDA, one for OpenCL for the given one.

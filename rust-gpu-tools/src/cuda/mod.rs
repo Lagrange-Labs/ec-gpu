@@ -303,6 +303,29 @@ impl Program {
         Ok(())
     }
 
+    /// Creates a persistent buffer from a slice, uploading data to GPU.
+    ///
+    /// Unlike `create_buffer_from_slice`, the returned `PersistentBuffer` can outlive
+    /// a `program.run()` call. The caller must ensure the CUDA context is active
+    /// (i.e. call this inside a `program.run()` closure or after `push_context()`).
+    pub fn create_persistent_buffer_from_slice<T>(&self, slice: &[T]) -> GPUResult<crate::PersistentBuffer<T>> {
+        Ok(crate::PersistentBuffer::Cuda(self.create_buffer_from_slice(slice)?))
+    }
+
+    /// Push this program's CUDA context onto the current thread's context stack.
+    ///
+    /// Must be called before dropping a `PersistentBuffer` outside of a `program.run()` scope,
+    /// because `cuMemFree` requires the owning context to be current.
+    pub fn push_context(&self) -> GPUResult<()> {
+        rustacuda::context::CurrentContext::set_current(&self.context)?;
+        Ok(())
+    }
+
+    /// Pop the current context (public version).
+    pub fn pop_context_public(&self) {
+        Self::pop_context();
+    }
+
     /// Pop the current context.
     ///
     /// It panics as it's an unrecoverable error.
@@ -345,6 +368,16 @@ impl KernelArgument for i32 {
 impl KernelArgument for u32 {
     fn as_c_void(&self) -> *mut c_void {
         self as *const _ as _
+    }
+}
+
+impl<T> KernelArgument for crate::PersistentBuffer<T> {
+    fn as_c_void(&self) -> *mut c_void {
+        match self {
+            crate::PersistentBuffer::Cuda(b) => b.as_c_void(),
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot use OpenCL buffer with CUDA kernel"),
+        }
     }
 }
 

@@ -362,6 +362,24 @@ impl Program {
         self.queue.finish()?;
         Ok(())
     }
+
+    /// Creates a persistent buffer from a slice, uploading data to GPU.
+    ///
+    /// Unlike `create_buffer_from_slice`, the returned `PersistentBuffer` can outlive
+    /// a `program.run()` call. OpenCL buffers don't have context-stack issues like CUDA.
+    pub fn create_persistent_buffer_from_slice<T>(&self, slice: &[T]) -> GPUResult<crate::PersistentBuffer<T>> {
+        Ok(crate::PersistentBuffer::Opencl(self.create_buffer_from_slice(slice)?))
+    }
+
+    /// Push context (no-op on OpenCL — no context stack).
+    pub fn push_context(&self) -> GPUResult<()> {
+        Ok(())
+    }
+
+    /// Pop context (no-op on OpenCL — no context stack).
+    pub fn pop_context_public(&self) {
+        // OpenCL doesn't use a context stack
+    }
 }
 
 /// Abstraction for kernel arguments.
@@ -394,6 +412,16 @@ impl KernelArgument for u32 {
     fn push(&self, kernel: &mut Kernel) {
         unsafe {
             kernel.builder.set_arg(self);
+        }
+    }
+}
+
+impl<T> KernelArgument for crate::PersistentBuffer<T> {
+    fn push(&self, kernel: &mut Kernel) {
+        match self {
+            crate::PersistentBuffer::Opencl(b) => b.push(kernel),
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot use CUDA buffer with OpenCL kernel"),
         }
     }
 }
