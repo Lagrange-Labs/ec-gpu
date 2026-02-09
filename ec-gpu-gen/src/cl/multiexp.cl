@@ -720,6 +720,32 @@ KERNEL void POINT_copy_at_offset(
 }
 
 /*
+ * Reduce multiexp group results per window on GPU.
+ *
+ * The multiexp_signed kernel produces results[g * num_windows + w] for each
+ * (group, window) pair. This kernel sums across groups for each window,
+ * producing window_sums[w] = sum_g results[g * num_windows + w].
+ *
+ * This replaces the CPU-side accumulation loop from multiexp(), eliminating
+ * a GPU→CPU download of work_units Jacobian points per MSM iteration.
+ *
+ * Launch with num_windows threads.
+ */
+KERNEL void POINT_reduce_multiexp_groups(
+    GLOBAL POINT_jacobian *results,
+    GLOBAL POINT_jacobian *window_sums,
+    uint num_groups,
+    uint num_windows) {
+  const uint wid = GET_GLOBAL_ID();
+  if (wid >= num_windows) return;
+  POINT_jacobian acc = POINT_ZERO;
+  for (uint g = 0; g < num_groups; g++) {
+    acc = POINT_add(acc, results[g * num_windows + wid]);
+  }
+  window_sums[wid] = acc;
+}
+
+/*
  * Phase 3 (zero-sync): Accumulate ALL sorted buckets.
  *
  * Unlike POINT_accumulate_sorted_buckets which uses nonempty_bucket_ids mapping,
