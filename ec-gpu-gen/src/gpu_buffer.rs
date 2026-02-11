@@ -548,6 +548,8 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     base_buffer: Option<rust_gpu_tools::PersistentBuffer<G::GpuRepr>>,
     /// Number of elements in the persistent base buffer.
     base_buffer_len: usize,
+    /// Total GPU device memory in bytes (used for batch size computation).
+    device_memory: u64,
     _phantom: std::marker::PhantomData<(F, G)>,
 }
 
@@ -578,13 +580,17 @@ const REDUCTION_CHUNK_SIZE: usize = 256;
 
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
     /// Create a new fused poly-commit handler.
-    pub fn create(program: Program, work_units: usize) -> EcResult<Self> {
+    ///
+    /// `device_memory` is the total GPU memory in bytes (used for batch size computation
+    /// in `batch_commit_multi`).
+    pub fn create(program: Program, work_units: usize, device_memory: u64) -> EcResult<Self> {
         Ok(Self {
             program,
             max_window_size: MAX_WINDOW_SIZE,
             work_units,
             base_buffer: None,
             base_buffer_len: 0,
+            device_memory,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -1731,6 +1737,337 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         });
 
         self.program.run(closures, ())
+    }
+
+    /// Compute the maximum number of same-size polys that can be processed
+    /// concurrently in `batch_commit_multi` without exceeding GPU memory.
+    fn compute_multi_batch_size(&self, n_per_poly: usize) -> usize {
+        const BN254_SCALAR_BITS: usize = 254;
+        let effective_bits = BN254_SCALAR_BITS;
+        let ws = std::cmp::min(
+            ((div_ceil(n_per_poly, self.work_units) as f64).log2() as usize) + 2,
+            self.max_window_size,
+        );
+        let nw = div_ceil(effective_bits + 1, ws);
+        let bpw = 1usize << (ws - 1);
+        let tb = nw * bpw; // total_buckets_per_poly
+        let tp = n_per_poly * nw; // total_pairs_per_poly
+        let num_chunks_pw = div_ceil(bpw, REDUCTION_CHUNK_SIZE);
+        let total_chunks = nw * num_chunks_pw;
+
+        // Size of a Jacobian point on GPU (3 field elements × 32 bytes for BN254)
+        let jacobian_size = std::mem::size_of::<G::Group>();
+        let field_size = std::mem::size_of::<F>();
+
+        let per_poly_bytes: usize =
+            // fr_buffer + scalar_buffer + digits
+            n_per_poly * (field_size + field_size + nw * 2)
+            // keys + values + sorted_values (u32 each)
+            + tp * 12
+            // counts + offsets + scatter_offsets (u32 each)
+            + tb * 12
+            // bucket_results
+            + tb * jacobian_size
+            // chunk_sbp + chunk_sum
+            + total_chunks * jacobian_size * 2
+            // window_results
+            + nw * jacobian_size
+            // final_result
+            + jacobian_size;
+
+        // Use 65% of available memory to leave headroom
+        let available = (self.device_memory as f64 * 0.65) as usize;
+        // Subtract base buffer size (shared, not per-poly)
+        let base_overhead = self.base_buffer_len * std::mem::size_of::<G::GpuRepr>();
+        let usable = available.saturating_sub(base_overhead);
+
+        (usable / per_poly_bytes).max(1).min(2048)
+    }
+
+    /// Batch commit N same-size polynomials concurrently through a single MSM pipeline.
+    ///
+    /// All polys must have the same length. Instead of running the 11-kernel MSM pipeline
+    /// once per poly (N × 11 kernel launches), this packs N polys' data contiguously and
+    /// runs each kernel once with N× the work (11 kernel launches total per batch).
+    ///
+    /// This dramatically reduces kernel launch overhead and CPU-GPU sync points for
+    /// workloads with many same-size polynomials.
+    ///
+    /// # Arguments
+    /// * `polys` - Polynomial evaluations in Montgomery form (all must be the same length)
+    /// * `bases` - Pre-converted GPU bases (at least as long as each poly)
+    ///
+    /// # Returns
+    /// One commitment (projective point) per polynomial.
+    pub fn batch_commit_multi(
+        &self,
+        polys: &[&[F]],
+        bases: &[G::GpuRepr],
+    ) -> EcResult<Vec<G::Group>> {
+        if polys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let n_per_poly = polys[0].len();
+        assert!(n_per_poly > 0, "Polynomials must not be empty");
+        for (i, p) in polys.iter().enumerate() {
+            assert_eq!(
+                p.len(), n_per_poly,
+                "All polys must have same length, poly {i} has {} (expected {n_per_poly})",
+                p.len()
+            );
+        }
+
+        let effective_base_len = if self.base_buffer.is_some() {
+            self.base_buffer_len
+        } else {
+            bases.len()
+        };
+        assert!(
+            effective_base_len >= n_per_poly,
+            "Not enough bases for polynomial size (have {}, need {})",
+            effective_base_len, n_per_poly
+        );
+
+        let total_polys = polys.len();
+        let batch_size = self.compute_multi_batch_size(n_per_poly);
+        let work_units = self.work_units;
+        let max_window_size = self.max_window_size;
+        let persistent_base = self.base_buffer.as_ref();
+        let persistent_base_len = self.base_buffer_len;
+
+        // Pre-pack all poly data contiguously on CPU
+        // We'll process in chunks of batch_size
+        let mut all_commitments = Vec::with_capacity(total_polys);
+
+        for chunk_start in (0..total_polys).step_by(batch_size) {
+            let chunk_end = std::cmp::min(chunk_start + batch_size, total_polys);
+            let n_polys = chunk_end - chunk_start;
+            let chunk_polys = &polys[chunk_start..chunk_end];
+
+            // Pack chunk_polys contiguously
+            let mut flat_data: Vec<F> = Vec::with_capacity(n_polys * n_per_poly);
+            for p in chunk_polys {
+                flat_data.extend_from_slice(p);
+            }
+
+            let closures = program_closures!(|program, _arg| -> EcResult<Vec<G::Group>> {
+                // Use persistent base buffer if available
+                let local_base_buf;
+                let base_buffer = if let Some(pb) = persistent_base {
+                    if persistent_base_len >= n_per_poly {
+                        pb
+                    } else {
+                        local_base_buf = program.create_persistent_buffer_from_slice(&bases[..n_per_poly])?;
+                        &local_base_buf
+                    }
+                } else {
+                    local_base_buf = program.create_persistent_buffer_from_slice(&bases[..n_per_poly])?;
+                    &local_base_buf
+                };
+
+                // MSM parameters (same for all polys since same size)
+                const BN254_SCALAR_BITS: usize = 254;
+                let effective_bits = BN254_SCALAR_BITS;
+                let window_size = std::cmp::min(
+                    ((div_ceil(n_per_poly, work_units) as f64).log2() as usize) + 2,
+                    max_window_size,
+                );
+                let num_windows = div_ceil(effective_bits + 1, window_size);
+                let buckets_per_window = 1usize << (window_size - 1);
+                let total_buckets_per_poly = num_windows * buckets_per_window;
+                let total_pairs_per_poly = n_per_poly * num_windows;
+
+                // Multiplied sizes for N polys
+                let n_total = n_polys * n_per_poly;
+                let total_pairs = n_polys * total_pairs_per_poly;
+                let total_buckets = n_polys * total_buckets_per_poly;
+                let num_chunks_per_window = div_ceil(buckets_per_window, REDUCTION_CHUNK_SIZE);
+                let total_chunks = n_polys * num_windows * num_chunks_per_window;
+
+                // Upload packed polynomial data
+                let fr_buffer = program.create_buffer_from_slice(&flat_data)?;
+
+                // Allocate all buffers at N× size
+                let scalar_buffer = unsafe { program.create_buffer::<F>(n_total)? };
+                let digits_buffer = unsafe { program.create_buffer::<u16>(n_total * num_windows)? };
+                let keys_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+                let values_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+                let sorted_values_buffer = unsafe { program.create_buffer::<u32>(total_pairs)? };
+                let counts_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+                let offsets_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+                let scatter_offsets_buffer = unsafe { program.create_buffer::<u32>(total_buckets)? };
+                let bucket_results_buffer = unsafe { program.create_buffer::<G::Group>(total_buckets)? };
+                let chunk_sbp_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+                let chunk_sum_buffer = unsafe { program.create_buffer::<G::Group>(total_chunks.max(1))? };
+                let window_results_buffer = unsafe { program.create_buffer::<G::Group>(n_polys * num_windows)? };
+                let final_results_buffer = {
+                    let zeros = vec![<G::Group as AdditiveGroup>::ZERO; n_polys];
+                    program.create_buffer_from_slice(&zeros)?
+                };
+
+                // Step 1: to_scalar_bytes — N * n_per_poly elements (existing kernel, element-wise)
+                let to_scalar_name = format!("{}_to_scalar_bytes", F::name());
+                let to_scalar_global = div_ceil(n_total, LOCAL_WORK_SIZE);
+                let to_scalar_kernel = program.create_kernel(&to_scalar_name, to_scalar_global, LOCAL_WORK_SIZE)?;
+                to_scalar_kernel
+                    .arg(&fr_buffer)
+                    .arg(&scalar_buffer)
+                    .arg(&(n_total as u32))
+                    .run()?;
+
+                // Step 2: preprocess_signed_digits — N * n_per_poly bases (existing kernel, per-element)
+                let preprocess_global = div_ceil(n_total, LOCAL_WORK_SIZE);
+                let preprocess_kernel = program.create_kernel(
+                    &format!("{}_preprocess_signed_digits", G::name()),
+                    preprocess_global, LOCAL_WORK_SIZE)?;
+                preprocess_kernel
+                    .arg(&scalar_buffer)
+                    .arg(&digits_buffer)
+                    .arg(&(n_total as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .run()?;
+
+                // Step 3: decompose_to_pairs_multi — NEW kernel, offsets keys by poly_idx
+                let decompose_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let decompose_kernel = program.create_kernel(
+                    &format!("{}_decompose_to_pairs_multi", G::name()),
+                    decompose_global, MSM_LOCAL_WORK_SIZE)?;
+                decompose_kernel
+                    .arg(&digits_buffer)
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&(n_per_poly as u32))
+                    .arg(&(num_windows as u32))
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(total_buckets_per_poly as u32))
+                    .arg(&(total_pairs as u32))
+                    .run()?;
+
+                // Step 4: u32_fill_zero on counts buffer
+                let fill_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
+                let fill_kernel = program.create_kernel("u32_fill_zero", fill_global, MSM_LOCAL_WORK_SIZE)?;
+                fill_kernel
+                    .arg(&counts_buffer)
+                    .arg(&(total_buckets as u32))
+                    .run()?;
+
+                // Step 5: count_buckets — total_pairs elements (existing kernel, atomic histogram)
+                let count_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let count_kernel = program.create_kernel(
+                    &format!("{}_count_buckets", G::name()),
+                    count_global, MSM_LOCAL_WORK_SIZE)?;
+                count_kernel
+                    .arg(&keys_buffer)
+                    .arg(&counts_buffer)
+                    .arg(&(total_pairs as u32))
+                    .run()?;
+
+                // Step 6: prefix_sum_multi — NEW kernel, N threads
+                let prefix_global = div_ceil(n_polys, MSM_LOCAL_WORK_SIZE);
+                let prefix_kernel = program.create_kernel(
+                    &format!("{}_prefix_sum_multi", G::name()),
+                    prefix_global, MSM_LOCAL_WORK_SIZE)?;
+                prefix_kernel
+                    .arg(&counts_buffer)
+                    .arg(&offsets_buffer)
+                    .arg(&(total_buckets_per_poly as u32))
+                    .arg(&(total_pairs_per_poly as u32))
+                    .arg(&(n_polys as u32))
+                    .run()?;
+
+                // Step 7: u32_copy_buffer — copy offsets to scatter_offsets on GPU (avoids CPU sync)
+                let copy_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
+                let copy_kernel = program.create_kernel("u32_copy_buffer", copy_global, MSM_LOCAL_WORK_SIZE)?;
+                copy_kernel
+                    .arg(&offsets_buffer)
+                    .arg(&scatter_offsets_buffer)
+                    .arg(&(total_buckets as u32))
+                    .run()?;
+
+                // Step 8: scatter_to_sorted — total_pairs elements (existing kernel)
+                let scatter_global = div_ceil(total_pairs, MSM_LOCAL_WORK_SIZE);
+                let scatter_kernel = program.create_kernel(
+                    &format!("{}_scatter_to_sorted", G::name()),
+                    scatter_global, MSM_LOCAL_WORK_SIZE)?;
+                scatter_kernel
+                    .arg(&keys_buffer)
+                    .arg(&values_buffer)
+                    .arg(&scatter_offsets_buffer)
+                    .arg(&sorted_values_buffer)
+                    .arg(&(total_pairs as u32))
+                    .run()?;
+
+                // Step 9: accumulate_all_buckets_multi — NEW kernel, 1 thread per bucket
+                let accum_global = div_ceil(total_buckets, MSM_LOCAL_WORK_SIZE);
+                let accum_kernel = program.create_kernel(
+                    &format!("{}_accumulate_all_buckets_multi", G::name()),
+                    accum_global, MSM_LOCAL_WORK_SIZE)?;
+                accum_kernel
+                    .arg(base_buffer)
+                    .arg(&sorted_values_buffer)
+                    .arg(&offsets_buffer)
+                    .arg(&counts_buffer)
+                    .arg(&bucket_results_buffer)
+                    .arg(&(total_buckets as u32))
+                    .run()?;
+
+                // Step 10: reduce_buckets_chunked — N * total_chunks work groups (existing kernel)
+                let total_blocks = n_polys * num_windows * num_chunks_per_window;
+                let chunked_reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_buckets_chunked", G::name()),
+                    total_blocks, REDUCTION_CHUNK_SIZE)?;
+                chunked_reduce_kernel
+                    .arg(&bucket_results_buffer)
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&(buckets_per_window as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&LocalBuffer::<G::Group>::new(REDUCTION_CHUNK_SIZE))
+                    .run()?;
+
+                // Step 11: combine_chunks_to_windows — N * num_windows threads (existing kernel)
+                let n_total_windows = n_polys * num_windows;
+                let combine_global = div_ceil(n_total_windows, MSM_LOCAL_WORK_SIZE);
+                let combine_kernel = program.create_kernel(
+                    &format!("{}_combine_chunks_to_windows", G::name()),
+                    combine_global, MSM_LOCAL_WORK_SIZE)?;
+                combine_kernel
+                    .arg(&chunk_sbp_buffer)
+                    .arg(&chunk_sum_buffer)
+                    .arg(&window_results_buffer)
+                    .arg(&(n_total_windows as u32))
+                    .arg(&(num_chunks_per_window as u32))
+                    .arg(&(REDUCTION_CHUNK_SIZE as u32))
+                    .run()?;
+
+                // Step 12: reduce_windows_multi — NEW kernel, N threads
+                let reduce_global = div_ceil(n_polys, MSM_LOCAL_WORK_SIZE);
+                let reduce_kernel = program.create_kernel(
+                    &format!("{}_reduce_windows_multi", G::name()),
+                    reduce_global, MSM_LOCAL_WORK_SIZE)?;
+                reduce_kernel
+                    .arg(&window_results_buffer)
+                    .arg(&final_results_buffer)
+                    .arg(&(num_windows as u32))
+                    .arg(&(window_size as u32))
+                    .arg(&(effective_bits as u32))
+                    .arg(&(n_polys as u32))
+                    .run()?;
+
+                // Step 13: Download all N results at once — single CPU sync!
+                let mut results = vec![<G::Group as AdditiveGroup>::ZERO; n_polys];
+                program.read_into_buffer(&final_results_buffer, &mut results)?;
+
+                Ok(results)
+            });
+
+            let chunk_results = self.program.run(closures, ())?;
+            all_commitments.extend(chunk_results);
+        }
+
+        Ok(all_commitments)
     }
 
     /// Fused HyperKZG open: runs the entire open operation in one GPU session.
