@@ -548,6 +548,8 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     base_buffer: Option<rust_gpu_tools::PersistentBuffer<G::GpuRepr>>,
     /// Number of elements in the persistent base buffer.
     base_buffer_len: usize,
+    /// Total GPU VRAM in bytes, used to compute VRAM-aware batch sizes.
+    device_memory: u64,
     _phantom: std::marker::PhantomData<(F, G)>,
 }
 
@@ -578,13 +580,14 @@ const REDUCTION_CHUNK_SIZE: usize = 256;
 
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
     /// Create a new fused poly-commit handler.
-    pub fn create(program: Program, work_units: usize) -> EcResult<Self> {
+    pub fn create(program: Program, work_units: usize, device_memory: u64) -> EcResult<Self> {
         Ok(Self {
             program,
             max_window_size: MAX_WINDOW_SIZE,
             work_units,
             base_buffer: None,
             base_buffer_len: 0,
+            device_memory,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -1423,8 +1426,12 @@ pub struct FusedOpenResult<F, AffineG, ProjectiveG> {
 impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, G> {
     /// Batch commit: computes MSM commitments for multiple polynomials in a single GPU session.
     ///
+    /// Uses VRAM-aware bulk upload: packs multiple polys contiguously in CPU memory, uploads
+    /// once per batch (1 sync instead of N syncs), then uses `to_scalar_bytes_offset` to index
+    /// into the packed GPU buffer. This eliminates per-poly CPU-GPU sync overhead (~4ms × N).
+    ///
     /// Uses the Pippenger MSM pipeline (same as fused_open Phase 2): `multiexp_signed` with
-    /// ~27K threads for full GPU utilization, 0 CPU roundtrips per poly, single download at end.
+    /// ~27K threads for full GPU utilization, 0 CPU roundtrips per poly within a batch.
     ///
     /// # Arguments
     /// * `polys` - Polynomial evaluations in Montgomery form
@@ -1457,6 +1464,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
         let work_units = self.work_units;
         let max_window_size = self.max_window_size;
+        let device_memory = self.device_memory;
         let persistent_base = self.base_buffer.as_ref();
         let persistent_base_len = self.base_buffer_len;
 
@@ -1475,12 +1483,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 &local_base_buf
             };
 
-            // CPU-side scratch buffer for zero-padded poly data (reused per poly)
-            let mut padded_scratch: Vec<F> = vec![F::ZERO; max_len];
-
-            // Reusable GPU buffer for one poly at a time
-            let mut fr_buffer = program.create_buffer_from_slice(&padded_scratch)?;
-
             // Compute Pippenger MSM params (constant across all polys since using max_len)
             const BN254_SCALAR_BITS: usize = 254;
             let effective_bits = BN254_SCALAR_BITS;
@@ -1489,6 +1491,36 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let num_windows = div_ceil(effective_bits + 1, ws);
             let buckets_per_window = 1usize << (ws - 1);
             let num_groups = work_units / num_windows;
+
+            // Compute VRAM-aware batch size
+            let elem_size_f = std::mem::size_of::<F>();
+            let elem_size_g = std::mem::size_of::<G::Group>();
+
+            // Fixed GPU allocations (independent of batch size):
+            let persistent_base_bytes = if persistent_base.is_some() {
+                persistent_base_len * std::mem::size_of::<G::GpuRepr>()
+            } else {
+                max_len * std::mem::size_of::<G::GpuRepr>()
+            };
+            let fixed_gpu_bytes =
+                max_len * elem_size_f                          // scalar_buffer
+                + max_len * num_windows * 2                    // digits_buffer (u16)
+                + work_units * buckets_per_window * elem_size_g // bucket_buffer
+                + work_units * elem_size_g                     // multiexp_results
+                + num_windows * elem_size_g                    // window_results
+                + elem_size_g                                  // final_result
+                + num_polys * elem_size_g                      // commitments_gpu
+                + persistent_base_bytes;                       // base_buffer
+
+            let safety_margin = device_memory / 10; // 10% safety margin
+            let available = device_memory.saturating_sub(fixed_gpu_bytes as u64 + safety_margin);
+            let per_poly_bytes = max_len * elem_size_f; // packed buffer cost per poly
+            let batch_size = std::cmp::max(1, (available as usize) / per_poly_bytes);
+            let batch_size = std::cmp::min(batch_size, num_polys);
+
+            // Pre-allocate CPU packed buffer and GPU packed buffer (reused per batch)
+            let mut packed_cpu: Vec<F> = vec![F::ZERO; batch_size * max_len];
+            let mut packed_gpu = program.create_buffer_from_slice(&packed_cpu)?;
 
             // Pre-allocate shared Pippenger buffers (reused per poly)
             let scalar_buffer = unsafe { program.create_buffer::<F>(max_len)? };
@@ -1502,76 +1534,100 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let commitments_gpu = unsafe { program.create_buffer::<G::Group>(num_polys)? };
 
             // Kernel names
-            let to_scalar_name = format!("{}_to_scalar_bytes", F::name());
+            let to_scalar_offset_name = format!("{}_to_scalar_bytes_offset", F::name());
             let preprocess_name = format!("{}_preprocess_signed_digits", G::name());
             let multiexp_signed_name = format!("{}_multiexp_signed", G::name());
             let reduce_groups_name = format!("{}_reduce_multiexp_groups", G::name());
             let reduce_windows_name = format!("{}_reduce_windows", G::name());
             let copy_at_offset_name = format!("{}_copy_at_offset", G::name());
 
-            for (poly_i, poly) in polys.iter().enumerate() {
-                // Build zero-padded poly on CPU and upload to reusable fr_buffer
-                padded_scratch[..poly.len()].copy_from_slice(poly);
-                for v in padded_scratch[poly.len()..].iter_mut() {
-                    *v = F::ZERO;
+            let to_scalar_global = div_ceil(max_len, LOCAL_WORK_SIZE);
+            let preprocess_global = div_ceil(n_bases, LOCAL_WORK_SIZE);
+            let msm_global = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
+            let reduce_groups_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
+
+            // Process polys in VRAM-aware batches
+            let mut global_poly_idx = 0usize;
+            while global_poly_idx < num_polys {
+                let batch_end = std::cmp::min(global_poly_idx + batch_size, num_polys);
+                let this_batch = batch_end - global_poly_idx;
+
+                // 1. CPU: pack this_batch polys contiguously into packed_cpu (zero-padded to max_len)
+                for (b, poly) in polys[global_poly_idx..batch_end].iter().enumerate() {
+                    let dst_offset = b * max_len;
+                    packed_cpu[dst_offset..dst_offset + poly.len()].copy_from_slice(poly);
+                    packed_cpu[dst_offset + poly.len()..dst_offset + max_len].fill(F::ZERO);
                 }
-                program.write_from_buffer(&mut fr_buffer, &padded_scratch)?;
 
-                // 1. Convert Montgomery → standard form on GPU
-                let to_scalar_global = div_ceil(max_len, LOCAL_WORK_SIZE);
-                program.create_kernel(&to_scalar_name, to_scalar_global, LOCAL_WORK_SIZE)?
-                    .arg(&fr_buffer)
-                    .arg(&scalar_buffer)
-                    .arg(&(max_len as u32))
-                    .run_async()?;
+                // 2. GPU: single bulk upload for this batch (1 SYNC per batch)
+                // If batch is smaller than batch_size, only write the portion we need
+                if this_batch == batch_size {
+                    program.write_from_buffer(&mut packed_gpu, &packed_cpu)?;
+                } else {
+                    // Partial batch: write only the used portion
+                    program.write_from_buffer(&mut packed_gpu, &packed_cpu[..this_batch * max_len])?;
+                }
 
-                // 2. Preprocess to signed digits
-                let preprocess_global = div_ceil(n_bases, LOCAL_WORK_SIZE);
-                program.create_kernel(&preprocess_name, preprocess_global, LOCAL_WORK_SIZE)?
-                    .arg(&scalar_buffer)
-                    .arg(&digits_buffer)
-                    .arg(&(n_bases as u32))
-                    .arg(&(num_windows as u32))
-                    .arg(&(ws as u32))
-                    .run_async()?;
+                // 3. For each poly in batch: async kernel dispatch (0 syncs within batch)
+                for b in 0..this_batch {
+                    let offset = (b * max_len) as u32;
+                    let poly_i = global_poly_idx + b;
 
-                // 3. Pippenger multiexp_signed (self-initializes buckets, ~27K threads)
-                let msm_global = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
-                program.create_kernel(&multiexp_signed_name, msm_global, MSM_LOCAL_WORK_SIZE)?
-                    .arg(base_buffer)
-                    .arg(&bucket_buffer)
-                    .arg(&multiexp_results)
-                    .arg(&digits_buffer)
-                    .arg(&(n_bases as u32))
-                    .arg(&(num_groups as u32))
-                    .arg(&(num_windows as u32))
-                    .arg(&(ws as u32))
-                    .run_async()?;
+                    // a. Convert Montgomery → standard form from packed_gpu[offset..]
+                    program.create_kernel(&to_scalar_offset_name, to_scalar_global, LOCAL_WORK_SIZE)?
+                        .arg(&packed_gpu)
+                        .arg(&scalar_buffer)
+                        .arg(&(max_len as u32))
+                        .arg(&offset)
+                        .run_async()?;
 
-                // 4. Reduce group results per window on GPU
-                let reduce_groups_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
-                program.create_kernel(&reduce_groups_name, reduce_groups_global, MSM_LOCAL_WORK_SIZE)?
-                    .arg(&multiexp_results)
-                    .arg(&window_results)
-                    .arg(&(num_groups as u32))
-                    .arg(&(num_windows as u32))
-                    .run_async()?;
+                    // b. Preprocess to signed digits
+                    program.create_kernel(&preprocess_name, preprocess_global, LOCAL_WORK_SIZE)?
+                        .arg(&scalar_buffer)
+                        .arg(&digits_buffer)
+                        .arg(&(n_bases as u32))
+                        .arg(&(num_windows as u32))
+                        .arg(&(ws as u32))
+                        .run_async()?;
 
-                // 5. Horner reduction across windows
-                program.create_kernel(&reduce_windows_name, 1, 1)?
-                    .arg(&window_results)
-                    .arg(&final_result)
-                    .arg(&(num_windows as u32))
-                    .arg(&(ws as u32))
-                    .arg(&(effective_bits as u32))
-                    .run_async()?;
+                    // c. Pippenger multiexp_signed (self-initializes buckets, ~27K threads)
+                    program.create_kernel(&multiexp_signed_name, msm_global, MSM_LOCAL_WORK_SIZE)?
+                        .arg(base_buffer)
+                        .arg(&bucket_buffer)
+                        .arg(&multiexp_results)
+                        .arg(&digits_buffer)
+                        .arg(&(n_bases as u32))
+                        .arg(&(num_groups as u32))
+                        .arg(&(num_windows as u32))
+                        .arg(&(ws as u32))
+                        .run_async()?;
 
-                // 6. Save commitment to GPU array (no per-poly download)
-                program.create_kernel(&copy_at_offset_name, 1, 1)?
-                    .arg(&final_result)
-                    .arg(&commitments_gpu)
-                    .arg(&(poly_i as u32))
-                    .run_async()?;
+                    // d. Reduce group results per window on GPU
+                    program.create_kernel(&reduce_groups_name, reduce_groups_global, MSM_LOCAL_WORK_SIZE)?
+                        .arg(&multiexp_results)
+                        .arg(&window_results)
+                        .arg(&(num_groups as u32))
+                        .arg(&(num_windows as u32))
+                        .run_async()?;
+
+                    // e. Horner reduction across windows
+                    program.create_kernel(&reduce_windows_name, 1, 1)?
+                        .arg(&window_results)
+                        .arg(&final_result)
+                        .arg(&(num_windows as u32))
+                        .arg(&(ws as u32))
+                        .arg(&(effective_bits as u32))
+                        .run_async()?;
+
+                    // f. Save commitment to GPU array (no per-poly download)
+                    program.create_kernel(&copy_at_offset_name, 1, 1)?
+                        .arg(&final_result)
+                        .arg(&commitments_gpu)
+                        .arg(&(poly_i as u32))
+                        .run_async()?;
+                }
+
+                global_poly_idx = batch_end;
             }
 
             // Single download of all commitments at end
