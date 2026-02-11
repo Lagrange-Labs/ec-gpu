@@ -1546,6 +1546,15 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let msm_global = div_ceil(num_windows * num_groups, MSM_LOCAL_WORK_SIZE);
             let reduce_groups_global = div_ceil(num_windows, MSM_LOCAL_WORK_SIZE);
 
+            eprintln!("[batch_commit] num_polys={}, max_len={}, batch_size={}, num_batches={}, ws={}, num_windows={}, num_groups={}, work_units={}",
+                num_polys, max_len, batch_size, div_ceil(num_polys, batch_size), ws, num_windows, num_groups, work_units);
+            eprintln!("[batch_commit] device_memory={}MB, fixed_gpu={}MB, available={}MB, per_poly={}MB, packed_gpu={}MB",
+                device_memory / (1024*1024), fixed_gpu_bytes / (1024*1024),
+                available / (1024*1024), per_poly_bytes / (1024*1024),
+                (batch_size * max_len * elem_size_f) / (1024*1024));
+
+            let batch_commit_start = std::time::Instant::now();
+
             // Process polys in VRAM-aware batches
             let mut global_poly_idx = 0usize;
             while global_poly_idx < num_polys {
@@ -1553,13 +1562,16 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 let this_batch = batch_end - global_poly_idx;
 
                 // 1. CPU: pack this_batch polys contiguously into packed_cpu (zero-padded to max_len)
+                let t_pack = std::time::Instant::now();
                 for (b, poly) in polys[global_poly_idx..batch_end].iter().enumerate() {
                     let dst_offset = b * max_len;
                     packed_cpu[dst_offset..dst_offset + poly.len()].copy_from_slice(poly);
                     packed_cpu[dst_offset + poly.len()..dst_offset + max_len].fill(F::ZERO);
                 }
+                let pack_ms = t_pack.elapsed().as_secs_f64() * 1000.0;
 
                 // 2. GPU: single bulk upload for this batch (1 SYNC per batch)
+                let t_upload = std::time::Instant::now();
                 // If batch is smaller than batch_size, only write the portion we need
                 if this_batch == batch_size {
                     program.write_from_buffer(&mut packed_gpu, &packed_cpu)?;
@@ -1567,8 +1579,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     // Partial batch: write only the used portion
                     program.write_from_buffer(&mut packed_gpu, &packed_cpu[..this_batch * max_len])?;
                 }
+                let upload_ms = t_upload.elapsed().as_secs_f64() * 1000.0;
 
                 // 3. For each poly in batch: async kernel dispatch (0 syncs within batch)
+                let t_kernels = std::time::Instant::now();
                 for b in 0..this_batch {
                     let offset = (b * max_len) as u32;
                     let poly_i = global_poly_idx + b;
@@ -1627,8 +1641,16 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         .run_async()?;
                 }
 
+                let kernels_ms = t_kernels.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[batch_commit] batch {}: {} polys, pack={:.1}ms, upload={:.1}ms ({}MB), kernels={:.1}ms",
+                    global_poly_idx / batch_size, this_batch, pack_ms, upload_ms,
+                    (this_batch * max_len * elem_size_f) / (1024*1024), kernels_ms);
+
                 global_poly_idx = batch_end;
             }
+
+            let total_ms = batch_commit_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("[batch_commit] total loop: {:.1}ms", total_ms);
 
             // Single download of all commitments at end
             let mut results = vec![<G::Group as AdditiveGroup>::ZERO; num_polys];
