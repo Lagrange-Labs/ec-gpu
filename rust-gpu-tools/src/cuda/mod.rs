@@ -257,6 +257,30 @@ impl Program {
         Ok(())
     }
 
+    /// Puts data from an existing buffer onto the GPU without synchronizing.
+    ///
+    /// The caller MUST ensure that `data` remains valid until the copy completes.
+    /// This is safe when:
+    /// - The data slice outlives all GPU operations that read from this buffer, OR
+    /// - A later `synchronize()` or `read_into_buffer()` is called before `data` is dropped
+    ///
+    /// Since all operations on a single CUDA stream execute in order, subsequent
+    /// kernel launches on the same stream will see the completed copy.
+    pub fn write_from_buffer_async<T>(&self, buffer: &mut Buffer<T>, data: &[T]) -> GPUResult<()> {
+        assert!(data.len() <= buffer.length, "Buffer is too small");
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                std::mem::size_of_val(data),
+            )
+        };
+
+        unsafe { buffer.buffer.async_copy_from(bytes, &self.stream)? };
+
+        Ok(())
+    }
+
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");

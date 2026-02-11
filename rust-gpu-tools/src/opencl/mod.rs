@@ -326,6 +326,30 @@ impl Program {
         Ok(())
     }
 
+    /// Puts data from an existing buffer onto the GPU without synchronizing.
+    ///
+    /// The caller MUST ensure that `data` remains valid until the copy completes.
+    /// On OpenCL this uses CL_NON_BLOCKING for the write.
+    pub fn write_from_buffer_async<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+    ) -> GPUResult<()> {
+        assert!(data.len() <= buffer.length, "Buffer is too small");
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+        unsafe {
+            self.queue
+                .enqueue_write_buffer(&mut buffer.buffer, opencl3::types::CL_NON_BLOCKING, 0, bytes, &[])?;
+        }
+        Ok(())
+    }
+
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");
