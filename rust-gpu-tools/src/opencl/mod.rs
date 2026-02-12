@@ -350,6 +350,59 @@ impl Program {
         Ok(())
     }
 
+    /// Create an additional OpenCL command queue for concurrent kernel execution.
+    ///
+    /// OpenCL command queues are analogous to CUDA streams. Each queue executes
+    /// operations in order, but different queues can execute concurrently.
+    pub fn create_stream(&self) -> GPUResult<Stream> {
+        let queue = CommandQueue::create_default(&self.context, 0)?;
+        Ok(Stream { queue })
+    }
+
+    /// Create a kernel bound to a specific stream (command queue).
+    pub fn create_kernel_on_stream<'a>(
+        &'a self,
+        stream: &'a Stream,
+        name: &str,
+        global_work_size: usize,
+        local_work_size: usize,
+    ) -> GPUResult<Kernel<'a>> {
+        let kernel = self
+            .kernels_by_name
+            .get(name)
+            .ok_or_else(|| GPUError::KernelNotFound(name.to_string()))?;
+        let mut builder = ExecuteKernel::new(kernel);
+        builder.set_global_work_size(global_work_size * local_work_size);
+        builder.set_local_work_size(local_work_size);
+        Ok(Kernel {
+            builder,
+            queue: &stream.queue,
+            num_local_buffers: 0,
+        })
+    }
+
+    /// Upload data to GPU buffer on a specific stream (command queue).
+    pub fn write_from_buffer_on_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        stream: &Stream,
+    ) -> GPUResult<()> {
+        assert!(data.len() <= buffer.length, "Buffer is too small");
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+        unsafe {
+            stream
+                .queue
+                .enqueue_write_buffer(&mut buffer.buffer, opencl3::types::CL_NON_BLOCKING, 0, bytes, &[])?;
+        }
+        Ok(())
+    }
+
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");
@@ -403,6 +456,22 @@ impl Program {
     /// Pop context (no-op on OpenCL — no context stack).
     pub fn pop_context_public(&self) {
         // OpenCL doesn't use a context stack
+    }
+}
+
+/// An OpenCL command queue acting as a "stream" for concurrent execution.
+///
+/// Analogous to CUDA streams: operations on the same Stream execute in order,
+/// but different Streams can execute concurrently on the GPU.
+pub struct Stream {
+    queue: CommandQueue,
+}
+
+impl Stream {
+    /// Synchronize this stream, waiting for all enqueued operations to complete.
+    pub fn synchronize(&self) -> GPUResult<()> {
+        self.queue.finish()?;
+        Ok(())
     }
 }
 

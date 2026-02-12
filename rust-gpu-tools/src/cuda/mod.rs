@@ -281,6 +281,59 @@ impl Program {
         Ok(())
     }
 
+    /// Create an additional CUDA stream for concurrent kernel execution.
+    ///
+    /// Each stream executes operations in order within itself, but different streams
+    /// can execute concurrently on the GPU. This enables overlapping compute from
+    /// different size groups in batch_commit.
+    pub fn create_stream(&self) -> GPUResult<Stream> {
+        Ok(Stream::new(StreamFlags::NON_BLOCKING, None)?)
+    }
+
+    /// Create a kernel bound to a specific stream (instead of the default program stream).
+    ///
+    /// This allows launching kernels on different streams for concurrent execution.
+    pub fn create_kernel_on_stream<'a>(
+        &'a self,
+        stream: &'a Stream,
+        name: &str,
+        gws: usize,
+        lws: usize,
+    ) -> GPUResult<Kernel<'a>> {
+        let function_name = CString::new(name).expect("Kernel name must not contain nul bytes");
+        let function = self.module.get_function(&function_name)?;
+        Ok(Kernel {
+            function,
+            global_work_size: gws,
+            local_work_size: lws,
+            stream,
+            args: Vec::new(),
+        })
+    }
+
+    /// Upload data to GPU buffer on a specific stream.
+    ///
+    /// `cuMemcpyHtoDAsync` with pageable host memory implicitly syncs the specified stream
+    /// (waits for that stream's pending ops), then stages data and initiates DMA.
+    /// Other streams' GPU work continues uninterrupted during the sync wait.
+    /// Subsequent kernels on this stream will wait for the DMA to complete (stream ordering).
+    pub fn write_from_buffer_on_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        stream: &Stream,
+    ) -> GPUResult<()> {
+        assert!(data.len() <= buffer.length, "Buffer is too small");
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                std::mem::size_of_val(data),
+            )
+        };
+        unsafe { buffer.buffer.async_copy_from(bytes, stream)? };
+        Ok(())
+    }
+
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");
