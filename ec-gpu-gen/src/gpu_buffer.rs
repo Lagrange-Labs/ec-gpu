@@ -1768,9 +1768,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let poly = polys[g_poly_counter[gi]];
                     let poly_i = g_poly_counter[gi];
 
-                    // Build zero-padded poly on CPU (per-group scratch, exact size)
+                    // Build zero-padded poly on CPU (per-group scratch, exact size).
+                    // Skip zero-fill when poly exactly matches bucket size (common with
+                    // power-of-2 bucketing — all DensePolynomial sizes are powers of 2).
                     g_padded_scratch[gi][..poly.len()].copy_from_slice(poly);
-                    g_padded_scratch[gi][poly.len()..].fill(F::ZERO);
+                    if poly.len() < g_max_len[gi] {
+                        g_padded_scratch[gi][poly.len()..].fill(F::ZERO);
+                    }
 
                     // Upload on THIS stream — exact-size match with per-group fr_buffer
                     program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], &g_padded_scratch[gi], stream)?;
