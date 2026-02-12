@@ -1527,25 +1527,39 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             let batch_commit_start = std::time::Instant::now();
 
+            // Per-step timing accumulators (in nanoseconds)
+            let mut t_pad = 0u64;
+            let mut t_upload = 0u64;
+            let mut t_k1 = 0u64; // to_scalar_bytes
+            let mut t_k2 = 0u64; // preprocess_signed_digits
+            let mut t_k3 = 0u64; // multiexp_signed
+            let mut t_k4 = 0u64; // reduce_multiexp_groups
+            let mut t_k5 = 0u64; // reduce_windows
+            let mut t_k6 = 0u64; // copy_at_offset
+
             for (poly_i, poly) in polys.iter().enumerate() {
                 // Build zero-padded poly on CPU
+                let t0 = std::time::Instant::now();
                 padded_scratch[..poly.len()].copy_from_slice(poly);
                 padded_scratch[poly.len()..].fill(F::ZERO);
+                t_pad += t0.elapsed().as_nanos() as u64;
 
                 // Async upload: queues DMA copy on stream, no CPU-GPU sync.
-                // Safe because padded_scratch lives until the next iteration, and
-                // same-stream ordering guarantees the copy completes before the
-                // to_scalar_bytes kernel reads fr_buffer.
+                let t0 = std::time::Instant::now();
                 program.write_from_buffer_async(&mut fr_buffer, &padded_scratch)?;
+                t_upload += t0.elapsed().as_nanos() as u64;
 
                 // 1. Convert Montgomery → standard form on GPU
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&to_scalar_name, to_scalar_global, LOCAL_WORK_SIZE)?
                     .arg(&fr_buffer)
                     .arg(&scalar_buffer)
                     .arg(&(max_len as u32))
                     .run_async()?;
+                t_k1 += t0.elapsed().as_nanos() as u64;
 
                 // 2. Preprocess to signed digits
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&preprocess_name, preprocess_global, LOCAL_WORK_SIZE)?
                     .arg(&scalar_buffer)
                     .arg(&digits_buffer)
@@ -1553,8 +1567,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(num_windows as u32))
                     .arg(&(ws as u32))
                     .run_async()?;
+                t_k2 += t0.elapsed().as_nanos() as u64;
 
                 // 3. Pippenger multiexp_signed (self-initializes buckets, ~27K threads)
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&multiexp_signed_name, msm_global, MSM_LOCAL_WORK_SIZE)?
                     .arg(base_buffer)
                     .arg(&bucket_buffer)
@@ -1565,16 +1581,20 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(num_windows as u32))
                     .arg(&(ws as u32))
                     .run_async()?;
+                t_k3 += t0.elapsed().as_nanos() as u64;
 
                 // 4. Reduce group results per window on GPU
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&reduce_groups_name, reduce_groups_global, MSM_LOCAL_WORK_SIZE)?
                     .arg(&multiexp_results)
                     .arg(&window_results)
                     .arg(&(num_groups as u32))
                     .arg(&(num_windows as u32))
                     .run_async()?;
+                t_k4 += t0.elapsed().as_nanos() as u64;
 
                 // 5. Horner reduction across windows
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&reduce_windows_name, 1, 1)?
                     .arg(&window_results)
                     .arg(&final_result)
@@ -1582,13 +1602,16 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(ws as u32))
                     .arg(&(effective_bits as u32))
                     .run_async()?;
+                t_k5 += t0.elapsed().as_nanos() as u64;
 
                 // 6. Save commitment to GPU array (no per-poly download)
+                let t0 = std::time::Instant::now();
                 program.create_kernel(&copy_at_offset_name, 1, 1)?
                     .arg(&final_result)
                     .arg(&commitments_gpu)
                     .arg(&(poly_i as u32))
                     .run_async()?;
+                t_k6 += t0.elapsed().as_nanos() as u64;
             }
 
             let loop_ms = batch_commit_start.elapsed().as_secs_f64() * 1000.0;
@@ -1599,8 +1622,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             program.read_into_buffer(&commitments_gpu, &mut results)?;
             let download_ms = t_download.elapsed().as_secs_f64() * 1000.0;
 
+            let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
             eprintln!("[batch_commit] loop={:.1}ms, download={:.1}ms, total={:.1}ms",
                 loop_ms, download_ms, batch_commit_start.elapsed().as_secs_f64() * 1000.0);
+            eprintln!("[batch_commit] per-step totals: pad={:.1}ms upload={:.1}ms to_scalar={:.1}ms preprocess={:.1}ms multiexp={:.1}ms reduce_grp={:.1}ms reduce_win={:.1}ms copy={:.1}ms",
+                to_ms(t_pad), to_ms(t_upload), to_ms(t_k1), to_ms(t_k2), to_ms(t_k3), to_ms(t_k4), to_ms(t_k5), to_ms(t_k6));
 
             Ok(results)
         });
