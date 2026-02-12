@@ -1705,12 +1705,18 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // the per-group size params, so they safely reuse oversized per-stream allocations.
             let t_alloc = std::time::Instant::now();
 
-            // Per-group: fr_buffer (exact-size upload), padded_scratch (CPU), commitments (different poly counts)
+            // Per-group: fr_buffer (exact-size upload), padded_scratch (pinned CPU), commitments (different poly counts)
+            // padded_scratch uses page-locked (pinned) host memory so that cuMemcpyHtoDAsync
+            // is truly async — without pinning, each upload implicitly syncs the stream (~2-3ms block).
             let mut g_padded_scratch = Vec::with_capacity(num_groups);
             let mut g_fr_buffer = Vec::with_capacity(num_groups);
             let mut g_commitments_gpu = Vec::with_capacity(num_groups);
             for (polys, max_len) in &groups {
-                g_padded_scratch.push(vec![F::ZERO; *max_len]);
+                let mut pinned = unsafe { program.create_pinned_host_buffer::<F>(*max_len)? };
+                // Zero-initialize: the dispatch loop overwrites [..poly.len()] and fills [poly.len()..],
+                // but we initialize here so the first iteration's fill range is valid.
+                pinned.fill(F::ZERO);
+                g_padded_scratch.push(pinned);
                 g_fr_buffer.push(unsafe { program.create_buffer::<F>(*max_len)? });
                 g_commitments_gpu.push(unsafe { program.create_buffer::<G::Group>(polys.len())? });
             }

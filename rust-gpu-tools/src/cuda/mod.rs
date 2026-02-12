@@ -32,6 +32,46 @@ pub struct Buffer<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
+/// Page-locked (pinned) host memory buffer for truly async GPU transfers.
+///
+/// When `cuMemcpyHtoDAsync` reads from pageable host memory, it implicitly
+/// synchronizes the stream (blocking the CPU ~2-3ms per call). With page-locked
+/// memory allocated via `cuMemAllocHost`, the transfer is truly asynchronous —
+/// the CPU returns immediately and the DMA runs in the background.
+///
+/// Wraps `LockedBuffer<u8>` from rustacuda and provides typed `&[T]` / `&mut [T]`
+/// access for use as staging buffers in multi-stream GPU uploads.
+pub struct PinnedHostBuffer<T> {
+    inner: rustacuda::memory::LockedBuffer<u8>,
+    len: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> PinnedHostBuffer<T> {
+    /// Number of T-sized elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the buffer has zero elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T> std::ops::Deref for PinnedHostBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.inner.as_ptr() as *const T, self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for PinnedHostBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.inner.as_mut_ptr() as *mut T, self.len) }
+    }
+}
+
 /// CUDA specific device.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -401,6 +441,27 @@ impl Program {
     /// Pop the current context (public version).
     pub fn pop_context_public(&self) {
         Self::pop_context();
+    }
+
+    /// Allocate page-locked (pinned) host memory for truly async GPU transfers.
+    ///
+    /// With pageable host memory, `cuMemcpyHtoDAsync` implicitly synchronizes the
+    /// stream (~2-3ms block per call). With pinned memory, the transfer is truly async.
+    ///
+    /// ### Safety
+    ///
+    /// The buffer contents are uninitialized. The caller must write to all elements
+    /// before passing them to GPU upload functions or reading from them.
+    /// The CUDA context must be active (call within `program.run()` or after `push_context()`).
+    pub unsafe fn create_pinned_host_buffer<T>(&self, length: usize) -> GPUResult<PinnedHostBuffer<T>> {
+        assert!(length > 0);
+        let byte_len = length * std::mem::size_of::<T>();
+        let inner = rustacuda::memory::LockedBuffer::<u8>::uninitialized(byte_len)?;
+        Ok(PinnedHostBuffer {
+            inner,
+            len: length,
+            _phantom: std::marker::PhantomData,
+        })
     }
 
     /// Pop the current context.

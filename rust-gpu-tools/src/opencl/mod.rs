@@ -32,6 +32,42 @@ pub struct Buffer<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
+/// Pinned host memory buffer (OpenCL fallback: regular heap allocation).
+///
+/// On CUDA, page-locked memory enables truly async GPU transfers.
+/// On OpenCL, this wraps a regular `Vec<u8>` — transfers already use
+/// `CL_NON_BLOCKING` which handles staging internally.
+pub struct PinnedHostBuffer<T> {
+    inner: Vec<u8>,
+    len: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> PinnedHostBuffer<T> {
+    /// Number of T-sized elements.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if the buffer has zero elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T> std::ops::Deref for PinnedHostBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.inner.as_ptr() as *const T, self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for PinnedHostBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.inner.as_mut_ptr() as *mut T, self.len) }
+    }
+}
+
 /// OpenCL specific device.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -456,6 +492,27 @@ impl Program {
     /// Pop context (no-op on OpenCL — no context stack).
     pub fn pop_context_public(&self) {
         // OpenCL doesn't use a context stack
+    }
+
+    /// Allocate a host memory buffer for async GPU transfers (OpenCL fallback: heap allocation).
+    ///
+    /// On CUDA, this would allocate page-locked memory. On OpenCL, `CL_NON_BLOCKING`
+    /// handles staging internally, so this is a regular heap allocation.
+    ///
+    /// ### Safety
+    ///
+    /// The buffer contents are uninitialized. The caller must write to all elements
+    /// before reading from them.
+    pub unsafe fn create_pinned_host_buffer<T>(&self, length: usize) -> GPUResult<PinnedHostBuffer<T>> {
+        assert!(length > 0);
+        let byte_len = length * std::mem::size_of::<T>();
+        let mut inner = Vec::with_capacity(byte_len);
+        inner.set_len(byte_len);
+        Ok(PinnedHostBuffer {
+            inner,
+            len: length,
+            _phantom: std::marker::PhantomData,
+        })
     }
 }
 
