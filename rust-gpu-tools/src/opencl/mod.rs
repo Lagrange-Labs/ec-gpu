@@ -514,6 +514,100 @@ impl Program {
             _phantom: std::marker::PhantomData,
         })
     }
+
+    /// Look up a kernel function by name with caching.
+    /// On OpenCL, kernels are pre-loaded at program creation, so this just validates the name.
+    /// Returns a handle (index into kernels_by_name) for use with cached kernel creation.
+    pub fn get_cached_function(&self, name: &str) -> GPUResult<usize> {
+        if self.kernels_by_name.contains_key(name) {
+            // Use pointer-based hash as stable handle; not actually needed on OpenCL
+            // since kernels_by_name is a HashMap. We just return 0 as OpenCL
+            // doesn't benefit from caching (kernels already loaded).
+            Ok(0)
+        } else {
+            Err(GPUError::KernelNotFound(name.to_string()))
+        }
+    }
+
+    /// Create a kernel on a PersistentStream (non-cached variant).
+    pub fn create_kernel_on_persistent_stream<'a>(
+        &'a self,
+        pstream: &'a crate::PersistentStream,
+        name: &str,
+        gws: usize,
+        lws: usize,
+    ) -> GPUResult<Kernel<'a>> {
+        match pstream {
+            crate::PersistentStream::Opencl(ref s) => {
+                self.create_kernel_on_stream(s, name, gws, lws)
+            }
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot use CUDA stream with OpenCL kernel"),
+        }
+    }
+
+    /// Create a kernel on a PersistentStream using a cached function handle.
+    /// On OpenCL, the handle is ignored (kernels are pre-loaded).
+    pub fn create_kernel_cached_on_persistent_stream<'a>(
+        &'a self,
+        pstream: &'a crate::PersistentStream,
+        _func_handle: usize,
+        _gws: usize,
+        _lws: usize,
+    ) -> Kernel<'a> {
+        match pstream {
+            crate::PersistentStream::Opencl(ref _s) => {
+                unimplemented!("OpenCL cached kernel creation not yet implemented")
+            }
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot use CUDA stream with OpenCL kernel"),
+        }
+    }
+
+    /// Upload data to GPU buffer on a PersistentStream.
+    pub fn write_from_buffer_on_persistent_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        pstream: &crate::PersistentStream,
+    ) -> GPUResult<()> {
+        match pstream {
+            crate::PersistentStream::Opencl(ref s) => {
+                self.write_from_buffer_on_stream(buffer, data, s)
+            }
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot use CUDA stream with OpenCL kernel"),
+        }
+    }
+
+    /// Upload data to a PersistentBuffer on a PersistentStream.
+    pub fn write_persistent_buffer_on_persistent_stream<T>(
+        &self,
+        buffer: &mut crate::PersistentBuffer<T>,
+        data: &[T],
+        pstream: &crate::PersistentStream,
+    ) -> GPUResult<()> {
+        match buffer {
+            crate::PersistentBuffer::Opencl(ref mut b) => {
+                self.write_from_buffer_on_persistent_stream(b, data, pstream)
+            }
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot use CUDA buffer with OpenCL program"),
+        }
+    }
+
+    /// Read from a PersistentBuffer into a host slice.
+    pub fn read_into_persistent_buffer<T>(
+        &self,
+        buffer: &crate::PersistentBuffer<T>,
+        data: &mut [T],
+    ) -> GPUResult<()> {
+        match buffer {
+            crate::PersistentBuffer::Opencl(ref b) => self.read_into_buffer(b, data),
+            #[cfg(feature = "cuda")]
+            _ => panic!("Cannot read CUDA buffer from OpenCL program"),
+        }
+    }
 }
 
 /// An OpenCL command queue acting as a "stream" for concurrent execution.

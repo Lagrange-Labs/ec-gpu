@@ -10,6 +10,8 @@
 
 pub(crate) mod utils;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ffi::{c_void, CStr, CString};
 use std::fmt;
@@ -17,7 +19,8 @@ use std::hash::{Hash, Hasher};
 
 use log::debug;
 use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer};
-use rustacuda::stream::{Stream, StreamFlags};
+pub use rustacuda::stream::Stream;
+use rustacuda::stream::StreamFlags;
 
 use crate::device::{DeviceUuid, PciId, Vendor};
 use crate::error::{GPUError, GPUResult};
@@ -160,6 +163,9 @@ pub struct Program {
     module: rustacuda::module::Module,
     stream: Stream,
     device_name: String,
+    /// Cache of kernel function handles (CUfunction pointers cast to usize).
+    /// Avoids CString allocation + cuModuleGetFunction on every kernel launch.
+    function_cache: RefCell<HashMap<String, usize>>,
 }
 
 impl Program {
@@ -185,6 +191,7 @@ impl Program {
             stream,
             device_name: device.name(),
             context: device.context.clone(),
+            function_cache: RefCell::new(HashMap::new()),
         };
         Self::pop_context();
         Ok(prog)
@@ -207,6 +214,7 @@ impl Program {
             stream,
             device_name: device.name(),
             context: device.context.clone(),
+            function_cache: RefCell::new(HashMap::new()),
         };
         Self::pop_context();
         Ok(prog)
@@ -462,6 +470,142 @@ impl Program {
             len: length,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /// Look up a kernel function by name with caching.
+    ///
+    /// First call for a given name does CString allocation + cuModuleGetFunction.
+    /// Subsequent calls return the cached handle instantly, avoiding both the
+    /// CString allocation and the GPU driver call.
+    ///
+    /// Returns a raw function handle for use with `create_kernel_cached_on_stream`.
+    pub fn get_cached_function(&self, name: &str) -> GPUResult<usize> {
+        {
+            let cache = self.function_cache.borrow();
+            if let Some(&raw) = cache.get(name) {
+                return Ok(raw);
+            }
+        }
+        // Cache miss: do the actual lookup
+        let function_name = CString::new(name).expect("Kernel name must not contain nul bytes");
+        let func = self.module.get_function(&function_name)?;
+        // Function is a thin wrapper around CUfunction (raw pointer, same size as usize).
+        // We extract it via transmute_copy to cache the raw handle.
+        // SAFETY: Function<'a> is repr(transparent) over CUfunction (a raw pointer).
+        // The Module that owns this function lives as long as Program, so the handle
+        // remains valid for the lifetime of Program.
+        let raw: usize = unsafe { std::mem::transmute_copy(&func) };
+        std::mem::forget(func);
+        self.function_cache.borrow_mut().insert(name.to_string(), raw);
+        Ok(raw)
+    }
+
+    /// Create a kernel on a specific stream using a cached function handle.
+    ///
+    /// This avoids CString allocation and cuModuleGetFunction on every kernel launch.
+    /// Use `get_cached_function` to obtain the handle once, then reuse it for all
+    /// launches of the same kernel.
+    pub fn create_kernel_cached_on_stream<'a>(
+        &'a self,
+        stream: &'a Stream,
+        func_handle: usize,
+        gws: usize,
+        lws: usize,
+    ) -> Kernel<'a> {
+        // Reconstruct Function<'a> from raw handle.
+        // SAFETY: the handle came from self.module.get_function() which is valid for
+        // the lifetime of self.module (owned by Program). Function is just a CUfunction
+        // pointer + PhantomData, so transmute_copy is sound.
+        let function: rustacuda::function::Function<'a> = unsafe {
+            std::mem::transmute_copy(&func_handle)
+        };
+        Kernel {
+            function,
+            global_work_size: gws,
+            local_work_size: lws,
+            stream,
+            args: Vec::new(),
+        }
+    }
+
+    /// Create a kernel on a specific stream using a cached function handle from a
+    /// PersistentStream.
+    pub fn create_kernel_cached_on_persistent_stream<'a>(
+        &'a self,
+        pstream: &'a crate::PersistentStream,
+        func_handle: usize,
+        gws: usize,
+        lws: usize,
+    ) -> Kernel<'a> {
+        match pstream {
+            crate::PersistentStream::Cuda(ref s) => {
+                self.create_kernel_cached_on_stream(s, func_handle, gws, lws)
+            }
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
+        }
+    }
+
+    /// Create a kernel on a PersistentStream (non-cached variant).
+    pub fn create_kernel_on_persistent_stream<'a>(
+        &'a self,
+        pstream: &'a crate::PersistentStream,
+        name: &str,
+        gws: usize,
+        lws: usize,
+    ) -> GPUResult<Kernel<'a>> {
+        match pstream {
+            crate::PersistentStream::Cuda(ref s) => {
+                self.create_kernel_on_stream(s, name, gws, lws)
+            }
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
+        }
+    }
+
+    /// Upload data to GPU buffer on a PersistentStream.
+    pub fn write_from_buffer_on_persistent_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        pstream: &crate::PersistentStream,
+    ) -> GPUResult<()> {
+        match pstream {
+            crate::PersistentStream::Cuda(ref s) => {
+                self.write_from_buffer_on_stream(buffer, data, s)
+            }
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
+        }
+    }
+
+    /// Upload data to a PersistentBuffer on a PersistentStream.
+    pub fn write_persistent_buffer_on_persistent_stream<T>(
+        &self,
+        buffer: &mut crate::PersistentBuffer<T>,
+        data: &[T],
+        pstream: &crate::PersistentStream,
+    ) -> GPUResult<()> {
+        match buffer {
+            crate::PersistentBuffer::Cuda(ref mut b) => {
+                self.write_from_buffer_on_persistent_stream(b, data, pstream)
+            }
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot use OpenCL buffer with CUDA program"),
+        }
+    }
+
+    /// Read from a PersistentBuffer into a host slice.
+    pub fn read_into_persistent_buffer<T>(
+        &self,
+        buffer: &crate::PersistentBuffer<T>,
+        data: &mut [T],
+    ) -> GPUResult<()> {
+        match buffer {
+            crate::PersistentBuffer::Cuda(ref b) => self.read_into_buffer(b, data),
+            #[cfg(feature = "opencl")]
+            _ => panic!("Cannot read OpenCL buffer from CUDA program"),
+        }
     }
 
     /// Pop the current context.
