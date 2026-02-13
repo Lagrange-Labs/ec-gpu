@@ -1634,6 +1634,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let use_pinned = std::env::var("USE_PINNED_HOST_MEMORY")
             .map(|v| v != "0")
             .unwrap_or(true);
+        eprintln!("[batch_commit_concurrent] USE_PINNED_HOST_MEMORY={}", use_pinned);
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             let t_total = std::time::Instant::now();
@@ -1707,6 +1708,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // === Buffer allocation: per-group for upload buffers, per-stream for compute buffers ===
             let t_alloc = std::time::Instant::now();
+            eprintln!("[batch_commit_concurrent] inside closure: use_pinned={}", use_pinned);
 
             // Per-group: host scratch buffers (pinned or pageable), GPU fr_buffer, commitments
             // Double-buffering: buffer A is used for even-numbered polys, buffer B for odd-numbered.
