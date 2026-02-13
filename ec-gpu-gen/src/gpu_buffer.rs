@@ -534,45 +534,6 @@ pub struct FixVarsAndCommitResult<F, G> {
     pub commitments: Vec<G>,
 }
 
-/// Persistent GPU compute state for `batch_commit_concurrent`.
-///
-/// Caches CUDA streams, per-stream compute buffers, and kernel function handles
-/// between calls. On first call, everything is allocated; subsequent calls reuse
-/// if sizes fit, reallocating only buffers that grew.
-struct ComputeState<F: PrimeField + GpuName, G: GpuAffine> {
-    /// Number of streams (max 4).
-    num_streams: usize,
-    /// Persistent CUDA streams.
-    streams: Vec<rust_gpu_tools::PersistentStream>,
-    /// Per-stream compute buffers: (scalar, digits, bucket, multiexp, window, final).
-    /// Indexed by stream index.
-    s_scalar_buffer: Vec<rust_gpu_tools::PersistentBuffer<F>>,
-    s_digits_buffer: Vec<rust_gpu_tools::PersistentBuffer<u16>>,
-    s_bucket_buffer: Vec<rust_gpu_tools::PersistentBuffer<G::Group>>,
-    s_multiexp_results: Vec<rust_gpu_tools::PersistentBuffer<G::Group>>,
-    s_window_results: Vec<rust_gpu_tools::PersistentBuffer<G::Group>>,
-    s_final_result: Vec<rust_gpu_tools::PersistentBuffer<G::Group>>,
-    /// Max parameters each stream was sized for, for realloc decisions.
-    s_max_ml: Vec<usize>,
-    s_max_nw: Vec<usize>,
-    s_max_bpw: Vec<usize>,
-    /// Per-group buffers: fr_buffer, commitments_gpu, pinned scratch.
-    /// These are sized per-group and reused if the group layout matches.
-    g_fr_buffer: Vec<rust_gpu_tools::PersistentBuffer<F>>,
-    g_commitments_gpu: Vec<rust_gpu_tools::PersistentBuffer<G::Group>>,
-    g_padded_scratch: Vec<rust_gpu_tools::PersistentPinnedBuffer<F>>,
-    /// Sizes that per-group buffers were allocated for.
-    g_max_len: Vec<usize>,
-    g_num_polys: Vec<usize>,
-    /// Cached kernel function handles (CUfunction pointers as usize).
-    fn_to_scalar: usize,
-    fn_preprocess: usize,
-    fn_multiexp_signed: usize,
-    fn_reduce_groups: usize,
-    fn_reduce_windows: usize,
-    fn_copy_at_offset: usize,
-}
-
 /// Fused GPU operations for HyperKZG that combine polynomial operations with MSM.
 ///
 /// This struct keeps both polynomial data and curve bases on GPU between operations,
@@ -588,18 +549,13 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     /// Number of elements in the persistent base buffer.
     base_buffer_len: usize,
     _phantom: std::marker::PhantomData<(F, G)>,
-    /// Persistent compute state for batch_commit_concurrent.
-    /// Stored between calls to avoid re-allocating streams, buffers, and kernel handles.
-    compute_state: Option<ComputeState<F, G>>,
 }
 
 impl<F: PrimeField + GpuName, G: GpuAffine> Drop for FusedPolyCommit<F, G> {
     fn drop(&mut self) {
-        let has_persistent = self.base_buffer.is_some() || self.compute_state.is_some();
-        if has_persistent {
+        if self.base_buffer.is_some() {
             if self.program.push_context().is_ok() {
                 self.base_buffer = None;
-                self.compute_state = None;
                 self.program.pop_context();
             }
         }
@@ -626,7 +582,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             base_buffer: None,
             base_buffer_len: 0,
             _phantom: std::marker::PhantomData,
-            compute_state: None,
         })
     }
 
@@ -1642,12 +1597,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
     /// the maximum of all groups on that stream. This reduces buffer allocations from 8×num_groups
     /// to 8×num_streams + num_groups (commitments stay per-group).
     ///
-    /// Persistent ComputeState: on first call, all streams/buffers/kernel handles are allocated
-    /// and cached on `self`. Subsequent calls reuse them if sizes fit, reallocating only what grew.
-    ///
     /// Returns one `Vec<G::Group>` per group, in the same order as input.
     pub fn batch_commit_concurrent(
-        &mut self,
+        &self,
         groups: Vec<(Vec<&[F]>, usize)>,
         bases: &[G::GpuRepr],
     ) -> EcResult<Vec<Vec<G::Group>>> {
@@ -1679,184 +1631,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             .collect();
         eprintln!("[batch_commit_concurrent] {} groups: [{}]", num_groups, group_desc.join(", "));
 
-        const BN254_SCALAR_BITS: usize = 254;
-        let effective_bits = BN254_SCALAR_BITS;
-
-        // Compute per-group Pippenger params
-        let mut g_max_len_vec = Vec::with_capacity(num_groups);
-        let mut g_ws = Vec::with_capacity(num_groups);
-        let mut g_num_windows = Vec::with_capacity(num_groups);
-        let mut g_num_groups_msm = Vec::with_capacity(num_groups);
-        let mut g_to_scalar_global = Vec::with_capacity(num_groups);
-        let mut g_preprocess_global = Vec::with_capacity(num_groups);
-        let mut g_msm_global = Vec::with_capacity(num_groups);
-        let mut g_reduce_groups_global = Vec::with_capacity(num_groups);
-        let mut g_num_polys_vec = Vec::with_capacity(num_groups);
-
-        for (polys, max_len) in &groups {
-            let n_bases = *max_len;
-            let ws = std::cmp::min(((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2, max_window_size);
-            let nw = div_ceil(effective_bits + 1, ws);
-            let ng = work_units / nw;
-
-            g_max_len_vec.push(*max_len);
-            g_ws.push(ws);
-            g_num_windows.push(nw);
-            g_num_groups_msm.push(ng);
-            g_to_scalar_global.push(div_ceil(*max_len, LOCAL_WORK_SIZE));
-            g_preprocess_global.push(div_ceil(n_bases, LOCAL_WORK_SIZE));
-            g_msm_global.push(div_ceil(nw * ng, MSM_LOCAL_WORK_SIZE));
-            g_reduce_groups_global.push(div_ceil(nw, MSM_LOCAL_WORK_SIZE));
-            g_num_polys_vec.push(polys.len());
-        }
-
-        let num_streams = std::cmp::min(num_groups, 4);
-
-        // Check if we need to (re)allocate compute state
-        let needs_realloc = if let Some(ref cs) = self.compute_state {
-            // Check stream count
-            cs.num_streams != num_streams
-            // Check per-group count
-            || cs.g_fr_buffer.len() != num_groups
-            // Check per-group sizes (fr_buffer must match exactly for async_copy_from)
-            || (0..num_groups).any(|gi| cs.g_max_len[gi] != g_max_len_vec[gi])
-            // Check per-group poly counts (commitments buffer must match)
-            || (0..num_groups).any(|gi| cs.g_num_polys[gi] != g_num_polys_vec[gi])
-            // Check per-stream buffer sizes (must be large enough)
-            || (0..num_streams).any(|si| {
-                let stream_group_indices: Vec<usize> = (si..num_groups).step_by(num_streams).collect();
-                let needed_ml = stream_group_indices.iter().map(|&gi| g_max_len_vec[gi]).max().unwrap_or(0);
-                let needed_ws = stream_group_indices.iter().map(|&gi| g_ws[gi]).max().unwrap_or(1);
-                let needed_nw = stream_group_indices.iter().map(|&gi| g_num_windows[gi]).max().unwrap_or(1);
-                let needed_bpw = 1usize << (needed_ws - 1);
-                needed_ml > cs.s_max_ml[si] || needed_nw > cs.s_max_nw[si] || needed_bpw > cs.s_max_bpw[si]
-            })
-        } else {
-            true
-        };
-
-        if needs_realloc {
-            // Drop old state (if any) before allocating new
-            if self.compute_state.is_some() {
-                self.program.push_context()?;
-                self.compute_state = None;
-                self.program.pop_context();
-            }
-
-            // Allocate everything inside a context scope
-            self.program.push_context()?;
-
-            let alloc_result = (|| -> EcResult<ComputeState<F, G>> {
-                // Kernel names
-                let to_scalar_name = format!("{}_to_scalar_bytes", F::name());
-                let preprocess_name = format!("{}_preprocess_signed_digits", G::name());
-                let multiexp_signed_name = format!("{}_multiexp_signed", G::name());
-                let reduce_groups_name = format!("{}_reduce_multiexp_groups", G::name());
-                let reduce_windows_name = format!("{}_reduce_windows", G::name());
-                let copy_at_offset_name = format!("{}_copy_at_offset", G::name());
-
-                // Cache kernel function handles
-                let fn_to_scalar = self.program.get_cached_function(&to_scalar_name)?;
-                let fn_preprocess = self.program.get_cached_function(&preprocess_name)?;
-                let fn_multiexp_signed = self.program.get_cached_function(&multiexp_signed_name)?;
-                let fn_reduce_groups = self.program.get_cached_function(&reduce_groups_name)?;
-                let fn_reduce_windows = self.program.get_cached_function(&reduce_windows_name)?;
-                let fn_copy_at_offset = self.program.get_cached_function(&copy_at_offset_name)?;
-
-                // Create persistent streams
-                let streams: Vec<_> = (0..num_streams)
-                    .map(|_| self.program.create_persistent_stream())
-                    .collect::<Result<_, _>>()?;
-
-                // Per-group buffers
-                let mut g_padded_scratch = Vec::with_capacity(num_groups);
-                let mut g_fr_buffer = Vec::with_capacity(num_groups);
-                let mut g_commitments_gpu = Vec::with_capacity(num_groups);
-                for gi in 0..num_groups {
-                    let ml = g_max_len_vec[gi];
-                    let np = g_num_polys_vec[gi];
-                    let mut pinned = unsafe { self.program.create_persistent_pinned_buffer::<F>(ml)? };
-                    pinned.fill(F::ZERO);
-                    g_padded_scratch.push(pinned);
-                    g_fr_buffer.push(self.program.create_persistent_buffer_from_slice(&vec![F::ZERO; ml])?);
-                    g_commitments_gpu.push(self.program.create_persistent_buffer_from_slice(
-                        &vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; np]
-                    )?);
-                }
-
-                // Per-stream compute buffers
-                let mut s_scalar_buffer = Vec::with_capacity(num_streams);
-                let mut s_digits_buffer = Vec::with_capacity(num_streams);
-                let mut s_bucket_buffer = Vec::with_capacity(num_streams);
-                let mut s_multiexp_results = Vec::with_capacity(num_streams);
-                let mut s_window_results = Vec::with_capacity(num_streams);
-                let mut s_final_result = Vec::with_capacity(num_streams);
-                let mut s_max_ml = Vec::with_capacity(num_streams);
-                let mut s_max_nw = Vec::with_capacity(num_streams);
-                let mut s_max_bpw = Vec::with_capacity(num_streams);
-
-                for si in 0..num_streams {
-                    let stream_group_indices: Vec<usize> = (si..num_groups).step_by(num_streams).collect();
-                    let max_ml = stream_group_indices.iter().map(|&gi| g_max_len_vec[gi]).max().unwrap();
-                    let max_ws = stream_group_indices.iter().map(|&gi| g_ws[gi]).max().unwrap();
-                    let max_nw = stream_group_indices.iter().map(|&gi| g_num_windows[gi]).max().unwrap();
-                    let max_bpw = 1usize << (max_ws - 1);
-
-                    s_scalar_buffer.push(self.program.create_persistent_buffer_from_slice(&vec![F::ZERO; max_ml])?);
-                    s_digits_buffer.push(self.program.create_persistent_buffer_from_slice(&vec![0u16; max_ml * max_nw])?);
-                    s_bucket_buffer.push(self.program.create_persistent_buffer_from_slice(
-                        &vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; work_units * max_bpw]
-                    )?);
-                    s_multiexp_results.push(self.program.create_persistent_buffer_from_slice(
-                        &vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; work_units]
-                    )?);
-                    s_window_results.push(self.program.create_persistent_buffer_from_slice(
-                        &vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; max_nw]
-                    )?);
-                    s_final_result.push(self.program.create_persistent_buffer_from_slice(
-                        &vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; 1]
-                    )?);
-                    s_max_ml.push(max_ml);
-                    s_max_nw.push(max_nw);
-                    s_max_bpw.push(max_bpw);
-                }
-
-                Ok(ComputeState {
-                    num_streams,
-                    streams,
-                    s_scalar_buffer,
-                    s_digits_buffer,
-                    s_bucket_buffer,
-                    s_multiexp_results,
-                    s_window_results,
-                    s_final_result,
-                    s_max_ml,
-                    s_max_nw,
-                    s_max_bpw,
-                    g_fr_buffer,
-                    g_commitments_gpu,
-                    g_padded_scratch,
-                    g_max_len: g_max_len_vec.clone(),
-                    g_num_polys: g_num_polys_vec.clone(),
-                    fn_to_scalar,
-                    fn_preprocess,
-                    fn_multiexp_signed,
-                    fn_reduce_groups,
-                    fn_reduce_windows,
-                    fn_copy_at_offset,
-                })
-            })();
-
-            self.program.pop_context();
-            self.compute_state = Some(alloc_result?);
-            eprintln!("[batch_commit_concurrent] allocated new ComputeState");
-        } else {
-            eprintln!("[batch_commit_concurrent] reusing cached ComputeState");
-        }
-
-        // Now run the dispatch loop using cached state
-        let cs = self.compute_state.as_mut().unwrap();
-
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             let t_total = std::time::Instant::now();
 
@@ -1874,21 +1648,111 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 &local_base_buf
             };
 
+            // Create streams (max 4)
+            let num_streams = std::cmp::min(num_groups, 4);
+            let streams: Vec<_> = (0..num_streams)
+                .map(|_| program.create_stream())
+                .collect::<Result<_, _>>()?;
+
+            const BN254_SCALAR_BITS: usize = 254;
+            let effective_bits = BN254_SCALAR_BITS;
+
+            // Cache kernel function handles (avoids CString + cuModuleGetFunction per launch)
+            let to_scalar_name = format!("{}_to_scalar_bytes", F::name());
+            let preprocess_name = format!("{}_preprocess_signed_digits", G::name());
+            let multiexp_signed_name = format!("{}_multiexp_signed", G::name());
+            let reduce_groups_name = format!("{}_reduce_multiexp_groups", G::name());
+            let reduce_windows_name = format!("{}_reduce_windows", G::name());
+            let copy_at_offset_name = format!("{}_copy_at_offset", G::name());
+
+            let fn_to_scalar = program.get_cached_function(&to_scalar_name)?;
+            let fn_preprocess = program.get_cached_function(&preprocess_name)?;
+            let fn_multiexp_signed = program.get_cached_function(&multiexp_signed_name)?;
+            let fn_reduce_groups = program.get_cached_function(&reduce_groups_name)?;
+            let fn_reduce_windows = program.get_cached_function(&reduce_windows_name)?;
+            let fn_copy_at_offset = program.get_cached_function(&copy_at_offset_name)?;
+
+            // Compute per-group Pippenger params
+            let mut g_max_len = Vec::with_capacity(num_groups);
+            let mut g_ws = Vec::with_capacity(num_groups);
+            let mut g_num_windows = Vec::with_capacity(num_groups);
+            let mut g_num_groups_msm = Vec::with_capacity(num_groups);
+            let mut g_to_scalar_global = Vec::with_capacity(num_groups);
+            let mut g_preprocess_global = Vec::with_capacity(num_groups);
+            let mut g_msm_global = Vec::with_capacity(num_groups);
+            let mut g_reduce_groups_global = Vec::with_capacity(num_groups);
+            let mut g_num_polys = Vec::with_capacity(num_groups);
+            let mut g_poly_counter = vec![0usize; num_groups];
+
+            for (polys, max_len) in &groups {
+                let n_bases = *max_len;
+                let ws = std::cmp::min(((div_ceil(n_bases, work_units) as f64).log2() as usize) + 2, max_window_size);
+                let nw = div_ceil(effective_bits + 1, ws);
+                let ng = work_units / nw;
+
+                g_max_len.push(*max_len);
+                g_ws.push(ws);
+                g_num_windows.push(nw);
+                g_num_groups_msm.push(ng);
+                g_to_scalar_global.push(div_ceil(*max_len, LOCAL_WORK_SIZE));
+                g_preprocess_global.push(div_ceil(n_bases, LOCAL_WORK_SIZE));
+                g_msm_global.push(div_ceil(nw * ng, MSM_LOCAL_WORK_SIZE));
+                g_reduce_groups_global.push(div_ceil(nw, MSM_LOCAL_WORK_SIZE));
+                g_num_polys.push(polys.len());
+            }
+
+            // === Buffer allocation: per-group for upload buffers, per-stream for compute buffers ===
             let t_alloc = std::time::Instant::now();
+
+            // Per-group: fr_buffer (exact-size upload), padded_scratch (CPU), commitments (different poly counts)
+            let mut g_padded_scratch = Vec::with_capacity(num_groups);
+            let mut g_fr_buffer = Vec::with_capacity(num_groups);
+            let mut g_commitments_gpu = Vec::with_capacity(num_groups);
+            for (polys, max_len) in &groups {
+                g_padded_scratch.push(vec![F::ZERO; *max_len]);
+                g_fr_buffer.push(unsafe { program.create_buffer::<F>(*max_len)? });
+                g_commitments_gpu.push(unsafe { program.create_buffer::<G::Group>(polys.len())? });
+            }
+
+            // Per-stream: compute buffers sized to max of all groups on that stream.
+            let mut s_scalar_buffer = Vec::with_capacity(num_streams);
+            let mut s_digits_buffer = Vec::with_capacity(num_streams);
+            let mut s_bucket_buffer = Vec::with_capacity(num_streams);
+            let mut s_multiexp_results = Vec::with_capacity(num_streams);
+            let mut s_window_results = Vec::with_capacity(num_streams);
+            let mut s_final_result = Vec::with_capacity(num_streams);
+
+            for si in 0..num_streams {
+                // Find all groups assigned to this stream
+                let stream_group_indices: Vec<usize> = (si..num_groups).step_by(num_streams).collect();
+
+                // Compute max params across all groups on this stream
+                let max_ml = stream_group_indices.iter().map(|&gi| g_max_len[gi]).max().unwrap();
+                let max_ws = stream_group_indices.iter().map(|&gi| g_ws[gi]).max().unwrap();
+                let max_nw = stream_group_indices.iter().map(|&gi| g_num_windows[gi]).max().unwrap();
+                let max_bpw = 1usize << (max_ws - 1);
+
+                s_scalar_buffer.push(unsafe { program.create_buffer::<F>(max_ml)? });
+                s_digits_buffer.push(unsafe { program.create_buffer::<u16>(max_ml * max_nw)? });
+                s_bucket_buffer.push(unsafe { program.create_buffer::<G::Group>(work_units * max_bpw)? });
+                s_multiexp_results.push(unsafe { program.create_buffer::<G::Group>(work_units)? });
+                s_window_results.push(unsafe { program.create_buffer::<G::Group>(max_nw)? });
+                s_final_result.push(unsafe { program.create_buffer::<G::Group>(1)? });
+            }
+
             let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
 
             // === Interleaved dispatch loop ===
             let t_dispatch = std::time::Instant::now();
             let mut memcpy_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
-            let mut g_poly_counter = vec![0usize; num_groups];
 
             loop {
                 let mut any_active = false;
 
                 for (gi, (polys, _)) in groups.iter().enumerate() {
-                    let si = gi % cs.num_streams;
-                    let pstream = &cs.streams[si];
+                    let si = gi % num_streams;
+                    let stream = &streams[si];
 
                     if g_poly_counter[gi] >= polys.len() {
                         continue;
@@ -1900,72 +1764,67 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
                     // --- memcpy phase: CPU copy + GPU upload ---
                     let t_mc = std::time::Instant::now();
-                    cs.g_padded_scratch[gi][..poly.len()].copy_from_slice(poly);
-                    if poly.len() < g_max_len_vec[gi] {
-                        cs.g_padded_scratch[gi][poly.len()..].fill(F::ZERO);
+                    g_padded_scratch[gi][..poly.len()].copy_from_slice(poly);
+                    if poly.len() < g_max_len[gi] {
+                        g_padded_scratch[gi][poly.len()..].fill(F::ZERO);
                     }
-                    program.write_persistent_buffer_on_persistent_stream(
-                        &mut cs.g_fr_buffer[gi], &cs.g_padded_scratch[gi], pstream)?;
+
+                    // Upload on THIS stream — exact-size match with per-group fr_buffer
+                    program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], &g_padded_scratch[gi], stream)?;
                     memcpy_ns += t_mc.elapsed().as_nanos() as u64;
 
-                    // --- kernel launch phase ---
+                    // --- kernel launch phase (using cached function handles) ---
                     let t_kl = std::time::Instant::now();
 
                     // 1. to_scalar_bytes
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_to_scalar, g_to_scalar_global[gi], LOCAL_WORK_SIZE)
-                        .arg(&cs.g_fr_buffer[gi])
-                        .arg(&cs.s_scalar_buffer[si])
-                        .arg(&(g_max_len_vec[gi] as u32))
+                    program.create_kernel_cached_on_stream(stream, fn_to_scalar, g_to_scalar_global[gi], LOCAL_WORK_SIZE)
+                        .arg(&g_fr_buffer[gi])
+                        .arg(&s_scalar_buffer[si])
+                        .arg(&(g_max_len[gi] as u32))
                         .run_async()?;
 
                     // 2. preprocess_signed_digits
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_preprocess, g_preprocess_global[gi], LOCAL_WORK_SIZE)
-                        .arg(&cs.s_scalar_buffer[si])
-                        .arg(&cs.s_digits_buffer[si])
-                        .arg(&(g_max_len_vec[gi] as u32))
+                    program.create_kernel_cached_on_stream(stream, fn_preprocess, g_preprocess_global[gi], LOCAL_WORK_SIZE)
+                        .arg(&s_scalar_buffer[si])
+                        .arg(&s_digits_buffer[si])
+                        .arg(&(g_max_len[gi] as u32))
                         .arg(&(g_num_windows[gi] as u32))
                         .arg(&(g_ws[gi] as u32))
                         .run_async()?;
 
                     // 3. multiexp_signed
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_multiexp_signed, g_msm_global[gi], MSM_LOCAL_WORK_SIZE)
+                    program.create_kernel_cached_on_stream(stream, fn_multiexp_signed, g_msm_global[gi], MSM_LOCAL_WORK_SIZE)
                         .arg(base_buffer)
-                        .arg(&cs.s_bucket_buffer[si])
-                        .arg(&cs.s_multiexp_results[si])
-                        .arg(&cs.s_digits_buffer[si])
-                        .arg(&(g_max_len_vec[gi] as u32))
+                        .arg(&s_bucket_buffer[si])
+                        .arg(&s_multiexp_results[si])
+                        .arg(&s_digits_buffer[si])
+                        .arg(&(g_max_len[gi] as u32))
                         .arg(&(g_num_groups_msm[gi] as u32))
                         .arg(&(g_num_windows[gi] as u32))
                         .arg(&(g_ws[gi] as u32))
                         .run_async()?;
 
                     // 4. reduce_multiexp_groups
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_reduce_groups, g_reduce_groups_global[gi], MSM_LOCAL_WORK_SIZE)
-                        .arg(&cs.s_multiexp_results[si])
-                        .arg(&cs.s_window_results[si])
+                    program.create_kernel_cached_on_stream(stream, fn_reduce_groups, g_reduce_groups_global[gi], MSM_LOCAL_WORK_SIZE)
+                        .arg(&s_multiexp_results[si])
+                        .arg(&s_window_results[si])
                         .arg(&(g_num_groups_msm[gi] as u32))
                         .arg(&(g_num_windows[gi] as u32))
                         .run_async()?;
 
                     // 5. reduce_windows
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_reduce_windows, 1, 1)
-                        .arg(&cs.s_window_results[si])
-                        .arg(&cs.s_final_result[si])
+                    program.create_kernel_cached_on_stream(stream, fn_reduce_windows, 1, 1)
+                        .arg(&s_window_results[si])
+                        .arg(&s_final_result[si])
                         .arg(&(g_num_windows[gi] as u32))
                         .arg(&(g_ws[gi] as u32))
                         .arg(&(effective_bits as u32))
                         .run_async()?;
 
-                    // 6. copy_at_offset
-                    program.create_kernel_cached_on_persistent_stream(
-                        pstream, cs.fn_copy_at_offset, 1, 1)
-                        .arg(&cs.s_final_result[si])
-                        .arg(&cs.g_commitments_gpu[gi])
+                    // 6. copy_at_offset (commitments buffer is per-group)
+                    program.create_kernel_cached_on_stream(stream, fn_copy_at_offset, 1, 1)
+                        .arg(&s_final_result[si])
+                        .arg(&g_commitments_gpu[gi])
                         .arg(&(poly_i as u32))
                         .run_async()?;
 
@@ -1983,8 +1842,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // Sync all streams
             let t_sync = std::time::Instant::now();
-            for pstream in &cs.streams {
-                pstream.synchronize().map_err(|_e| crate::error::EcError::Simple("Stream sync failed"))?;
+            for stream in &streams {
+                stream.synchronize().map_err(|e| rust_gpu_tools::GPUError::from(e))?;
             }
             let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
 
@@ -1992,8 +1851,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let t_download = std::time::Instant::now();
             let mut all_results = Vec::with_capacity(num_groups);
             for gi in 0..num_groups {
-                let mut results = vec![<G::Group as ark_ff::AdditiveGroup>::ZERO; g_num_polys_vec[gi]];
-                program.read_into_persistent_buffer(&cs.g_commitments_gpu[gi], &mut results)?;
+                let mut results = vec![<G::Group as AdditiveGroup>::ZERO; g_num_polys[gi]];
+                program.read_into_buffer(&g_commitments_gpu[gi], &mut results)?;
                 all_results.push(results);
             }
             let download_ms = t_download.elapsed().as_secs_f64() * 1000.0;

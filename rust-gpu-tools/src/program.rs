@@ -159,43 +159,6 @@ impl Program {
             Self::Opencl(program) => program.pop_context_public(),
         }
     }
-
-    /// Create a persistent stream that can outlive `program.run()` calls.
-    pub fn create_persistent_stream(&self) -> Result<crate::PersistentStream, GPUError> {
-        match self {
-            #[cfg(feature = "cuda")]
-            Self::Cuda(program) => {
-                let s = program.create_stream()?;
-                Ok(crate::PersistentStream::Cuda(s))
-            }
-            #[cfg(feature = "opencl")]
-            Self::Opencl(program) => {
-                let s = program.create_stream()?;
-                Ok(crate::PersistentStream::Opencl(s))
-            }
-        }
-    }
-
-    /// Create a persistent pinned host buffer that can outlive `program.run()` calls.
-    ///
-    /// ### Safety
-    ///
-    /// The buffer contents are uninitialized. The caller must write to all elements
-    /// before passing them to GPU upload functions or reading from them.
-    pub unsafe fn create_persistent_pinned_buffer<T>(&self, length: usize) -> Result<crate::PersistentPinnedBuffer<T>, GPUError> {
-        match self {
-            #[cfg(feature = "cuda")]
-            Self::Cuda(program) => {
-                let b = program.create_pinned_host_buffer(length)?;
-                Ok(crate::PersistentPinnedBuffer::Cuda(b))
-            }
-            #[cfg(feature = "opencl")]
-            Self::Opencl(program) => {
-                let b = program.create_pinned_host_buffer(length)?;
-                Ok(crate::PersistentPinnedBuffer::Opencl(b))
-            }
-        }
-    }
 }
 
 /// Creates two closures, one for CUDA, one for OpenCL for the given one.

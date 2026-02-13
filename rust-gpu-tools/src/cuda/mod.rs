@@ -35,46 +35,6 @@ pub struct Buffer<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
-/// Page-locked (pinned) host memory buffer for truly async GPU transfers.
-///
-/// When `cuMemcpyHtoDAsync` reads from pageable host memory, it implicitly
-/// synchronizes the stream (blocking the CPU ~2-3ms per call). With page-locked
-/// memory allocated via `cuMemAllocHost`, the transfer is truly asynchronous —
-/// the CPU returns immediately and the DMA runs in the background.
-///
-/// Wraps `LockedBuffer<u8>` from rustacuda and provides typed `&[T]` / `&mut [T]`
-/// access for use as staging buffers in multi-stream GPU uploads.
-pub struct PinnedHostBuffer<T> {
-    inner: rustacuda::memory::LockedBuffer<u8>,
-    len: usize,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<T> PinnedHostBuffer<T> {
-    /// Number of T-sized elements.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Returns true if the buffer has zero elements.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<T> std::ops::Deref for PinnedHostBuffer<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        unsafe { std::slice::from_raw_parts(self.inner.as_ptr() as *const T, self.len) }
-    }
-}
-
-impl<T> std::ops::DerefMut for PinnedHostBuffer<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.inner.as_mut_ptr() as *mut T, self.len) }
-    }
-}
-
 /// CUDA specific device.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -451,27 +411,6 @@ impl Program {
         Self::pop_context();
     }
 
-    /// Allocate page-locked (pinned) host memory for truly async GPU transfers.
-    ///
-    /// With pageable host memory, `cuMemcpyHtoDAsync` implicitly synchronizes the
-    /// stream (~2-3ms block per call). With pinned memory, the transfer is truly async.
-    ///
-    /// ### Safety
-    ///
-    /// The buffer contents are uninitialized. The caller must write to all elements
-    /// before passing them to GPU upload functions or reading from them.
-    /// The CUDA context must be active (call within `program.run()` or after `push_context()`).
-    pub unsafe fn create_pinned_host_buffer<T>(&self, length: usize) -> GPUResult<PinnedHostBuffer<T>> {
-        assert!(length > 0);
-        let byte_len = length * std::mem::size_of::<T>();
-        let inner = rustacuda::memory::LockedBuffer::<u8>::uninitialized(byte_len)?;
-        Ok(PinnedHostBuffer {
-            inner,
-            len: length,
-            _phantom: std::marker::PhantomData,
-        })
-    }
-
     /// Look up a kernel function by name with caching.
     ///
     /// First call for a given name does CString allocation + cuModuleGetFunction.
@@ -525,86 +464,6 @@ impl Program {
             local_work_size: lws,
             stream,
             args: Vec::new(),
-        }
-    }
-
-    /// Create a kernel on a specific stream using a cached function handle from a
-    /// PersistentStream.
-    pub fn create_kernel_cached_on_persistent_stream<'a>(
-        &'a self,
-        pstream: &'a crate::PersistentStream,
-        func_handle: usize,
-        gws: usize,
-        lws: usize,
-    ) -> Kernel<'a> {
-        match pstream {
-            crate::PersistentStream::Cuda(ref s) => {
-                self.create_kernel_cached_on_stream(s, func_handle, gws, lws)
-            }
-            #[cfg(feature = "opencl")]
-            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
-        }
-    }
-
-    /// Create a kernel on a PersistentStream (non-cached variant).
-    pub fn create_kernel_on_persistent_stream<'a>(
-        &'a self,
-        pstream: &'a crate::PersistentStream,
-        name: &str,
-        gws: usize,
-        lws: usize,
-    ) -> GPUResult<Kernel<'a>> {
-        match pstream {
-            crate::PersistentStream::Cuda(ref s) => {
-                self.create_kernel_on_stream(s, name, gws, lws)
-            }
-            #[cfg(feature = "opencl")]
-            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
-        }
-    }
-
-    /// Upload data to GPU buffer on a PersistentStream.
-    pub fn write_from_buffer_on_persistent_stream<T>(
-        &self,
-        buffer: &mut Buffer<T>,
-        data: &[T],
-        pstream: &crate::PersistentStream,
-    ) -> GPUResult<()> {
-        match pstream {
-            crate::PersistentStream::Cuda(ref s) => {
-                self.write_from_buffer_on_stream(buffer, data, s)
-            }
-            #[cfg(feature = "opencl")]
-            _ => panic!("Cannot use OpenCL stream with CUDA kernel"),
-        }
-    }
-
-    /// Upload data to a PersistentBuffer on a PersistentStream.
-    pub fn write_persistent_buffer_on_persistent_stream<T>(
-        &self,
-        buffer: &mut crate::PersistentBuffer<T>,
-        data: &[T],
-        pstream: &crate::PersistentStream,
-    ) -> GPUResult<()> {
-        match buffer {
-            crate::PersistentBuffer::Cuda(ref mut b) => {
-                self.write_from_buffer_on_persistent_stream(b, data, pstream)
-            }
-            #[cfg(feature = "opencl")]
-            _ => panic!("Cannot use OpenCL buffer with CUDA program"),
-        }
-    }
-
-    /// Read from a PersistentBuffer into a host slice.
-    pub fn read_into_persistent_buffer<T>(
-        &self,
-        buffer: &crate::PersistentBuffer<T>,
-        data: &mut [T],
-    ) -> GPUResult<()> {
-        match buffer {
-            crate::PersistentBuffer::Cuda(ref b) => self.read_into_buffer(b, data),
-            #[cfg(feature = "opencl")]
-            _ => panic!("Cannot read OpenCL buffer from CUDA program"),
         }
     }
 
