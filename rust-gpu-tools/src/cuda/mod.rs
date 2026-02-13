@@ -18,7 +18,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use log::debug;
-use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer};
+use rustacuda::memory::{AsyncCopyDestination, DeviceBuffer, LockedBuffer};
 pub use rustacuda::stream::Stream;
 use rustacuda::stream::StreamFlags;
 
@@ -34,6 +34,51 @@ pub struct Buffer<T> {
     length: usize,
     _phantom: std::marker::PhantomData<T>,
 }
+
+/// Page-locked (pinned) host memory buffer for truly async GPU transfers.
+///
+/// With pinned memory, `cuMemcpyHtoDAsync` is truly asynchronous: the call
+/// enqueues a DMA and returns immediately (~5μs). No stream sync, no staging copy.
+/// This enables full compute/transfer overlap and true multi-stream concurrency.
+///
+/// Wraps `LockedBuffer<u8>` internally (same bytes-level pattern as `Buffer<T>`
+/// wrapping `DeviceBuffer<u8>`) with typed access via `Deref<Target=[T]>`.
+/// Drop is automatic via `LockedBuffer`'s Drop (calls `cuMemFreeHost`).
+#[derive(Debug)]
+pub struct PinnedHostBuffer<T> {
+    buffer: LockedBuffer<u8>,
+    /// The number of T-sized elements.
+    length: usize,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> std::ops::Deref for PinnedHostBuffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        unsafe {
+            std::slice::from_raw_parts(
+                self.buffer.as_ptr() as *const T,
+                self.length,
+            )
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for PinnedHostBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.buffer.as_mut_ptr() as *mut T,
+                self.length,
+            )
+        }
+    }
+}
+
+// SAFETY: PinnedHostBuffer wraps page-locked host memory allocated via cuMemAllocHost.
+// The memory is not thread-local and can be safely sent between threads.
+unsafe impl<T> Send for PinnedHostBuffer<T> {}
 
 /// CUDA specific device.
 #[derive(Debug, Clone)]
@@ -319,11 +364,41 @@ impl Program {
         })
     }
 
+    /// Allocate a pinned (page-locked) host memory buffer.
+    ///
+    /// Pinned memory enables truly asynchronous `cuMemcpyHtoDAsync`: the call
+    /// enqueues a DMA and returns immediately (~5μs), with no stream sync or
+    /// staging copy. This is critical for multi-stream concurrency.
+    ///
+    /// The buffer is uninitialized; the caller must write data before reading.
+    /// Drop automatically calls `cuMemFreeHost`.
+    ///
+    /// ### Safety
+    ///
+    /// The buffer contents are uninitialized. The caller must write to it before
+    /// passing it as a source for GPU transfers.
+    pub fn create_pinned_host_buffer<T>(&self, length: usize) -> GPUResult<PinnedHostBuffer<T>> {
+        assert!(length > 0);
+        let byte_len = length * std::mem::size_of::<T>();
+        let buffer = unsafe { LockedBuffer::<u8>::uninitialized(byte_len)? };
+        Ok(PinnedHostBuffer {
+            buffer,
+            length,
+            _phantom: std::marker::PhantomData,
+        })
+    }
+
     /// Upload data to GPU buffer on a specific stream.
     ///
-    /// `cuMemcpyHtoDAsync` with pageable host memory implicitly syncs the specified stream
-    /// (waits for that stream's pending ops), then stages data and initiates DMA.
-    /// Other streams' GPU work continues uninterrupted during the sync wait.
+    /// With **pageable** host memory, `cuMemcpyHtoDAsync` implicitly syncs the specified
+    /// stream (waits for that stream's pending ops), then stages data to an internal
+    /// pinned buffer synchronously, then initiates DMA. Each upload forces a stream
+    /// sync + blocking stage copy.
+    ///
+    /// With **pinned** host memory (from `create_pinned_host_buffer`), the call is truly
+    /// async: it enqueues a DMA and returns immediately (~5μs). No stream sync,
+    /// no staging copy. The CUDA driver auto-detects pinned vs pageable memory.
+    ///
     /// Subsequent kernels on this stream will wait for the DMA to complete (stream ordering).
     pub fn write_from_buffer_on_stream<T>(
         &self,

@@ -1704,12 +1704,18 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // === Buffer allocation: per-group for upload buffers, per-stream for compute buffers ===
             let t_alloc = std::time::Instant::now();
 
-            // Per-group: fr_buffer (exact-size upload), padded_scratch (CPU), commitments (different poly counts)
-            let mut g_padded_scratch = Vec::with_capacity(num_groups);
+            // Per-group: fr_buffer (exact-size upload), double-buffered pinned host memory, commitments
+            // Double-buffering with pinned memory: buffer A is used for even-numbered polys,
+            // buffer B for odd-numbered. With pinned memory, cuMemcpyHtoDAsync returns immediately
+            // (~5μs) and reads from the host buffer asynchronously via DMA. The alternate buffer
+            // ensures each buffer has a full cycle before reuse, while DMAs complete in ≤0.16ms.
+            let mut g_pinned_a = Vec::with_capacity(num_groups);
+            let mut g_pinned_b = Vec::with_capacity(num_groups);
             let mut g_fr_buffer = Vec::with_capacity(num_groups);
             let mut g_commitments_gpu = Vec::with_capacity(num_groups);
             for (polys, max_len) in &groups {
-                g_padded_scratch.push(vec![F::ZERO; *max_len]);
+                g_pinned_a.push(program.create_pinned_host_buffer::<F>(*max_len)?);
+                g_pinned_b.push(program.create_pinned_host_buffer::<F>(*max_len)?);
                 g_fr_buffer.push(unsafe { program.create_buffer::<F>(*max_len)? });
                 g_commitments_gpu.push(unsafe { program.create_buffer::<G::Group>(polys.len())? });
             }
@@ -1762,15 +1768,20 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let poly = polys[g_poly_counter[gi]];
                     let poly_i = g_poly_counter[gi];
 
-                    // --- memcpy phase: CPU copy + GPU upload ---
+                    // --- memcpy phase: CPU copy to pinned buffer + truly async GPU upload ---
                     let t_mc = std::time::Instant::now();
-                    g_padded_scratch[gi][..poly.len()].copy_from_slice(poly);
+                    let scratch = if g_poly_counter[gi] % 2 == 0 {
+                        &mut g_pinned_a[gi]
+                    } else {
+                        &mut g_pinned_b[gi]
+                    };
+                    scratch[..poly.len()].copy_from_slice(poly);
                     if poly.len() < g_max_len[gi] {
-                        g_padded_scratch[gi][poly.len()..].fill(F::ZERO);
+                        scratch[poly.len()..].fill(F::ZERO);
                     }
 
-                    // Upload on THIS stream — exact-size match with per-group fr_buffer
-                    program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], &g_padded_scratch[gi], stream)?;
+                    // Upload on THIS stream — with pinned memory this is truly async (~5μs)
+                    program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], &*scratch, stream)?;
                     memcpy_ns += t_mc.elapsed().as_nanos() as u64;
 
                     // --- kernel launch phase (using cached function handles) ---

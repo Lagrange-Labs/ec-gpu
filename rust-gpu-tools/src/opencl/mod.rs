@@ -32,6 +32,30 @@ pub struct Buffer<T> {
     _phantom: std::marker::PhantomData<T>,
 }
 
+/// Host memory buffer for GPU transfers (OpenCL fallback — no actual pinning).
+///
+/// On CUDA, the equivalent type wraps page-locked memory for truly async DMA.
+/// On OpenCL, this is a plain `Vec<T>` wrapper with the same typed-access API,
+/// so that `gpu_buffer.rs` code can use `PinnedHostBuffer<T>` uniformly.
+#[derive(Debug)]
+pub struct PinnedHostBuffer<T> {
+    buffer: Vec<T>,
+}
+
+impl<T> std::ops::Deref for PinnedHostBuffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.buffer
+    }
+}
+
+impl<T> std::ops::DerefMut for PinnedHostBuffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.buffer
+    }
+}
+
 /// OpenCL specific device.
 #[derive(Debug, Clone)]
 pub struct Device {
@@ -456,6 +480,21 @@ impl Program {
     /// Pop context (no-op on OpenCL — no context stack).
     pub fn pop_context_public(&self) {
         // OpenCL doesn't use a context stack
+    }
+
+    /// Allocate a host memory buffer (OpenCL fallback — no actual pinning).
+    ///
+    /// On CUDA, this allocates page-locked memory for truly async DMA transfers.
+    /// On OpenCL, this returns a plain heap-allocated buffer with the same API.
+    ///
+    /// The buffer is uninitialized; the caller must write data before reading.
+    pub fn create_pinned_host_buffer<T>(&self, length: usize) -> GPUResult<PinnedHostBuffer<T>> {
+        assert!(length > 0);
+        let mut buffer = Vec::with_capacity(length);
+        // SAFETY: The caller must write to the buffer before reading.
+        // This matches the CUDA version which also returns uninitialized memory.
+        unsafe { buffer.set_len(length); }
+        Ok(PinnedHostBuffer { buffer })
     }
 
     /// Look up a kernel function by name with caching.
