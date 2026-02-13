@@ -1631,6 +1631,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             .collect();
         eprintln!("[batch_commit_concurrent] {} groups: [{}]", num_groups, group_desc.join(", "));
 
+        let use_pinned = std::env::var("USE_PINNED_HOST_MEMORY")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             let t_total = std::time::Instant::now();
 
@@ -1704,18 +1708,34 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // === Buffer allocation: per-group for upload buffers, per-stream for compute buffers ===
             let t_alloc = std::time::Instant::now();
 
-            // Per-group: fr_buffer (exact-size upload), double-buffered pinned host memory, commitments
-            // Double-buffering with pinned memory: buffer A is used for even-numbered polys,
-            // buffer B for odd-numbered. With pinned memory, cuMemcpyHtoDAsync returns immediately
-            // (~5μs) and reads from the host buffer asynchronously via DMA. The alternate buffer
-            // ensures each buffer has a full cycle before reuse, while DMAs complete in ≤0.16ms.
+            // Per-group: host scratch buffers (pinned or pageable), GPU fr_buffer, commitments
+            // Double-buffering: buffer A is used for even-numbered polys, buffer B for odd-numbered.
+            // With pinned memory, cuMemcpyHtoDAsync returns immediately (~5μs) and reads from
+            // the host buffer asynchronously via DMA. With pageable memory, the driver must stage
+            // copy into an internal pinned buffer first (blocking).
+            let t_host = std::time::Instant::now();
             let mut g_pinned_a = Vec::with_capacity(num_groups);
             let mut g_pinned_b = Vec::with_capacity(num_groups);
+            let mut g_pageable: Vec<Option<Vec<F>>> = Vec::with_capacity(num_groups);
+            if use_pinned {
+                for (_, max_len) in &groups {
+                    g_pinned_a.push(Some(program.create_pinned_host_buffer::<F>(*max_len)?));
+                    g_pinned_b.push(Some(program.create_pinned_host_buffer::<F>(*max_len)?));
+                    g_pageable.push(None);
+                }
+            } else {
+                for (_, max_len) in &groups {
+                    g_pinned_a.push(None);
+                    g_pinned_b.push(None);
+                    g_pageable.push(Some(vec![F::ZERO; *max_len]));
+                }
+            }
+            let host_alloc_ms = t_host.elapsed().as_secs_f64() * 1000.0;
+
+            let t_device = std::time::Instant::now();
             let mut g_fr_buffer = Vec::with_capacity(num_groups);
             let mut g_commitments_gpu = Vec::with_capacity(num_groups);
             for (polys, max_len) in &groups {
-                g_pinned_a.push(program.create_pinned_host_buffer::<F>(*max_len)?);
-                g_pinned_b.push(program.create_pinned_host_buffer::<F>(*max_len)?);
                 g_fr_buffer.push(unsafe { program.create_buffer::<F>(*max_len)? });
                 g_commitments_gpu.push(unsafe { program.create_buffer::<G::Group>(polys.len())? });
             }
@@ -1745,12 +1765,14 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 s_window_results.push(unsafe { program.create_buffer::<G::Group>(max_nw)? });
                 s_final_result.push(unsafe { program.create_buffer::<G::Group>(1)? });
             }
+            let device_alloc_ms = t_device.elapsed().as_secs_f64() * 1000.0;
 
             let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
 
             // === Interleaved dispatch loop ===
             let t_dispatch = std::time::Instant::now();
-            let mut memcpy_ns: u64 = 0;
+            let mut cpu_copy_ns: u64 = 0;
+            let mut dma_enqueue_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
 
             loop {
@@ -1768,21 +1790,30 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let poly = polys[g_poly_counter[gi]];
                     let poly_i = g_poly_counter[gi];
 
-                    // --- memcpy phase: CPU copy to pinned buffer + truly async GPU upload ---
-                    let t_mc = std::time::Instant::now();
-                    let scratch = if g_poly_counter[gi] % 2 == 0 {
-                        &mut g_pinned_a[gi]
+                    // --- CPU copy phase: copy poly data into scratch buffer ---
+                    let t_cpu = std::time::Instant::now();
+                    let scratch: &mut [F] = if use_pinned {
+                        let buf = if g_poly_counter[gi] % 2 == 0 {
+                            g_pinned_a[gi].as_mut().unwrap()
+                        } else {
+                            g_pinned_b[gi].as_mut().unwrap()
+                        };
+                        &mut **buf
                     } else {
-                        &mut g_pinned_b[gi]
+                        g_pageable[gi].as_mut().unwrap().as_mut_slice()
                     };
                     scratch[..poly.len()].copy_from_slice(poly);
                     if poly.len() < g_max_len[gi] {
                         scratch[poly.len()..].fill(F::ZERO);
                     }
+                    cpu_copy_ns += t_cpu.elapsed().as_nanos() as u64;
 
-                    // Upload on THIS stream — with pinned memory this is truly async (~5μs)
-                    program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], &*scratch, stream)?;
-                    memcpy_ns += t_mc.elapsed().as_nanos() as u64;
+                    // --- DMA enqueue phase: upload to GPU ---
+                    // With pinned memory this is truly async (~5μs).
+                    // With pageable memory the driver stages into internal pinned buffer (blocking).
+                    let t_dma = std::time::Instant::now();
+                    program.write_from_buffer_on_stream(&mut g_fr_buffer[gi], scratch, stream)?;
+                    dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
 
                     // --- kernel launch phase (using cached function handles) ---
                     let t_kl = std::time::Instant::now();
@@ -1848,7 +1879,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 }
             }
             let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
-            let memcpy_ms = memcpy_ns as f64 / 1_000_000.0;
+            let cpu_copy_ms = cpu_copy_ns as f64 / 1_000_000.0;
+            let dma_enqueue_ms = dma_enqueue_ns as f64 / 1_000_000.0;
             let launch_ms = launch_ns as f64 / 1_000_000.0;
 
             // Sync all streams
@@ -1870,8 +1902,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms, dispatch: {:.1}ms (memcpy: {:.1}ms, launch: {:.1}ms), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
-                alloc_ms, dispatch_ms, memcpy_ms, launch_ms, sync_ms, download_ms, total_ms
+                "[batch_commit_concurrent] alloc: {:.1}ms (host: {:.1}ms, device: {:.1}ms, pinned={}), dispatch: {:.1}ms (cpu_copy: {:.1}ms, dma_enqueue: {:.1}ms, launch: {:.1}ms), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
+                alloc_ms, host_alloc_ms, device_alloc_ms, use_pinned,
+                dispatch_ms, cpu_copy_ms, dma_enqueue_ms, launch_ms,
+                sync_ms, download_ms, total_ms
             );
 
             Ok(all_results)
