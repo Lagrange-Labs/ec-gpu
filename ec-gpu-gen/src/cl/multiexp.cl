@@ -800,4 +800,152 @@ KERNEL void POINT_accumulate_all_sorted_buckets(
   }
 }
 
+/*
+ * ============================================================================
+ * Batched MSM kernels for batch_commit_concurrent
+ * ============================================================================
+ * These kernels process B same-size polynomials per launch. All polys share
+ * the SAME SRS bases but have per-poly digits. This gives B× more threads
+ * per launch (better occupancy) and B× fewer total launches (less overhead).
+ */
+
+/*
+ * Batched signed-digit multiexp: processes B polynomials in one launch.
+ *
+ * Total threads: batch_size × num_groups × num_windows.
+ * Each poly_idx uses shared bases[0..n] but per-poly digits at
+ * offset poly_idx × n × num_windows.
+ * Each thread has unique buckets (same as original).
+ *
+ * Parameters:
+ *   bases       - shared SRS bases (same for all polys)
+ *   buckets     - per-thread bucket storage, size = batch_size × num_groups × num_windows × bucket_len
+ *   results     - per-thread results, size = batch_size × num_groups × num_windows
+ *   digits      - preprocessed signed digits for B polys, packed contiguously
+ *   n           - elements per poly (NOT B*n)
+ *   num_groups  - groups per poly
+ *   num_windows - windows per poly
+ *   window_size - bits per window
+ *   batch_size  - number of polynomials in this batch
+ */
+KERNEL void POINT_multiexp_signed_batched(
+    GLOBAL POINT_affine *bases,
+    GLOBAL POINT_jacobian *buckets,
+    GLOBAL POINT_jacobian *results,
+    GLOBAL ushort *digits,
+    uint n,
+    uint num_groups,
+    uint num_windows,
+    uint window_size,
+    uint batch_size) {
+  const uint gid = GET_GLOBAL_ID();
+  const uint tpp = num_windows * num_groups;  // threads per poly
+  if(gid >= batch_size * tpp) return;
+  const uint poly_idx = gid / tpp;
+  const uint local_gid = gid % tpp;
+
+  const uint bucket_len = 1 << (window_size - 1);
+  buckets += bucket_len * gid;
+
+  const POINT_jacobian local_zero = POINT_ZERO;
+  for(uint i = 0; i < bucket_len; i++) buckets[i] = local_zero;
+
+  const uint len = (n + num_groups - 1) / num_groups;
+  const uint nstart = len * (local_gid / num_windows);
+  const uint nend = min(nstart + len, n);
+  const uint window = local_gid % num_windows;
+
+  // Per-poly digit offset
+  GLOBAL ushort *my_digits = digits + poly_idx * n * num_windows;
+
+  POINT_jacobian res = POINT_ZERO;
+  for(uint i = nstart; i < nend; i++) {
+    ushort raw = my_digits[i * num_windows + window];
+    uint ind = raw & 0x7FFF;
+    uint sign = (raw >> 15) & 1;
+    if(ind > 0) {
+      POINT_affine base = bases[i];  // SHARED bases
+      if(sign) { base.y = FIELD_sub(FIELD_ZERO, base.y); }
+      #if defined(OPENCL_NVIDIA) || defined(CUDA)
+        if(ind == (bucket_len >> 1)) buckets[(bucket_len >> 1) - 1] = POINT_add_mixed(buckets[(bucket_len >> 1) - 1], base);
+        else buckets[ind - 1] = POINT_add_mixed(buckets[ind - 1], base);
+      #else
+        buckets[ind - 1] = POINT_add_mixed(buckets[ind - 1], base);
+      #endif
+    }
+  }
+
+  POINT_jacobian acc = POINT_ZERO;
+  for(int j = bucket_len - 1; j >= 0; j--) {
+    acc = POINT_add(acc, buckets[j]);
+    res = POINT_add(res, acc);
+  }
+  results[gid] = res;
+}
+
+/*
+ * Batched reduce multiexp groups: sums across groups for each (poly, window) pair.
+ *
+ * Total threads: batch_size × num_windows.
+ * Each thread sums num_groups results for one (poly_idx, window) pair.
+ */
+KERNEL void POINT_reduce_multiexp_groups_batched(
+    GLOBAL POINT_jacobian *results,
+    GLOBAL POINT_jacobian *window_sums,
+    uint num_groups,
+    uint num_windows,
+    uint batch_size) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= batch_size * num_windows) return;
+  const uint poly_idx = gid / num_windows;
+  const uint wid = gid % num_windows;
+  const uint tpp = num_groups * num_windows;
+  POINT_jacobian acc = POINT_ZERO;
+  for (uint g = 0; g < num_groups; g++) {
+    acc = POINT_add(acc, results[poly_idx * tpp + g * num_windows + wid]);
+  }
+  window_sums[gid] = acc;
+}
+
+/*
+ * Batched reduce windows: Horner reduction for each polynomial.
+ *
+ * Total threads: batch_size.
+ * Each thread does Horner reduction across windows for one poly.
+ */
+KERNEL void POINT_reduce_windows_batched(
+    GLOBAL POINT_jacobian *window_results,
+    GLOBAL POINT_jacobian *final_results,
+    uint num_windows,
+    uint window_size,
+    uint effective_bits,
+    uint batch_size) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= batch_size) return;
+  GLOBAL POINT_jacobian *my_windows = window_results + gid * num_windows;
+  POINT_jacobian acc = POINT_ZERO;
+  for (int i = (int)num_windows - 1; i >= 0; i--) {
+    uint w = window_size;
+    uint remaining = effective_bits - (uint)i * window_size;
+    if (w > remaining) w = remaining;
+    for (uint d = 0; d < w; d++) acc = POINT_double(acc);
+    acc = POINT_add(acc, my_windows[i]);
+  }
+  final_results[gid] = acc;
+}
+
+/*
+ * Batched copy: copies B final results to the commitments array.
+ *
+ * Total threads: batch_size.
+ */
+KERNEL void POINT_copy_batch(
+    GLOBAL POINT_jacobian *src,
+    GLOBAL POINT_jacobian *dst,
+    uint dst_offset,
+    uint batch_size) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= batch_size) return;
+  dst[dst_offset + gid] = src[gid];
+}
 
