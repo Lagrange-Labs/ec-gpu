@@ -1739,14 +1739,18 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // === Buffer allocation: per-group for upload, per-stream for compute ===
             let t_alloc = std::time::Instant::now();
             // Per-group: pageable scratch buffers sized for B × max_len.
-            // Pageable DMA blocks the stream but is amortized over B polys per transfer.
-            // Pinned (cuMemAllocHost) is avoided entirely — it costs ~850ms for large buffers
-            // and the async DMA benefit is negligible with only ~48 batch DMAs.
+            // We skip zero-initialization (vec![F::ZERO; n] costs ~780ms for 2.1GB).
+            // SAFETY: F is Copy with no Drop. Every element is written before read:
+            //   - poly data via copy_from_slice in the dispatch loop
+            //   - tail padding via fill(F::ZERO) for partial batches (b < B)
+            // Vec::with_capacity uses mmap which is near-instant (lazy page allocation).
             let t_host = std::time::Instant::now();
             let mut g_scratch: Vec<Vec<F>> = Vec::with_capacity(num_groups);
             for gi in 0..num_groups {
                 let batch_len = g_batch_size[gi] * g_max_len[gi];
-                g_scratch.push(vec![F::ZERO; batch_len]);
+                let mut buf = Vec::<F>::with_capacity(batch_len);
+                unsafe { buf.set_len(batch_len); }
+                g_scratch.push(buf);
             }
             let host_alloc_ms = t_host.elapsed().as_secs_f64() * 1000.0;
 
