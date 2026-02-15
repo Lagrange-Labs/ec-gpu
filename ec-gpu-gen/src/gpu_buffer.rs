@@ -1634,8 +1634,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let use_pinned = std::env::var("USE_PINNED_HOST_MEMORY")
             .map(|v| v != "0")
             .unwrap_or(true);
-        eprintln!("[batch_commit_concurrent] USE_PINNED_HOST_MEMORY={}", use_pinned);
-
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             let t_total = std::time::Instant::now();
 
@@ -1706,10 +1704,21 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 g_num_polys.push(polys.len());
             }
 
+            // Log Pippenger params per group
+            for gi in 0..num_groups {
+                let bases_per_group = div_ceil(g_max_len[gi], g_num_groups_msm[gi]);
+                let bucket_len = 1usize << (g_ws[gi] - 1);
+                let adds_per_thread = bases_per_group + bucket_len * 2;
+                let bucket_bytes = bucket_len * std::mem::size_of::<G::Group>();
+                eprintln!(
+                    "[batch_commit_concurrent] group {}: {}×{} polys, ws={}, nw={}, ng={}, bases/group={}, buckets={}, adds/thread={}, bucket_mem/thread={}B, threads={}",
+                    gi, g_max_len[gi], g_num_polys[gi], g_ws[gi], g_num_windows[gi], g_num_groups_msm[gi],
+                    bases_per_group, bucket_len, adds_per_thread, bucket_bytes, g_num_windows[gi] * g_num_groups_msm[gi]
+                );
+            }
+
             // === Buffer allocation: per-group for upload buffers, per-stream for compute buffers ===
             let t_alloc = std::time::Instant::now();
-            eprintln!("[batch_commit_concurrent] inside closure: use_pinned={}", use_pinned);
-
             // Per-group: host scratch buffers (pinned or pageable), GPU fr_buffer, commitments
             // Double-buffering: buffer A is used for even-numbered polys, buffer B for odd-numbered.
             // With pinned memory, cuMemcpyHtoDAsync returns immediately (~5μs) and reads from
