@@ -1838,15 +1838,17 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     // --- CPU copy phase: pack B polys into scratch ---
                     let t_cpu = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
+                    let full_buf_len = g_batch_size[gi] * g_max_len[gi];
+                    // Use full buffer (not sliced) — async_copy_from requires exact size match
                     let scratch: &mut [F] = if use_pinned {
                         let buf = if batch_iteration[gi] % 2 == 0 {
                             g_pinned_a[gi].as_mut().unwrap()
                         } else {
                             g_pinned_b[gi].as_mut().unwrap()
                         };
-                        &mut buf[..batch_len]
+                        &mut **buf
                     } else {
-                        &mut g_pageable[gi].as_mut().unwrap()[..batch_len]
+                        g_pageable[gi].as_mut().unwrap().as_mut_slice()
                     };
                     for bi in 0..b {
                         let poly = polys[g_poly_counter[gi] + bi];
@@ -1856,17 +1858,22 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             scratch[offset + poly.len()..offset + g_max_len[gi]].fill(F::ZERO);
                         }
                     }
+                    // Zero-fill remaining slots when last batch has b < B
+                    // (stale data wouldn't be read by kernels, but avoids DMA of uninitialized memory)
+                    if batch_len < full_buf_len {
+                        scratch[batch_len..full_buf_len].fill(F::ZERO);
+                    }
                     cpu_copy_ns += t_cpu.elapsed().as_nanos() as u64;
 
-                    // --- DMA enqueue phase: upload B × max_len elements ---
+                    // --- DMA enqueue phase: upload full buffer (async_copy_from requires exact size match) ---
                     let t_dma = std::time::Instant::now();
                     program.write_from_buffer_on_stream(
-                        &mut g_fr_buffer[gi], &scratch[..batch_len], stream)?;
+                        &mut g_fr_buffer[gi], &scratch[..full_buf_len], stream)?;
                     dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
 
                     // --- kernel launch phase ---
                     let t_kl = std::time::Instant::now();
-                    let n_total = batch_len; // B × max_len
+                    let n_total = batch_len; // b × max_len (only process valid elements)
 
                     // 1. to_scalar_bytes: n = B × max_len (unchanged kernel, processes all elements)
                     program.create_kernel_cached_on_stream(stream, fn_to_scalar,
