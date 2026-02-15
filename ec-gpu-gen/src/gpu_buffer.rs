@@ -1741,20 +1741,23 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // === Buffer allocation: per-group for upload, per-stream for compute ===
             let t_alloc = std::time::Instant::now();
-            // Per-group: host scratch buffers sized for B × max_len (double-buffered for async DMA)
+            // Per-group: host scratch buffers sized for B × max_len
+            // With batching (B > 1), use pageable Vec — pinned cuMemAllocHost at B × max_len
+            // is ~1400ms for large batches. Pageable DMA blocks the stream but is amortized
+            // over B polys per transfer (~48 DMAs total instead of ~1361).
+            // For B == 1, use pinned + double-buffering for async per-poly pipelining.
             let t_host = std::time::Instant::now();
             let mut g_pinned_a = Vec::with_capacity(num_groups);
             let mut g_pinned_b = Vec::with_capacity(num_groups);
             let mut g_pageable: Vec<Option<Vec<F>>> = Vec::with_capacity(num_groups);
-            if use_pinned {
-                for gi in 0..num_groups {
-                    let batch_len = g_batch_size[gi] * g_max_len[gi];
-                    g_pinned_a.push(Some(program.create_pinned_host_buffer::<F>(batch_len)?));
-                    g_pinned_b.push(Some(program.create_pinned_host_buffer::<F>(batch_len)?));
+            for gi in 0..num_groups {
+                if use_pinned && g_batch_size[gi] == 1 {
+                    // B == 1: use pinned + double-buffering for async per-poly DMA
+                    g_pinned_a.push(Some(program.create_pinned_host_buffer::<F>(g_max_len[gi])?));
+                    g_pinned_b.push(Some(program.create_pinned_host_buffer::<F>(g_max_len[gi])?));
                     g_pageable.push(None);
-                }
-            } else {
-                for gi in 0..num_groups {
+                } else {
+                    // B > 1: use pageable Vec (fast alloc, blocking DMA amortized over B polys)
                     let batch_len = g_batch_size[gi] * g_max_len[gi];
                     g_pinned_a.push(None);
                     g_pinned_b.push(None);
@@ -1839,8 +1842,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let t_cpu = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
                     let full_buf_len = g_batch_size[gi] * g_max_len[gi];
-                    // Use full buffer (not sliced) — async_copy_from requires exact size match
-                    let scratch: &mut [F] = if use_pinned {
+                    let scratch: &mut [F] = if g_pinned_a[gi].is_some() {
+                        // B == 1: pinned double-buffered path
                         let buf = if batch_iteration[gi] % 2 == 0 {
                             g_pinned_a[gi].as_mut().unwrap()
                         } else {
@@ -1848,6 +1851,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         };
                         &mut **buf
                     } else {
+                        // B >= 1: pageable path
                         g_pageable[gi].as_mut().unwrap().as_mut_slice()
                     };
                     for bi in 0..b {
@@ -1859,13 +1863,16 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                         }
                     }
                     // Zero-fill remaining slots when last batch has b < B
-                    // (stale data wouldn't be read by kernels, but avoids DMA of uninitialized memory)
+                    // (async_copy_from requires exact size match with GPU buffer)
                     if batch_len < full_buf_len {
                         scratch[batch_len..full_buf_len].fill(F::ZERO);
                     }
                     cpu_copy_ns += t_cpu.elapsed().as_nanos() as u64;
 
-                    // --- DMA enqueue phase: upload full buffer (async_copy_from requires exact size match) ---
+                    // --- DMA enqueue phase: upload full buffer ---
+                    // async_copy_from requires exact size match between host and device slices.
+                    // With pinned memory (B==1) this is truly async; with pageable (B>1)
+                    // the driver stages through internal pinned buffer (blocking, amortized over B polys).
                     let t_dma = std::time::Instant::now();
                     program.write_from_buffer_on_stream(
                         &mut g_fr_buffer[gi], &scratch[..full_buf_len], stream)?;
@@ -2018,9 +2025,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let download_ms = t_download.elapsed().as_secs_f64() * 1000.0;
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
+            let pinned_groups = g_pinned_a.iter().filter(|p| p.is_some()).count();
+            let pageable_groups = g_pageable.iter().filter(|p| p.is_some()).count();
             eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms (host: {:.1}ms, device: {:.1}ms, pinned={}), dispatch: {:.1}ms (cpu_copy: {:.1}ms, dma_enqueue: {:.1}ms, launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
-                alloc_ms, host_alloc_ms, device_alloc_ms, use_pinned,
+                "[batch_commit_concurrent] alloc: {:.1}ms (host: {:.1}ms, device: {:.1}ms, pinned_groups={}, pageable_groups={}), dispatch: {:.1}ms (cpu_copy: {:.1}ms, dma_enqueue: {:.1}ms, launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
+                alloc_ms, host_alloc_ms, device_alloc_ms, pinned_groups, pageable_groups,
                 dispatch_ms, cpu_copy_ms, dma_enqueue_ms, launch_ms, total_batch_iters,
                 sync_ms, download_ms, total_ms
             );
