@@ -1789,12 +1789,28 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             }
             let device_alloc_ms = t_device.elapsed().as_secs_f64() * 1000.0;
 
+            // Pinned staging: 2 small buffers for double-buffered async DMA.
+            // Only allocated if any B>1 group has polys that fit.
+            let staging_capacity_elems: usize = 1024 * 1024; // ~32MB for F=32B (1M elements)
+            let needs_staging = (0..num_groups).any(|gi|
+                g_batch_size[gi] > 1 && g_max_len[gi] <= staging_capacity_elems);
+
+            let (mut pinned_a, mut pinned_b) = if needs_staging {
+                let t_pin = std::time::Instant::now();
+                let a = program.create_pinned_host_buffer::<F>(staging_capacity_elems)?;
+                let b = program.create_pinned_host_buffer::<F>(staging_capacity_elems)?;
+                let pin_ms = t_pin.elapsed().as_secs_f64() * 1000.0;
+                eprintln!("[batch_commit_concurrent] pinned staging: 2 × {}MB, alloc {:.1}ms",
+                    staging_capacity_elems * std::mem::size_of::<F>() / (1024*1024), pin_ms);
+                (Some(a), Some(b))
+            } else {
+                (None, None)
+            };
+            let mut use_pinned_a = true;
+
             let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
 
             // === Interleaved batched dispatch loop ===
-            // Scatter DMA: each poly is DMA'd directly from its source slice to the
-            // correct offset in the GPU buffer. No intermediate scratch buffer needed.
-            // This eliminates ~1700ms of CPU memcpy + page faults.
             let t_dispatch = std::time::Instant::now();
             let mut dma_enqueue_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
@@ -1815,39 +1831,52 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let remaining = polys.len() - g_poly_counter[gi];
                     let b = std::cmp::min(g_batch_size[gi], remaining);
 
-                    // --- Merged scatter DMA: merge consecutive contiguous polys ---
-                    // If polys are adjacent in memory, merge them into a single large
-                    // DMA call. This reduces per-call overhead (stream sync + staging)
-                    // from ~1430 small calls to potentially ~48 large calls.
+                    // --- DMA: three-branch dispatch ---
                     let t_dma = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
-                    let mut bi = 0;
                     let mut dma_calls = 0u32;
-                    while bi < b {
-                        let start_poly = polys[g_poly_counter[gi] + bi];
-                        debug_assert_eq!(start_poly.len(), g_max_len[gi],
-                            "All polys in a group must have length == max_len");
-                        let start_ptr = start_poly.as_ptr();
-                        let mut merged_count = 1usize;
 
-                        // Greedily merge consecutive contiguous polys
-                        while bi + merged_count < b {
-                            let next_poly = polys[g_poly_counter[gi] + bi + merged_count];
-                            let expected_ptr = unsafe { start_ptr.add(merged_count * g_max_len[gi]) };
-                            if next_poly.as_ptr() != expected_ptr {
-                                break;
-                            }
-                            merged_count += 1;
-                        }
-
-                        let merged_slice = unsafe {
-                            std::slice::from_raw_parts(start_ptr, merged_count * g_max_len[gi])
-                        };
-                        let offset = bi * g_max_len[gi];
+                    if b == 1 {
+                        // B=1: direct DMA, no packing benefit
+                        let poly = polys[g_poly_counter[gi]];
                         program.write_from_buffer_at_offset_on_stream(
-                            &mut g_fr_buffer[gi], merged_slice, offset, stream)?;
-                        bi += merged_count;
+                            &mut g_fr_buffer[gi], poly, 0, stream)?;
                         dma_calls += 1;
+                    } else if g_max_len[gi] <= staging_capacity_elems && pinned_a.is_some() {
+                        // Pinned staging: sub-batch polys into pinned buffer, async DMA
+                        let polys_per_sub = staging_capacity_elems / g_max_len[gi];
+                        let mut bi = 0;
+                        while bi < b {
+                            let sub_count = std::cmp::min(polys_per_sub, b - bi);
+                            let pinned = if use_pinned_a {
+                                pinned_a.as_mut().unwrap()
+                            } else {
+                                pinned_b.as_mut().unwrap()
+                            };
+                            // Pack sub_count polys into pinned staging
+                            for si_inner in 0..sub_count {
+                                let poly = polys[g_poly_counter[gi] + bi + si_inner];
+                                let off = si_inner * g_max_len[gi];
+                                pinned[off..off + poly.len()].copy_from_slice(poly);
+                            }
+                            // Async DMA from pinned (truly async, ~5μs)
+                            let gpu_offset = bi * g_max_len[gi];
+                            let data_len = sub_count * g_max_len[gi];
+                            program.write_from_buffer_at_offset_on_stream(
+                                &mut g_fr_buffer[gi], &pinned[..data_len], gpu_offset, stream)?;
+                            use_pinned_a = !use_pinned_a;
+                            bi += sub_count;
+                            dma_calls += 1;
+                        }
+                    } else {
+                        // Fallback: scatter DMA (per-poly, same as original)
+                        for bi in 0..b {
+                            let poly = polys[g_poly_counter[gi] + bi];
+                            let offset = bi * g_max_len[gi];
+                            program.write_from_buffer_at_offset_on_stream(
+                                &mut g_fr_buffer[gi], poly, offset, stream)?;
+                            dma_calls += 1;
+                        }
                     }
                     dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
                     total_dma_calls += dma_calls;
