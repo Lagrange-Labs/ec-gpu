@@ -417,6 +417,35 @@ impl Program {
         Ok(())
     }
 
+    /// Upload data to a specific offset within a GPU buffer on a stream.
+    ///
+    /// Writes `data.len()` elements starting at `offset` (in T-sized elements)
+    /// within the device buffer. Same pageable/pinned semantics as
+    /// `write_from_buffer_on_stream`.
+    pub fn write_from_buffer_at_offset_on_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        offset: usize,
+        stream: &Stream,
+    ) -> GPUResult<()> {
+        assert!(
+            offset + data.len() <= buffer.length,
+            "Buffer write would overflow (offset={}, len={}, capacity={})",
+            offset, data.len(), buffer.length
+        );
+        let elem_size = std::mem::size_of::<T>();
+        let byte_offset = offset * elem_size;
+        let byte_len = data.len() * elem_size;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len)
+        };
+        let (_, right) = buffer.buffer.split_at_mut(byte_offset);
+        let (target, _) = right.split_at_mut(byte_len);
+        unsafe { target.async_copy_from(bytes, stream)? };
+        Ok(())
+    }
+
     /// Reads data from the GPU into an existing buffer.
     pub fn read_into_buffer<T>(&self, buffer: &Buffer<T>, data: &mut [T]) -> GPUResult<()> {
         assert!(data.len() <= buffer.length, "Buffer is too small");

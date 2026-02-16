@@ -1738,21 +1738,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // === Buffer allocation: per-group for upload, per-stream for compute ===
             let t_alloc = std::time::Instant::now();
-            // Per-group: pageable scratch buffers sized for B × max_len.
-            // We skip zero-initialization (vec![F::ZERO; n] costs ~780ms for 2.1GB).
-            // SAFETY: F is Copy with no Drop. Every element is written before read:
-            //   - poly data via copy_from_slice in the dispatch loop
-            //   - tail padding via fill(F::ZERO) for partial batches (b < B)
-            // Vec::with_capacity uses mmap which is near-instant (lazy page allocation).
-            let t_host = std::time::Instant::now();
-            let mut g_scratch: Vec<Vec<F>> = Vec::with_capacity(num_groups);
-            for gi in 0..num_groups {
-                let batch_len = g_batch_size[gi] * g_max_len[gi];
-                let mut buf = Vec::<F>::with_capacity(batch_len);
-                unsafe { buf.set_len(batch_len); }
-                g_scratch.push(buf);
-            }
-            let host_alloc_ms = t_host.elapsed().as_secs_f64() * 1000.0;
 
             let t_device = std::time::Instant::now();
             // Per-group: GPU fr_buffer sized for B × max_len, commitments for all polys
@@ -1807,8 +1792,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
 
             // === Interleaved batched dispatch loop ===
+            // Scatter DMA: each poly is DMA'd directly from its source slice to the
+            // correct offset in the GPU buffer. No intermediate scratch buffer needed.
+            // This eliminates ~1700ms of CPU memcpy + page faults.
             let t_dispatch = std::time::Instant::now();
-            let mut cpu_copy_ns: u64 = 0;
             let mut dma_enqueue_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
             let mut batch_iteration = vec![0usize; num_groups];
@@ -1826,32 +1813,17 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let remaining = polys.len() - g_poly_counter[gi];
                     let b = std::cmp::min(g_batch_size[gi], remaining);
 
-                    // --- CPU copy phase: pack B polys into scratch ---
-                    let t_cpu = std::time::Instant::now();
+                    // --- Scatter DMA: upload each poly directly to its offset ---
+                    let t_dma = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
-                    let full_buf_len = g_batch_size[gi] * g_max_len[gi];
-                    let scratch = g_scratch[gi].as_mut_slice();
                     for bi in 0..b {
                         let poly = polys[g_poly_counter[gi] + bi];
+                        debug_assert_eq!(poly.len(), g_max_len[gi],
+                            "All polys in a group must have length == max_len");
                         let offset = bi * g_max_len[gi];
-                        scratch[offset..offset + poly.len()].copy_from_slice(poly);
-                        if poly.len() < g_max_len[gi] {
-                            scratch[offset + poly.len()..offset + g_max_len[gi]].fill(F::ZERO);
-                        }
+                        program.write_from_buffer_at_offset_on_stream(
+                            &mut g_fr_buffer[gi], poly, offset, stream)?;
                     }
-                    // Zero-fill remaining slots when last batch has b < B
-                    // (async_copy_from requires exact size match with GPU buffer)
-                    if batch_len < full_buf_len {
-                        scratch[batch_len..full_buf_len].fill(F::ZERO);
-                    }
-                    cpu_copy_ns += t_cpu.elapsed().as_nanos() as u64;
-
-                    // --- DMA enqueue phase: upload full buffer ---
-                    // async_copy_from requires exact size match between host and device slices.
-                    // Pageable DMA blocks the stream but is amortized over B polys per transfer.
-                    let t_dma = std::time::Instant::now();
-                    program.write_from_buffer_on_stream(
-                        &mut g_fr_buffer[gi], scratch, stream)?;
                     dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
 
                     // --- kernel launch phase ---
@@ -1978,7 +1950,6 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 }
             }
             let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
-            let cpu_copy_ms = cpu_copy_ns as f64 / 1_000_000.0;
             let dma_enqueue_ms = dma_enqueue_ns as f64 / 1_000_000.0;
             let launch_ms = launch_ns as f64 / 1_000_000.0;
             let total_batch_iters: usize = batch_iteration.iter().sum();
@@ -2002,9 +1973,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms (host: {:.1}ms, device: {:.1}ms), dispatch: {:.1}ms (cpu_copy: {:.1}ms, dma_enqueue: {:.1}ms, launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
-                alloc_ms, host_alloc_ms, device_alloc_ms,
-                dispatch_ms, cpu_copy_ms, dma_enqueue_ms, launch_ms, total_batch_iters,
+                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (scatter_dma: {:.1}ms, launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
+                alloc_ms, device_alloc_ms,
+                dispatch_ms, dma_enqueue_ms, launch_ms, total_batch_iters,
                 sync_ms, download_ms, total_ms
             );
 
