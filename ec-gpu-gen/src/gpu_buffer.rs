@@ -1856,27 +1856,13 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             } else {
                                 pinned_b.as_mut().unwrap()
                             };
-                            // Parallel pack: each poly writes to a disjoint region
+                            // Serial pack into pinned staging
                             let t_pack = std::time::Instant::now();
-                            // SAFETY: each thread writes to pinned[si_inner*max_len .. (si_inner+1)*max_len],
-                            // disjoint regions. pinned_ptr is valid for staging_capacity_elems elements.
-                            // Cast to usize for Send+Sync (raw pointers are !Sync).
-                            let pinned_addr = pinned.as_mut_ptr() as usize;
-                            let base_idx = g_poly_counter[gi] + bi;
-                            let poly_slice = &polys[base_idx..base_idx + sub_count];
-                            rayon::iter::ParallelIterator::for_each(
-                                rayon::iter::IntoParallelIterator::into_par_iter(0..sub_count),
-                                |si_inner| {
-                                    let poly = poly_slice[si_inner];
-                                    let off = si_inner * max_len;
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            poly.as_ptr(),
-                                            (pinned_addr as *mut F).add(off),
-                                            poly.len(),
-                                        );
-                                    }
-                                });
+                            for si_inner in 0..sub_count {
+                                let poly = polys[g_poly_counter[gi] + bi + si_inner];
+                                let off = si_inner * max_len;
+                                pinned[off..off + poly.len()].copy_from_slice(poly);
+                            }
                             pack_ns += t_pack.elapsed().as_nanos() as u64;
                             // Async DMA from pinned
                             let t_dma = std::time::Instant::now();
