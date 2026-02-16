@@ -1798,6 +1798,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let t_dispatch = std::time::Instant::now();
             let mut dma_enqueue_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
+            let mut total_dma_calls: u32 = 0;
+            let mut total_poly_dmas: usize = 0;
             let mut batch_iteration = vec![0usize; num_groups];
 
             loop {
@@ -1813,18 +1815,43 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let remaining = polys.len() - g_poly_counter[gi];
                     let b = std::cmp::min(g_batch_size[gi], remaining);
 
-                    // --- Scatter DMA: upload each poly directly to its offset ---
+                    // --- Merged scatter DMA: merge consecutive contiguous polys ---
+                    // If polys are adjacent in memory, merge them into a single large
+                    // DMA call. This reduces per-call overhead (stream sync + staging)
+                    // from ~1430 small calls to potentially ~48 large calls.
                     let t_dma = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
-                    for bi in 0..b {
-                        let poly = polys[g_poly_counter[gi] + bi];
-                        debug_assert_eq!(poly.len(), g_max_len[gi],
+                    let mut bi = 0;
+                    let mut dma_calls = 0u32;
+                    while bi < b {
+                        let start_poly = polys[g_poly_counter[gi] + bi];
+                        debug_assert_eq!(start_poly.len(), g_max_len[gi],
                             "All polys in a group must have length == max_len");
+                        let start_ptr = start_poly.as_ptr();
+                        let mut merged_count = 1usize;
+
+                        // Greedily merge consecutive contiguous polys
+                        while bi + merged_count < b {
+                            let next_poly = polys[g_poly_counter[gi] + bi + merged_count];
+                            let expected_ptr = unsafe { start_ptr.add(merged_count * g_max_len[gi]) };
+                            if next_poly.as_ptr() != expected_ptr {
+                                break;
+                            }
+                            merged_count += 1;
+                        }
+
+                        let merged_slice = unsafe {
+                            std::slice::from_raw_parts(start_ptr, merged_count * g_max_len[gi])
+                        };
                         let offset = bi * g_max_len[gi];
                         program.write_from_buffer_at_offset_on_stream(
-                            &mut g_fr_buffer[gi], poly, offset, stream)?;
+                            &mut g_fr_buffer[gi], merged_slice, offset, stream)?;
+                        bi += merged_count;
+                        dma_calls += 1;
                     }
                     dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
+                    total_dma_calls += dma_calls;
+                    total_poly_dmas += b;
 
                     // --- kernel launch phase ---
                     let t_kl = std::time::Instant::now();
@@ -1973,9 +2000,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (scatter_dma: {:.1}ms, launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
+                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (dma: {:.1}ms [{} calls for {} polys], launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
                 alloc_ms, device_alloc_ms,
-                dispatch_ms, dma_enqueue_ms, launch_ms, total_batch_iters,
+                dispatch_ms, dma_enqueue_ms, total_dma_calls, total_poly_dmas, launch_ms, total_batch_iters,
                 sync_ms, download_ms, total_ms
             );
 
