@@ -1812,6 +1812,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
 
             // === Interleaved batched dispatch loop ===
             let t_dispatch = std::time::Instant::now();
+            let mut pack_ns: u64 = 0;
             let mut dma_enqueue_ns: u64 = 0;
             let mut launch_ns: u64 = 0;
             let mut total_dma_calls: u32 = 0;
@@ -1832,19 +1833,21 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let b = std::cmp::min(g_batch_size[gi], remaining);
 
                     // --- DMA: three-branch dispatch ---
-                    let t_dma = std::time::Instant::now();
                     let batch_len = b * g_max_len[gi];
                     let mut dma_calls = 0u32;
 
                     if b == 1 {
                         // B=1: direct DMA, no packing benefit
+                        let t_dma = std::time::Instant::now();
                         let poly = polys[g_poly_counter[gi]];
                         program.write_from_buffer_at_offset_on_stream(
                             &mut g_fr_buffer[gi], poly, 0, stream)?;
+                        dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
                         dma_calls += 1;
                     } else if g_max_len[gi] <= staging_capacity_elems && pinned_a.is_some() {
-                        // Pinned staging: sub-batch polys into pinned buffer, async DMA
+                        // Pinned staging: pack polys into pinned buffer, async DMA
                         let polys_per_sub = staging_capacity_elems / g_max_len[gi];
+                        let max_len = g_max_len[gi];
                         let mut bi = 0;
                         while bi < b {
                             let sub_count = std::cmp::min(polys_per_sub, b - bi);
@@ -1853,23 +1856,42 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             } else {
                                 pinned_b.as_mut().unwrap()
                             };
-                            // Pack sub_count polys into pinned staging
-                            for si_inner in 0..sub_count {
-                                let poly = polys[g_poly_counter[gi] + bi + si_inner];
-                                let off = si_inner * g_max_len[gi];
-                                pinned[off..off + poly.len()].copy_from_slice(poly);
-                            }
-                            // Async DMA from pinned (truly async, ~5μs)
-                            let gpu_offset = bi * g_max_len[gi];
-                            let data_len = sub_count * g_max_len[gi];
+                            // Parallel pack: each poly writes to a disjoint region
+                            let t_pack = std::time::Instant::now();
+                            // SAFETY: each thread writes to pinned[si_inner*max_len .. (si_inner+1)*max_len],
+                            // disjoint regions. pinned_ptr is valid for staging_capacity_elems elements.
+                            // Cast to usize for Send+Sync (raw pointers are !Sync).
+                            let pinned_addr = pinned.as_mut_ptr() as usize;
+                            let base_idx = g_poly_counter[gi] + bi;
+                            let poly_slice = &polys[base_idx..base_idx + sub_count];
+                            rayon::iter::ParallelIterator::for_each(
+                                rayon::iter::IntoParallelIterator::into_par_iter(0..sub_count),
+                                |si_inner| {
+                                    let poly = poly_slice[si_inner];
+                                    let off = si_inner * max_len;
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            poly.as_ptr(),
+                                            (pinned_addr as *mut F).add(off),
+                                            poly.len(),
+                                        );
+                                    }
+                                });
+                            pack_ns += t_pack.elapsed().as_nanos() as u64;
+                            // Async DMA from pinned
+                            let t_dma = std::time::Instant::now();
+                            let gpu_offset = bi * max_len;
+                            let data_len = sub_count * max_len;
                             program.write_from_buffer_at_offset_on_stream(
                                 &mut g_fr_buffer[gi], &pinned[..data_len], gpu_offset, stream)?;
+                            dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
                             use_pinned_a = !use_pinned_a;
                             bi += sub_count;
                             dma_calls += 1;
                         }
                     } else {
                         // Fallback: scatter DMA (per-poly, same as original)
+                        let t_dma = std::time::Instant::now();
                         for bi in 0..b {
                             let poly = polys[g_poly_counter[gi] + bi];
                             let offset = bi * g_max_len[gi];
@@ -1877,8 +1899,8 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                                 &mut g_fr_buffer[gi], poly, offset, stream)?;
                             dma_calls += 1;
                         }
+                        dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
                     }
-                    dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
                     total_dma_calls += dma_calls;
                     total_poly_dmas += b;
 
@@ -2006,6 +2028,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 }
             }
             let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
+            let pack_ms = pack_ns as f64 / 1_000_000.0;
             let dma_enqueue_ms = dma_enqueue_ns as f64 / 1_000_000.0;
             let launch_ms = launch_ns as f64 / 1_000_000.0;
             let total_batch_iters: usize = batch_iteration.iter().sum();
@@ -2029,9 +2052,9 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
             eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (dma: {:.1}ms [{} calls for {} polys], launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
+                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (pack: {:.1}ms, dma: {:.1}ms [{} calls for {} polys], launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
                 alloc_ms, device_alloc_ms,
-                dispatch_ms, dma_enqueue_ms, total_dma_calls, total_poly_dmas, launch_ms, total_batch_iters,
+                dispatch_ms, pack_ms, dma_enqueue_ms, total_dma_calls, total_poly_dmas, launch_ms, total_batch_iters,
                 sync_ms, download_ms, total_ms
             );
 
