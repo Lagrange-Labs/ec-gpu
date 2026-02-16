@@ -1,11 +1,11 @@
 #![warn(missing_docs)]
-//! CUDA/OpenCL code generator for finite-field arithmetic over prime fields and elliptic curve
+//! CUDA code generator for finite-field arithmetic over prime fields and elliptic curve
 //! arithmetic constructed with Rust.
 //!
 //! There is also support for Fast Fourier Transform and Multiexponentiation.
 //!
-//! This crate usually creates GPU kernels at compile-time. CUDA generates a [fatbin], which OpenCL
-//! only generates the source code, which is then compiled at run-time.
+//! This crate creates GPU kernels at compile-time. CUDA generates a [fatbin] that is embedded
+//! into the binary.
 //!
 //! In order to make things easier to use, there are helper functions available. You would put some
 //! code into `build.rs`, that generates the kernels, and some code into your library which then
@@ -23,9 +23,8 @@
 //! ```
 //!
 //! The `ec_gpu_gen::generate()` takes care of the actual code generation/compilation. It will
-//! automatically create a CUDA and/or OpenCL kernel. It will define two environment variables,
-//! which are meant for internal use. `_EC_GPU_CUDA_KERNEL_FATBIN` that points to the compiled
-//! CUDA kernel, and `_EC_GPU_OPENCL_KERNEL_SOURCE` that points to the generated OpenCL source.
+//! create a CUDA kernel. It defines the `_EC_GPU_CUDA_KERNEL_FATBIN` environment variable
+//! that points to the compiled CUDA kernel.
 //!
 //! Those variables are then picked up by the `ec_gpu_gen::program!()` macro, which generates a
 //! program, for a given GPU device. Using FFT within your library would then look like this:
@@ -48,44 +47,44 @@
 //! Feature flags
 //! -------------
 //!
-//! CUDA and OpenCL are supported, each be enabled with the `cuda` and `opencl` [feature flags].
+//! CUDA is supported, enabled with the `cuda` [feature flag].
 //!
 //! [fatbin]: https://en.wikipedia.org/wiki/Fat_binary#Heterogeneous_computing
 //! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
 mod error;
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 mod program;
 mod source;
 
 /// Fast Fourier Transform on the GPU.
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub mod fft;
 /// Fast Fourier Transform on the CPU.
 pub mod fft_cpu;
 /// Multiexponentiation on the GPU.
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub mod multiexp;
 /// Polynomial operations on the GPU (fix_var, linear_combine, witness_poly).
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub mod poly_ops;
 /// GPU buffer management and combined operations for persistent data.
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub mod gpu_buffer;
 /// Helpers for multithreaded code.
 pub mod threadpool;
 
 /// Re-export rust-gpu-tools as things like [`rust_gpu_tools::Device`] might be needed.
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub use rust_gpu_tools;
 
 pub use error::{EcError, EcResult};
 pub use source::{generate, SourceBuilder};
 
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel, compute_work_units, SortedMsmParams, compute_sorted_msm_params, build_dispatch_tables, CHUNK_SIZE};
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
-#[cfg(any(feature = "cuda", feature = "opencl"))]
+#[cfg(feature = "cuda")]
 pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult, FusedPolyCommit, FixVarsAndCommitResult, Phase3Input, FusedOpenResult};

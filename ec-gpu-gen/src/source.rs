@@ -3,9 +3,9 @@ use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
-#[cfg(any(feature = "opencl", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 use std::path::PathBuf;
-#[cfg(any(feature = "opencl", feature = "cuda"))]
+#[cfg(feature = "cuda")]
 use std::{env, fs};
 
 use ec_gpu::{GpuField, GpuName};
@@ -607,23 +607,15 @@ where
     Ok(result)
 }
 
-/// Convenience function to generate a kernel/source based on a source builder.
+/// Convenience function to generate a kernel based on a source builder.
 ///
 /// When the `cuda` feature is enabled it will compile a CUDA fatbin. The path to the file is
 /// stored in the `_EC_GPU_CUDA_KERNEL_FATBIN` environment variable, that will automatically be
 /// used by the `ec-gpu-gen` functionality that needs a kernel.
-///
-///
-/// When the `opencl` feature is enabled it will generate the source code for OpenCL. The path to
-/// the source file is stored in the `_EC_GPU_OPENCL_KERNEL_SOURCE` environment variable, that will
-/// automatically be used by the `ec-gpu-gen` functionality that needs a kernel. OpenCL compiles
-/// the source at run time).
 #[allow(unused_variables)]
 pub fn generate(source_builder: &SourceBuilder) {
     #[cfg(feature = "cuda")]
     generate_cuda(source_builder);
-    #[cfg(feature = "opencl")]
-    generate_opencl(source_builder);
 }
 
 #[cfg(feature = "cuda")]
@@ -708,32 +700,7 @@ fn generate_cuda(source_builder: &SourceBuilder) -> PathBuf {
     fatbin_path
 }
 
-#[cfg(feature = "opencl")]
-fn generate_opencl(source_builder: &SourceBuilder) -> PathBuf {
-    let kernel_source = source_builder.build_64_bit_limbs();
-    let out_dir = env::var("OUT_DIR").expect("OUT_DIR was not set.");
-
-    // Generating the kernel source is cheap, hence use a fixed name and override it on every
-    // build.
-    let source_path: PathBuf = [&out_dir, "kernel.cl"].iter().collect();
-
-    fs::write(&source_path, kernel_source).unwrap_or_else(|_| {
-        panic!(
-            "Cannot write kernel source at {}.",
-            source_path.to_str().unwrap()
-        )
-    });
-
-    // For OpenCL we only need the kernel source, it is compiled at runtime.
-    println!(
-        "cargo:rustc-env=_EC_GPU_OPENCL_KERNEL_SOURCE={}",
-        source_path.to_str().unwrap()
-    );
-
-    source_path
-}
-
-#[cfg(all(test, any(feature = "opencl", feature = "cuda")))]
+#[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
 
@@ -741,8 +708,6 @@ mod tests {
 
     #[cfg(feature = "cuda")]
     use rust_gpu_tools::cuda;
-    #[cfg(feature = "opencl")]
-    use rust_gpu_tools::opencl;
     use rust_gpu_tools::{program_closures, Device, GPUError, Program};
 
     use ark_ff::AdditiveGroup;
@@ -792,13 +757,6 @@ mod tests {
     impl cuda::KernelArgument for GpuScalarBN254 {
         fn as_c_void(&self) -> *mut std::ffi::c_void {
             &self.0 as *const _ as _
-        }
-    }
-
-    #[cfg(all(feature = "arkworks", feature = "opencl"))]
-    impl opencl::KernelArgument for GpuScalarBN254 {
-        fn push(&self, kernel: &mut opencl::Kernel) {
-            unsafe { kernel.builder.set_arg(&self.0) };
         }
     }
 
@@ -878,19 +836,6 @@ mod tests {
         };
     }
 
-    #[cfg(all(feature = "arkworks", feature = "opencl"))]
-    lazy_static! {
-        static ref OPENCL_PROGRAM_ARK_BN254: Mutex<(Program, Program)> = {
-            let device = *Device::all().first().expect("Cannot get a default device");
-            let opencl_device = device.opencl_device().unwrap();
-            let source_32 = test_source_ark_bn254().build_32_bit_limbs();
-            let program_32 = opencl::Program::from_opencl(opencl_device, &source_32).unwrap();
-            let source_64 = test_source_ark_bn254().build_64_bit_limbs();
-            let program_64 = opencl::Program::from_opencl(opencl_device, &source_64).unwrap();
-            Mutex::new((Program::Opencl(program_32), Program::Opencl(program_64)))
-        };
-    }
-
     //     fn call_kernel(name: &str, scalars: &[GpuScalar], uints: &[u32]) -> Scalar {
     //         let closures = program_closures!(|program, _args| -> Result<Scalar, NoError> {
     //             let mut cpu_buffer = vec![GpuScalar::default()];
@@ -967,66 +912,11 @@ mod tests {
             Ok(cpu_buffer[0].0)
         });
 
-        // For CUDA we only test 32-bit limbs.
-        #[cfg(all(feature = "cuda", not(feature = "opencl")))]
-        return CUDA_PROGRAM_ARK_BN254
+        CUDA_PROGRAM_ARK_BN254
             .lock()
             .unwrap()
             .run(closures, ())
-            .unwrap();
-
-        // For OpenCL we test for 32 and 64-bit limbs.
-        #[cfg(all(feature = "opencl", not(feature = "cuda")))]
-        {
-            let result_32 = OPENCL_PROGRAM_ARK_BN254
-                .lock()
-                .unwrap()
-                .0
-                .run(closures, ())
-                .unwrap();
-            let result_64 = OPENCL_PROGRAM_ARK_BN254
-                .lock()
-                .unwrap()
-                .1
-                .run(closures, ())
-                .unwrap();
-            assert_eq!(
-                result_32, result_64,
-                "Results for 32-bit and 64-bit limbs must be the same."
-            );
-            result_32
-        }
-
-        // When both features are enabled, check if the results are the same
-        #[cfg(all(feature = "cuda", feature = "opencl"))]
-        {
-            let cuda_result = CUDA_PROGRAM_ARK_BN254
-                .lock()
-                .unwrap()
-                .run(closures, ())
-                .unwrap();
-            let opencl_32_result = OPENCL_PROGRAM_ARK_BN254
-                .lock()
-                .unwrap()
-                .0
-                .run(closures, ())
-                .unwrap();
-            let opencl_64_result = OPENCL_PROGRAM_ARK_BN254
-                .lock()
-                .unwrap()
-                .1
-                .run(closures, ())
-                .unwrap();
-            assert_eq!(
-                opencl_32_result, opencl_64_result,
-                "Results for 32-bit and 64-bit limbs on OpenCL must be the same."
-            );
-            assert_eq!(
-                cuda_result, opencl_32_result,
-                "Results for CUDA and OpenCL must be the same."
-            );
-            cuda_result
-        }
+            .unwrap()
     }
 
     #[cfg(feature = "arkworks")]
