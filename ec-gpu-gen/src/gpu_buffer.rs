@@ -548,6 +548,10 @@ pub struct FusedPolyCommit<F: PrimeField + GpuName, G: GpuAffine> {
     base_buffer: Option<rust_gpu_tools::PersistentBuffer<G::GpuRepr>>,
     /// Number of elements in the persistent base buffer.
     base_buffer_len: usize,
+    /// Pointer identity of the last uploaded bases slice. Used alongside `base_buffer_len`
+    /// to detect when different SRS bases of the same length are provided (e.g. concurrent
+    /// tests with different random SRS).
+    base_buffer_ptr: usize,
     _phantom: std::marker::PhantomData<(F, G)>,
 }
 
@@ -581,6 +585,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             work_units,
             base_buffer: None,
             base_buffer_len: 0,
+            base_buffer_ptr: 0,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -591,7 +596,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
     /// re-upload ~256MB of bases on every `batch_commit` or `fused_open` call.
     /// If a persistent buffer already exists with a different size, it is replaced.
     pub fn upload_bases(&mut self, bases: &[G::GpuRepr]) -> EcResult<()> {
-        if self.base_buffer.as_ref().is_some() && self.base_buffer_len == bases.len() {
+        let incoming_ptr = bases.as_ptr() as usize;
+        if self.base_buffer.is_some()
+            && self.base_buffer_len == bases.len()
+            && self.base_buffer_ptr == incoming_ptr
+        {
             return Ok(());
         }
         // Drop old buffer inside a context scope (for CUDA cuMemFree)
@@ -612,6 +621,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         self.program.pop_context();
         self.base_buffer = Some(buf);
         self.base_buffer_len = bases.len();
+        self.base_buffer_ptr = incoming_ptr;
         Ok(())
     }
 
