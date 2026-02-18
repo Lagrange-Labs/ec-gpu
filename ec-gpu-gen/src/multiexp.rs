@@ -84,7 +84,10 @@ where
 }
 
 /// Calculates the maximum number of terms that can be put onto the GPU memory.
-fn calc_chunk_size<G>(mem: u64, work_units: usize) -> usize
+///
+/// Returns `(chunk_size, effective_work_units)`. The work units may be reduced from the
+/// requested value if the GPU doesn't have enough memory for the bucket overhead.
+fn calc_chunk_size<G>(mem: u64, work_units: usize) -> (usize, usize)
 where
     G: GpuAffine,
 {
@@ -98,12 +101,15 @@ where
     let term_size = aff_size + exp_size;
     // The number of buckets needed for one work unit (signed-digit: half)
     let max_buckets_per_work_unit = 1 << (MAX_WINDOW_SIZE - 1);
-    // The amount of memory (in bytes) we need for the intermediate steps (buckets).
-    let buckets_size = work_units * max_buckets_per_work_unit * proj_size;
-    // The amount of memory (in bytes) we need for the results.
-    let results_size = work_units * proj_size;
+    // Per-work-unit overhead: one bucket array + one result element
+    let overhead_per_wu = max_buckets_per_work_unit * proj_size + proj_size;
 
-    (max_memory - buckets_size - results_size) / term_size
+    // Clamp work_units so that the overhead fits in available memory (leave room for ≥1 term).
+    let max_wu = max_memory / (overhead_per_wu + term_size);
+    let effective_wu = work_units.min(max_wu).max(1);
+
+    let overhead = effective_wu * overhead_per_wu;
+    ((max_memory - overhead) / term_size, effective_wu)
 }
 
 /// Calculates the maximum number of terms that can be put onto the GPU memory for sorted MSM.
@@ -319,12 +325,12 @@ where
         let compute_units = device.compute_units();
         let compute_capability = device.compute_capability();
         let work_units = work_units(compute_units, compute_capability);
-        let chunk_size = calc_chunk_size::<G>(mem, work_units);
+        let (chunk_size, effective_work_units) = calc_chunk_size::<G>(mem, work_units);
 
         Ok(SingleMultiexpKernel {
             program,
             n: chunk_size,
-            work_units,
+            work_units: effective_work_units,
             maybe_abort,
             _phantom: std::marker::PhantomData,
         })
