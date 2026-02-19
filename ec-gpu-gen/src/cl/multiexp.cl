@@ -41,7 +41,7 @@ KERNEL void POINT_multiexp(
   const uint bits = (gid % num_windows) * window_size;
   const ushort w = min((ushort)window_size, (ushort)(EXPONENT_BITS - bits));
 
-  POINT_jacobian res = POINT_ZERO;
+  
   for(uint i = nstart; i < nend; i++) {
     uint ind = EXPONENT_get_bits_lsb(exps[i], bits, w);
 
@@ -61,8 +61,9 @@ KERNEL void POINT_multiexp(
   // e.g. 3a + 2b + 1c = a +
   //                    (a) + b +
   //                    ((a) + b) + c
-  POINT_jacobian acc = POINT_ZERO;
-  for(int j = bucket_len - 1; j >= 0; j--) {
+  POINT_jacobian acc = buckets[bucket_len - 1];
+  POINT_jacobian res = acc;
+  for(int j = bucket_len - 2; j >= 0; j--) {
     acc = POINT_add(acc, buckets[j]);
     res = POINT_add(res, acc);
   }
@@ -157,7 +158,7 @@ KERNEL void POINT_multiexp_signed(
   const uint nend = min(nstart + len, n);
   const uint window = gid % num_windows;
 
-  POINT_jacobian res = POINT_ZERO;
+  
   for(uint i = nstart; i < nend; i++) {
     ushort raw = digits[i * num_windows + window];
     uint ind = raw & 0x7FFF;
@@ -180,8 +181,9 @@ KERNEL void POINT_multiexp_signed(
   }
 
   // Summation by parts — only half the iterations!
-  POINT_jacobian acc = POINT_ZERO;
-  for(int j = bucket_len - 1; j >= 0; j--) {
+  POINT_jacobian acc = buckets[bucket_len - 1];
+  POINT_jacobian res = acc;
+  for(int j = bucket_len - 2; j >= 0; j--) {
     acc = POINT_add(acc, buckets[j]);
     res = POINT_add(res, acc);
   }
@@ -480,9 +482,9 @@ KERNEL void POINT_combine_chunks_to_windows(
   const uint base = w * B;
 
   // Compute suffix sums of chunk_sums and accumulate correction
-  POINT_jacobian ss = POINT_ZERO;
-  POINT_jacobian correction = POINT_ZERO;
-  for (int c = (int)B - 1; c >= 0; c--) {
+  POINT_jacobian ss = chunk_sum[base + (uint)B - 1];
+  POINT_jacobian correction = ss;
+  for (int c = (int)B - 2; c >= 0; c--) {
     ss = POINT_add(ss, chunk_sum[base + (uint)c]);
     if (c > 0)
       correction = POINT_add(correction, ss);
@@ -864,7 +866,7 @@ KERNEL void POINT_multiexp_signed_batched(
   // Per-poly digit offset
   GLOBAL ushort *my_digits = digits + poly_idx * n * num_windows;
 
-  POINT_jacobian res = POINT_ZERO;
+  
   for(uint i = nstart; i < nend; i++) {
     ushort raw = my_digits[i * num_windows + window];
     uint ind = raw & 0x7FFF;
@@ -881,8 +883,9 @@ KERNEL void POINT_multiexp_signed_batched(
     }
   }
 
-  POINT_jacobian acc = POINT_ZERO;
-  for(int j = bucket_len - 1; j >= 0; j--) {
+  POINT_jacobian acc = buckets[bucket_len - 1];
+  POINT_jacobian res = acc;
+  for(int j = bucket_len - 2; j >= 0; j--) {
     acc = POINT_add(acc, buckets[j]);
     res = POINT_add(res, acc);
   }
