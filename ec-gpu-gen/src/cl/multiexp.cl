@@ -497,8 +497,8 @@ KERNEL void POINT_combine_chunks_to_windows(
   }
 
   // Sum all chunk SBPs
-  POINT_jacobian sbp_total = POINT_ZERO;
-  for (uint c = 0; c < B; c++)
+  POINT_jacobian sbp_total = chunk_sbp[base];
+  for (uint c = 1; c < B; c++)
     sbp_total = POINT_add(sbp_total, chunk_sbp[base + c]);
 
   window_results[w] = POINT_add(sbp_total, correction);
@@ -522,8 +522,8 @@ KERNEL void POINT_reduce_windows(
   const uint gid = GET_GLOBAL_ID();
   if (gid != 0) return;
 
-  POINT_jacobian acc = POINT_ZERO;
-  for (int i = (int)num_windows - 1; i >= 0; i--) {
+  POINT_jacobian acc = window_results[(int)num_windows - 1];
+  for (int i = (int)num_windows - 2; i >= 0; i--) {
     uint w = window_size;
     uint remaining = effective_bits - (uint)i * window_size;
     if (w > remaining) w = remaining;
@@ -615,8 +615,8 @@ KERNEL void POINT_reduce_partial_buckets(
   uint start = reduce_table[gid * 2 + 0];
   uint count = reduce_table[gid * 2 + 1];
 
-  POINT_jacobian acc = POINT_ZERO;
-  for (uint j = 0; j < count; j++) {
+  POINT_jacobian acc = partial_results[start];
+  for (uint j = 1; j < count; j++) {
     acc = POINT_add(acc, partial_results[start + j]);
   }
 
@@ -744,8 +744,8 @@ KERNEL void POINT_reduce_multiexp_groups(
     uint num_windows) {
   const uint wid = GET_GLOBAL_ID();
   if (wid >= num_windows) return;
-  POINT_jacobian acc = POINT_ZERO;
-  for (uint g = 0; g < num_groups; g++) {
+  POINT_jacobian acc = results[wid];
+  for (uint g = 1; g < num_groups; g++) {
     acc = POINT_add(acc, results[g * num_windows + wid]);
   }
   window_sums[wid] = acc;
@@ -906,8 +906,8 @@ KERNEL void POINT_reduce_multiexp_groups_batched(
   const uint poly_idx = gid / num_windows;
   const uint wid = gid % num_windows;
   const uint tpp = num_groups * num_windows;
-  POINT_jacobian acc = POINT_ZERO;
-  for (uint g = 0; g < num_groups; g++) {
+  POINT_jacobian acc = results[poly_idx * tpp + wid];
+  for (uint g = 1; g < num_groups; g++) {
     acc = POINT_add(acc, results[poly_idx * tpp + g * num_windows + wid]);
   }
   window_sums[gid] = acc;
@@ -929,8 +929,8 @@ KERNEL void POINT_reduce_windows_batched(
   const uint gid = GET_GLOBAL_ID();
   if (gid >= batch_size) return;
   GLOBAL POINT_jacobian *my_windows = window_results + gid * num_windows;
-  POINT_jacobian acc = POINT_ZERO;
-  for (int i = (int)num_windows - 1; i >= 0; i--) {
+  POINT_jacobian acc = my_windows[(int)num_windows - 1];
+  for (int i = (int)num_windows - 2; i >= 0; i--) {
     uint w = window_size;
     uint remaining = effective_bits - (uint)i * window_size;
     if (w > remaining) w = remaining;

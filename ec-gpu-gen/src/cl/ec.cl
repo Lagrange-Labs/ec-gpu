@@ -25,14 +25,15 @@ DEVICE POINT_jacobian POINT_double(POINT_jacobian inp) {
   FIELD c = FIELD_sqr(b); // C = B^2
 
   // D = 2*((X1+B)2-A-C)
-  FIELD d = FIELD_add(inp.x, b);
-  d = FIELD_sqr(d); d = FIELD_sub(FIELD_sub(d, a), c); d = FIELD_double(d);
-
+  // FIELD d = FIELD_add(inp.x, b);
+  // d = FIELD_sqr(d); d = FIELD_sub(FIELD_sub(d, a), c); d = FIELD_double(d);
+  FIELD d = FIELD_mul(inp.x, b);
+  d = FIELD_double(FIELD_double(d));
   const FIELD e = FIELD_add(FIELD_double(a), a); // E = 3*A
   const FIELD f = FIELD_sqr(e);
 
   inp.z = FIELD_mul(inp.y, inp.z); inp.z = FIELD_double(inp.z); // Z3 = 2*Y1*Z1
-  inp.x = FIELD_sub(FIELD_sub(f, d), d); // X3 = F-2*D
+  inp.x = FIELD_sub(f, FIELD_double(d)); // X3 = F-2*D
 
   // Y3 = E*(D-X3)-8*C
   c = FIELD_double(c); c = FIELD_double(c); c = FIELD_double(c);
@@ -56,13 +57,17 @@ DEVICE POINT_jacobian POINT_add_mixed(POINT_jacobian a, POINT_affine b) {
   const FIELD u2 = FIELD_mul(b.x, z1z1);
   const FIELD s2 = FIELD_mul(FIELD_mul(b.y, a.z), z1z1);
 
-  if(FIELD_eq(a.x, u2) && FIELD_eq(a.y, s2)) {
+  if(FIELD_eq(a.x, u2)) {
+    if(FIELD_eq(a.y, s2)) {
       return POINT_double(a);
+    } else {
+      return POINT_ZERO;
+    }
   }
 
   const FIELD h = FIELD_sub(u2, a.x); // H = U2-X1
-  const FIELD hh = FIELD_sqr(h); // HH = H^2
-  FIELD i = FIELD_double(hh); i = FIELD_double(i); // I = 4*HH
+  const FIELD i = FIELD_sqr(FIELD_double(h)); // HH = H^2
+  // FIELD i = FIELD_double(hh); i = FIELD_double(i); // I = 4*HH
   FIELD j = FIELD_mul(h, i); // J = H*I
   FIELD r = FIELD_sub(s2, a.y); r = FIELD_double(r); // r = 2*(S2-Y1)
   const FIELD v = FIELD_mul(a.x, i);
@@ -77,7 +82,8 @@ DEVICE POINT_jacobian POINT_add_mixed(POINT_jacobian a, POINT_affine b) {
   ret.y = FIELD_sub(FIELD_mul(FIELD_sub(v, ret.x), r), j);
 
   // Z3 = (Z1+H)^2-Z1Z1-HH
-  ret.z = FIELD_add(a.z, h); ret.z = FIELD_sub(FIELD_sub(FIELD_sqr(ret.z), z1z1), hh);
+  // ret.z = FIELD_add(a.z, h); ret.z = FIELD_sub(FIELD_sub(FIELD_sqr(ret.z), z1z1), hh);
+  ret.z = FIELD_double(FIELD_mul(a.z, h));
   return ret;
 }
 
@@ -95,9 +101,13 @@ DEVICE POINT_jacobian POINT_add(POINT_jacobian a, POINT_jacobian b) {
   FIELD s1 = FIELD_mul(FIELD_mul(a.y, b.z), z2z2); // S1 = Y1*Z2*Z2Z2
   const FIELD s2 = FIELD_mul(FIELD_mul(b.y, a.z), z1z1); // S2 = Y2*Z1*Z1Z1
 
-  if(FIELD_eq(u1, u2) && FIELD_eq(s1, s2))
-    return POINT_double(a);
-  else {
+  if(FIELD_eq(u1, u2)) { 
+    if(FIELD_eq(s1, s2)){
+      return POINT_double(a);
+    } else {
+      return POINT_ZERO;
+    }
+  } else {
     const FIELD h = FIELD_sub(u2, u1); // H = U2-U1
     FIELD i = FIELD_double(h); i = FIELD_sqr(i); // I = (2*H)^2
     const FIELD j = FIELD_mul(h, i); // J = H*I
