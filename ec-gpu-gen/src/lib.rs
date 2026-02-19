@@ -62,7 +62,7 @@ pub mod fft;
 /// Fast Fourier Transform on the CPU.
 pub mod fft_cpu;
 /// GPU buffer management and combined operations for persistent data.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod gpu_buffer;
 /// Multiexponentiation on the GPU.
 #[cfg(any(feature = "cuda", feature = "opencl"))]
@@ -92,5 +92,5 @@ pub use multiexp::{
     build_dispatch_tables, compute_sorted_msm_params, compute_work_units, G1AffineM, G2AffineM,
     GpuAffine, MultiexpKernel, SingleMultiexpKernel, SortedMsmParams, CHUNK_SIZE,
 };
-#[cfg(fany(feature = "cuda", feature = "opencl"))]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
