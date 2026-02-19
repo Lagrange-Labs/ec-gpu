@@ -68,7 +68,7 @@ pub mod gpu_buffer;
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod multiexp;
 /// Polynomial operations on the GPU (fix_var, linear_combine, witness_poly).
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod poly_ops;
 /// Helpers for multithreaded code.
 pub mod threadpool;
@@ -82,7 +82,7 @@ pub use source::{generate, SourceBuilder};
 
 #[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use gpu_buffer::{
     BufferMetadata, CombinedPolyOps, FixVarsAndCommitResult, FixVarsResult, FusedOpenResult,
     FusedPolyCommit, GpuBufferCache, GpuBufferId, Phase3Input,
@@ -92,5 +92,5 @@ pub use multiexp::{
     build_dispatch_tables, compute_sorted_msm_params, compute_work_units, G1AffineM, G2AffineM,
     GpuAffine, MultiexpKernel, SingleMultiexpKernel, SortedMsmParams, CHUNK_SIZE,
 };
-#[cfg(feature = "cuda")]
+#[cfg(fany(feature = "cuda", feature = "opencl"))]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
