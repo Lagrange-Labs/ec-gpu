@@ -151,6 +151,8 @@ pub struct Program {
     queue: CommandQueue,
     context: Context,
     kernels_by_name: HashMap<String, opencl3::kernel::Kernel>,
+    names_indices: HashMap<String, usize>,
+    names: Vec<String>,
 }
 
 impl Program {
@@ -183,18 +185,24 @@ impl Program {
             );
             let queue = CommandQueue::create_default(&context, 0)?;
             let kernels = opencl3::kernel::create_program_kernels(&program)?;
+            let mut names_indices = HashMap::<String, usize>::new();
+            let mut names = Vec::<String>::with_capacity(kernels.len());
             let kernels_by_name = kernels
-                .into_iter()
-                .map(|kernel| {
-                    let name = kernel.function_name()?;
-                    Ok((name, kernel))
-                })
-                .collect::<Result<_, ClError>>()?;
+            .into_iter().enumerate()
+            .map(|(idx, kernel)| {
+                let name = kernel.function_name()?;
+                names.push(name.clone());
+                names_indices.insert(name.clone(), idx);
+                Ok((name, kernel))
+            })
+            .collect::<Result<_, ClError>>()?;
             let prog = Program {
                 device_name: device.name(),
                 queue,
                 context,
                 kernels_by_name,
+                names_indices,
+                names,
             };
             let binaries = program
                 .get_binaries()
@@ -218,10 +226,14 @@ impl Program {
         }
         let queue = CommandQueue::create_default(&context, 0)?;
         let kernels = opencl3::kernel::create_program_kernels(&program)?;
+        let mut names_indices = HashMap::<String, usize>::new();
+        let mut names = Vec::<String>::with_capacity(kernels.len());
         let kernels_by_name = kernels
-            .into_iter()
-            .map(|kernel| {
+            .into_iter().enumerate()
+            .map(|(idx, kernel)| {
                 let name = kernel.function_name()?;
+                names.push(name.clone());
+                names_indices.insert(name.clone(), idx);
                 Ok((name, kernel))
             })
             .collect::<Result<_, ClError>>()?;
@@ -230,6 +242,8 @@ impl Program {
             queue,
             context,
             kernels_by_name,
+            names_indices,
+            names,
         })
     }
 
@@ -306,12 +320,12 @@ impl Program {
     /// number of threads. Instead it follows CUDA's definition and is the number of
     /// `local_work_size` sized thread groups. So the total number of threads is
     /// `global_work_size * local_work_size`.
-    pub fn create_kernel(
-        &self,
+    pub fn create_kernel<'a>(
+        &'a self,
         name: &str,
         global_work_size: usize,
         local_work_size: usize,
-    ) -> GPUResult<Kernel> {
+    ) -> GPUResult<Kernel<'a>> {
         let kernel = self
             .kernels_by_name
             .get(name)
@@ -405,6 +419,21 @@ impl Program {
         })
     }
 
+    /// Method that creates a kernel bound to a specific stream, `func_handle` corresponds to the index
+    /// in `Program.names`.
+    pub fn create_kernel_cached_on_stream<'a>(
+        &'a self,
+        stream: &'a Stream,
+        func_handle: usize,
+        gws: usize,
+        lws: usize,
+    ) -> Kernel<'a> {
+        let name = self.names[func_handle].as_str();
+
+        self.create_kernel_on_stream(stream, name, gws, lws).unwrap()
+       
+    }
+
     /// Upload data to GPU buffer on a specific stream (command queue).
     pub fn write_from_buffer_on_stream<T>(
         &self,
@@ -423,6 +452,37 @@ impl Program {
             stream
                 .queue
                 .enqueue_write_buffer(&mut buffer.buffer, opencl3::types::CL_NON_BLOCKING, 0, bytes, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Upload data to a specific offset within a GPU buffer on a stream.
+    ///
+    /// Writes `data.len()` elements starting at `offset` (in T-sized elements)
+    /// within the device buffer. Same pageable/pinned semantics as
+    /// `write_from_buffer_on_stream`.
+    pub fn write_from_buffer_at_offset_on_stream<T>(
+        &self,
+        buffer: &mut Buffer<T>,
+        data: &[T],
+        offset: usize,
+        stream: &Stream,
+    ) -> GPUResult<()> {
+        assert!(
+            offset + data.len() <= buffer.length,
+            "Buffer write would overflow (offset={}, len={}, capacity={})",
+            offset, data.len(), buffer.length
+        );
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const T as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+        unsafe {
+            stream
+                .queue
+                .enqueue_write_buffer(&mut buffer.buffer, opencl3::types::CL_NON_BLOCKING, offset, bytes, &[])?;
         }
         Ok(())
     }
@@ -501,14 +561,7 @@ impl Program {
     /// On OpenCL, kernels are pre-loaded at program creation, so this just validates the name.
     /// Returns a handle (index into kernels_by_name) for use with cached kernel creation.
     pub fn get_cached_function(&self, name: &str) -> GPUResult<usize> {
-        if self.kernels_by_name.contains_key(name) {
-            // Use pointer-based hash as stable handle; not actually needed on OpenCL
-            // since kernels_by_name is a HashMap. We just return 0 as OpenCL
-            // doesn't benefit from caching (kernels already loaded).
-            Ok(0)
-        } else {
-            Err(GPUError::KernelNotFound(name.to_string()))
-        }
+        self.names_indices.get(name).copied().ok_or(GPUError::KernelNotFound(name.to_string()))
     }
 
 }

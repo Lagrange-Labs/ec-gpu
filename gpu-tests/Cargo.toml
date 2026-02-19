@@ -12,7 +12,10 @@ publish = false
 criterion = "0.4"
 divan = "0.1"
 ec-gpu = { workspace = true, features = ["arkworks"] }
-ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false, features = ["arkworks"] }
+ec-gpu-gen = { path = "../ec-gpu-gen", default-features = false, features = [
+    "arkworks",
+    "opencl",
+] }
 fil_logger = "0.1.6"
 rand = "0.8"
 rayon = "1.5.3"
@@ -27,10 +30,10 @@ tracing-profile.workspace = true
 [build-dependencies]
 ark-bn254 = { version = "0.5.0" }
 ec-gpu = { path = "../ec-gpu", features = ["arkworks"] }
-ec-gpu-gen = { path = "../ec-gpu-gen", features = ["arkworks"] }
+ec-gpu-gen = { path = "../ec-gpu-gen", features = ["arkworks", "opencl"] }
 
 [features]
-default = ["cuda", "opencl"]
+default = ["opencl"]
 cuda = ["ec-gpu-gen/cuda"]
 opencl = ["ec-gpu-gen/opencl"]
 

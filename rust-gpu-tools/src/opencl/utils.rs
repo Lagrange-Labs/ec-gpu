@@ -31,6 +31,11 @@ fn get_pci_id(device: &opencl3::device::Device) -> GPUResult<PciId> {
             let device_id = device.pci_slot_id_nv()? as u16;
             (bus_id << 8) | device_id
         }
+        Vendor::Apple => {
+            return Err(GPUError::DeviceInfoNotAvailable(
+                opencl3::error_codes::CL_INVALID_VALUE.into(),
+            ))
+        }
     };
     Ok(id.into())
 }
@@ -97,8 +102,17 @@ pub(crate) fn build_device_list() -> Vec<Device> {
                     .map(opencl3::device::Device::new)
                     .filter_map(|device| {
                         if let Ok(vendor_id) = device.vendor_id() {
-                            // Only use devices from the accepted vendors ...
-                            let vendor = Vendor::try_from(vendor_id).ok()?;
+                            // Only use devices from the accepted vendors. Try numeric vendor ID
+                            // first; if that doesn't match (e.g. Apple Silicon), fall back to
+                            // the vendor string.
+                            let vendor = Vendor::try_from(vendor_id)
+                                .or_else(|_| {
+                                    device
+                                        .vendor()
+                                        .map_err(GPUError::DeviceInfoNotAvailable)
+                                        .and_then(|s| Vendor::try_from(s.as_str()))
+                                })
+                                .ok()?;
                             // ... which are available.
                             if !device.available().unwrap_or(false) {
                                 return None;

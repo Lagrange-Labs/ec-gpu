@@ -52,39 +52,45 @@
 //! [fatbin]: https://en.wikipedia.org/wiki/Fat_binary#Heterogeneous_computing
 //! [feature flags]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-features-section
 mod error;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 mod program;
 mod source;
 
 /// Fast Fourier Transform on the GPU.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod fft;
 /// Fast Fourier Transform on the CPU.
 pub mod fft_cpu;
-/// Multiexponentiation on the GPU.
+/// GPU buffer management and combined operations for persistent data.
 #[cfg(feature = "cuda")]
+pub mod gpu_buffer;
+/// Multiexponentiation on the GPU.
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub mod multiexp;
 /// Polynomial operations on the GPU (fix_var, linear_combine, witness_poly).
 #[cfg(feature = "cuda")]
 pub mod poly_ops;
-/// GPU buffer management and combined operations for persistent data.
-#[cfg(feature = "cuda")]
-pub mod gpu_buffer;
 /// Helpers for multithreaded code.
 pub mod threadpool;
 
 /// Re-export rust-gpu-tools as things like [`rust_gpu_tools::Device`] might be needed.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use rust_gpu_tools;
 
 pub use error::{EcError, EcResult};
 pub use source::{generate, SourceBuilder};
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 pub use fft::{FftKernel, FftKernelArk, SingleFftKernel, SingleFftKernelArk};
 #[cfg(feature = "cuda")]
-pub use multiexp::{G1AffineM, G2AffineM, GpuAffine, MultiexpKernel, SingleMultiexpKernel, compute_work_units, SortedMsmParams, compute_sorted_msm_params, build_dispatch_tables, CHUNK_SIZE};
+pub use gpu_buffer::{
+    BufferMetadata, CombinedPolyOps, FixVarsAndCommitResult, FixVarsResult, FusedOpenResult,
+    FusedPolyCommit, GpuBufferCache, GpuBufferId, Phase3Input,
+};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+pub use multiexp::{
+    build_dispatch_tables, compute_sorted_msm_params, compute_work_units, G1AffineM, G2AffineM,
+    GpuAffine, MultiexpKernel, SingleMultiexpKernel, SortedMsmParams, CHUNK_SIZE,
+};
 #[cfg(feature = "cuda")]
 pub use poly_ops::{PolyOpsKernel, SinglePolyOpsKernel};
-#[cfg(feature = "cuda")]
-pub use gpu_buffer::{CombinedPolyOps, GpuBufferCache, GpuBufferId, BufferMetadata, FixVarsResult, FusedPolyCommit, FixVarsAndCommitResult, Phase3Input, FusedOpenResult};

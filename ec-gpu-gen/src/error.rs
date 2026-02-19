@@ -1,6 +1,6 @@
 use std::io;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "opencl"))]
 use rust_gpu_tools::GPUError;
 
 /// Errors of this library.
@@ -11,12 +11,12 @@ pub enum EcError {
     Simple(&'static str),
 
     /// Error in case a GPU kernel execution was aborted.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
     #[error("GPU call was aborted!")]
     Aborted,
 
     /// An error that is bubbled up from the rust-gpu-tools library.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "opencl"))]
     #[error("GPU tools error: {0}")]
     GpuTools(#[from] GPUError),
 

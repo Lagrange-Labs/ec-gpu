@@ -24,6 +24,7 @@ const AMD_DEVICE_ON_APPLE_VENDOR_STRING: &str = "AMD";
 const AMD_DEVICE_ON_APPLE_VENDOR_ID: u32 = 0x1021d00;
 const NVIDIA_DEVICE_VENDOR_STRING: &str = "NVIDIA Corporation";
 const NVIDIA_DEVICE_VENDOR_ID: u32 = 0x10de;
+const APPLE_DEVICE_VENDOR_STRING: &str = "Apple";
 
 // The owned CUDA contexts are stored globally. Each devives contains an unowned reference, so
 // that devices can be cloned.
@@ -174,6 +175,8 @@ pub enum Vendor {
     Amd,
     /// GPU by NVIDIA.
     Nvidia,
+    /// GPU by Apple (Apple Silicon).
+    Apple,
 }
 
 impl TryFrom<&str> for Vendor {
@@ -184,6 +187,7 @@ impl TryFrom<&str> for Vendor {
             AMD_DEVICE_VENDOR_STRING => Ok(Self::Amd),
             AMD_DEVICE_ON_APPLE_VENDOR_STRING => Ok(Self::Amd),
             NVIDIA_DEVICE_VENDOR_STRING => Ok(Self::Nvidia),
+            APPLE_DEVICE_VENDOR_STRING => Ok(Self::Apple),
             _ => Err(GPUError::UnsupportedVendor(vendor.to_string())),
         }
     }
@@ -207,6 +211,7 @@ impl fmt::Display for Vendor {
         let vendor = match self {
             Self::Amd => AMD_DEVICE_VENDOR_STRING,
             Self::Nvidia => NVIDIA_DEVICE_VENDOR_STRING,
+            Self::Apple => APPLE_DEVICE_VENDOR_STRING,
         };
         write!(f, "{}", vendor)
     }

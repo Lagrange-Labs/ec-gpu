@@ -38,8 +38,7 @@
     defined(__Capeverde__) || defined(__Cayman__) || defined(__Barts__) || \
     defined(__Cypress__) || defined(__Juniper__) || defined(__Redwood__) || \
     defined(__Cedar__) || defined(__ATI_RV770__) || defined(__ATI_RV730__) || \
-    defined(__ATI_RV710__) || defined(__Loveland__) || defined(__GPU__) || \
-    defined(__Hawaii__)
+    defined(__ATI_RV710__) || defined(__Loveland__) || defined(__Hawaii__)
 #define AMD
 #endif
 
@@ -54,12 +53,31 @@ DEVICE ulong mac_with_carry_64(ulong a, ulong b, ulong c, ulong *d) {
         : "=l"(lo), "=l"(hi) : "l"(a), "l"(b), "l"(c), "l"(*d));
     *d = hi;
     return lo;
-  #else
+  #elif defined(AMD)
     ulong lo = a * b + c;
     ulong hi = mad_hi(a, b, (ulong)(lo < c));
     a = lo;
     lo += *d;
     hi += (lo < a);
+    *d = hi;
+    return lo;
+  #else
+    // Split into 32-bit halves to avoid mad_hi(ulong,...) which is unsupported on Apple Metal
+    uint a_lo = (uint)a,  a_hi = (uint)(a >> 32);
+    uint b_lo = (uint)b,  b_hi = (uint)(b >> 32);
+    ulong t0 = (ulong)a_lo * b_lo;
+    ulong t1 = (ulong)a_lo * b_hi;
+    ulong t2 = (ulong)a_hi * b_lo;
+    ulong t3 = (ulong)a_hi * b_hi;
+    t1 += (t0 >> 32);
+    t1 += t2;
+    if (t1 < t2) t3 += (ulong)1 << 32;
+    ulong lo = (t0 & 0xFFFFFFFFUL) | (t1 << 32);
+    ulong hi = t3 + (t1 >> 32);
+    lo += c;
+    if (lo < c) hi++;
+    lo += *d;
+    if (lo < *d) hi++;
     *d = hi;
     return lo;
   #endif
@@ -107,7 +125,7 @@ DEVICE uint add_with_carry_32(uint a, uint *b) {
 // Reverse the given bits. It's used by the FFT kernel.
 DEVICE uint bitreverse(uint n, uint bits) {
   uint r = 0;
-  for(int i = 0; i < bits; i++) {
+  for(uint i = 0; i < bits; i++) {
     r = (r << 1) | (n & 1);
     n >>= 1;
   }

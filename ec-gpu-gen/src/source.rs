@@ -3,10 +3,8 @@ use std::fmt::{self, Write};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem;
-#[cfg(feature = "cuda")]
-use std::path::PathBuf;
-#[cfg(feature = "cuda")]
-use std::{env, fs};
+#[cfg(any(feature = "cuda", feature = "opencl"))]
+use std::{env, fs, path::PathBuf};
 
 use ec_gpu::{GpuField, GpuName};
 
@@ -616,6 +614,8 @@ where
 pub fn generate(source_builder: &SourceBuilder) {
     #[cfg(feature = "cuda")]
     generate_cuda(source_builder);
+    #[cfg(feature = "opencl")]
+    generate_opencl(source_builder);
 }
 
 #[cfg(feature = "cuda")]
@@ -698,6 +698,18 @@ fn generate_cuda(source_builder: &SourceBuilder) -> PathBuf {
     );
 
     fatbin_path
+}
+
+#[cfg(feature = "opencl")]
+fn generate_opencl(source_builder: &SourceBuilder) {
+    let kernel_source = source_builder.build_32_bit_limbs();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR was not set.");
+    let source_path: PathBuf = [&out_dir, "ec_gpu_kernel.cl"].iter().collect();
+    fs::write(&source_path, &kernel_source).expect("Cannot write OpenCL kernel source.");
+    println!(
+        "cargo:rustc-env=_EC_GPU_OPENCL_KERNEL_SOURCE={}",
+        source_path.to_str().unwrap()
+    );
 }
 
 #[cfg(all(test, feature = "cuda"))]

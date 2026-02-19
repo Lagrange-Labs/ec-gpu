@@ -42,4 +42,10 @@ ark-bn254 = "0.5.0"
 [features]
 default = []
 cuda = ["rust-gpu-tools/cuda"]
-arkworks = ["ec-gpu/arkworks", "dep:ark-bn254", "dep:ark-std", "dep:ark-serialize"]
+opencl = ["rust-gpu-tools/opencl"]
+arkworks = [
+    "ec-gpu/arkworks",
+    "dep:ark-bn254",
+    "dep:ark-std",
+    "dep:ark-serialize",
+]

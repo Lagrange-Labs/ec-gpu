@@ -92,7 +92,7 @@ KERNEL void POINT_preprocess_signed_digits(
   const uint gid = GET_GLOBAL_ID();
   if (gid >= n) return;
 
-  const uint half = 1u << (window_size - 1);
+  const uint bucket_half = 1u << (window_size - 1);
   const uint full = 1u << window_size;
   const uint wmask = full - 1;
 
@@ -111,11 +111,11 @@ KERNEL void POINT_preprocess_signed_digits(
     if (val == 0) {
       digits[gid * num_windows + w] = 0;
       carry = overflow;
-    } else if (val < half) {
+    } else if (val < bucket_half) {
       digits[gid * num_windows + w] = (ushort)val;
       carry = overflow;
     } else {
-      // val >= half: use negative digit
+      // val >= bucket_half: use negative digit
       uint digit = full - val;
       digits[gid * num_windows + w] = (ushort)(digit | (1u << 15));
       carry = 1;  // borrow from next window
@@ -400,7 +400,11 @@ KERNEL void POINT_reduce_buckets_chunked(
     GLOBAL POINT_jacobian *chunk_sbp_out,
     GLOBAL POINT_jacobian *chunk_sum_out,
     uint buckets_per_window,
-    uint num_chunks_per_window) {
+    uint num_chunks_per_window
+#ifndef CUDA
+    , LOCAL POINT_jacobian *smem
+#endif
+    ) {
 
   const uint block_id = GET_GROUP_ID();
   const uint tid = GET_LOCAL_ID();
@@ -411,9 +415,6 @@ KERNEL void POINT_reduce_buckets_chunked(
 
 #ifdef CUDA
   POINT_jacobian *smem = (POINT_jacobian *)cuda_shared;
-#else
-  // OpenCL: not supported for now (fused_open is CUDA-only)
-  return;
 #endif
 
   // Load bucket results into shared memory (pad with identity for partial last chunk)
@@ -676,16 +677,6 @@ KERNEL void POINT_batch_scalar_mul(
  */
 
 /*
- * Fill a u32 buffer with zeros on the GPU.
- * Replaces CPU-side write_from_buffer with a zero vector.
- */
-KERNEL void u32_fill_zero(GLOBAL uint *buffer, uint count) {
-  const uint gid = GET_GLOBAL_ID();
-  if (gid >= count) return;
-  buffer[gid] = 0;
-}
-
-/*
  * Fill a Jacobian point buffer with identity points on the GPU.
  * Replaces CPU-side write_from_buffer with an identity vector.
  */
@@ -695,15 +686,30 @@ KERNEL void POINT_fill_identity(GLOBAL POINT_jacobian *buffer, uint count) {
   buffer[gid] = POINT_ZERO;
 }
 
+// These utility kernels do not depend on POINT/FIELD types and must only be
+// defined once even when multiexp.cl is instantiated for multiple curves.
+#ifndef EC_GPU_MULTIEXP_UTIL_KERNELS_DEFINED
+#define EC_GPU_MULTIEXP_UTIL_KERNELS_DEFINED
+
+/*
+ * Fill a u32 buffer with zeros on the GPU.
+ */
+KERNEL void u32_fill_zero(GLOBAL uint *buffer, uint count) {
+  const uint gid = GET_GLOBAL_ID();
+  if (gid >= count) return;
+  buffer[gid] = 0;
+}
+
 /*
  * Device-to-device u32 buffer copy.
- * Replaces the CPU roundtrip of downloading offsets and re-uploading to scatter_offsets.
  */
 KERNEL void u32_copy_buffer(GLOBAL uint *src, GLOBAL uint *dst, uint count) {
   const uint gid = GET_GLOBAL_ID();
   if (gid >= count) return;
   dst[gid] = src[gid];
 }
+
+#endif // EC_GPU_MULTIEXP_UTIL_KERNELS_DEFINED
 
 /*
  * Copy a single Jacobian point from src[0] to dst[dst_idx].

@@ -21,6 +21,14 @@ macro_rules! program {
                         #[cfg(not(feature = "cuda"))]
                         return Err($crate::EcError::Simple("CUDA framework is not supported, please compile with the `cuda` feature enabled."))
                     }
+                    "opencl" => {
+                        #[cfg(feature = "opencl")]
+                        {
+                            Framework::Opencl
+                        }
+                         #[cfg(not(feature = "opencl"))]
+                        return Err($crate::EcError::Simple("Opencl framework is not supported, please compile with the `opencl` feature enabled."))
+                    }
                     _ => default_framework,
                 },
                 Err(_) => default_framework,
@@ -33,6 +41,13 @@ macro_rules! program {
                     let cuda_device = device.cuda_device().ok_or(GPUError::DeviceNotFound)?;
                     let program = $crate::rust_gpu_tools::cuda::Program::from_bytes(cuda_device, kernel)?;
                     Ok(Program::Cuda(program))
+                }
+                #[cfg(feature = "opencl")]
+                Framework::Opencl => {
+                    let kernel = include_str!(env!("_EC_GPU_OPENCL_KERNEL_SOURCE"));
+                    let opencl_device = device.opencl_device().ok_or(GPUError::DeviceNotFound)?;
+                    let program = $crate::rust_gpu_tools::opencl::Program::from_opencl(opencl_device, kernel)?;
+                    Ok(Program::Opencl(program))
                 }
             }
         })($device)
