@@ -1950,7 +1950,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             }
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
-            eprintln!("[batch_commit_concurrent] alloc={:.1}ms dispatch={:.1}ms total={:.1}ms ({} groups, {} total polys)",
+            tracing::trace!("[batch_commit_concurrent] alloc={:.1}ms dispatch={:.1}ms total={:.1}ms ({} groups, {} total polys)",
                 alloc_ms, dispatch_ms, total_ms, num_groups,
                 g_num_polys.iter().sum::<usize>());
 
@@ -2133,7 +2133,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let reduce_chunked_name = format!("{}_reduce_buckets_chunked", G::name());
             let combine_chunks_name = format!("{}_combine_chunks_to_windows", G::name());
 
-            eprintln!("[fused_open] pre-alloc (buffers+kernel names): {:?}", fused_open_start.elapsed());
+            tracing::trace!("[fused_open] pre-alloc (buffers+kernel names): {:?}", fused_open_start.elapsed());
 
             // ================================================================
             // Phase 1+2: fix_vars + intermediate MSM commits
@@ -2261,7 +2261,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     current_len = next_len;
                 }
 
-                eprintln!("[fused_open] phase2 GPU loop ({} iters): {:?}", num_gpu_iterations, phase2_start.elapsed());
+                tracing::trace!("[fused_open] phase2 GPU loop ({} iters): {:?}", num_gpu_iterations, phase2_start.elapsed());
                 let cpu_fallback_start = std::time::Instant::now();
 
                 // === CPU fallback iterations: fix_var on GPU, MSM on CPU ===
@@ -2315,7 +2315,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     current_len = next_len;
                 }
 
-                eprintln!("[fused_open] phase2 CPU fallback ({} iters): {:?}", num_challenges - num_gpu_iterations, cpu_fallback_start.elapsed());
+                tracing::trace!("[fused_open] phase2 CPU fallback ({} iters): {:?}", num_challenges - num_gpu_iterations, cpu_fallback_start.elapsed());
                 let download_start = std::time::Instant::now();
 
                 // Batch download all intermediates (per_iter_buffers still alive on GPU)
@@ -2329,7 +2329,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 // Batch download all commitments (1 sync instead of 22)
                 commitments.resize(num_challenges, <G::Group as AdditiveGroup>::ZERO);
                 program.read_into_buffer(&commitments_gpu, &mut commitments)?;
-                eprintln!("[fused_open] batch download: {:?}", download_start.elapsed());
+                tracing::trace!("[fused_open] batch download: {:?}", download_start.elapsed());
             } // end if num_challenges > 0
 
             // ================================================================
@@ -2338,7 +2338,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             // ================================================================
             let callback_start = std::time::Instant::now();
             let phase3_input = middle_fn(&intermediates, &commitments);
-            eprintln!("[fused_open] CPU callback: {:?}", callback_start.elapsed());
+            tracing::trace!("[fused_open] CPU callback: {:?}", callback_start.elapsed());
 
             // ================================================================
             // Phase 3: Streaming LC using on-GPU per-iteration buffers
@@ -2390,7 +2390,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .run_async()?;
             }
 
-            eprintln!("[fused_open] phase3 LC: {:?}", lc_start.elapsed());
+            tracing::trace!("[fused_open] phase3 LC: {:?}", lc_start.elapsed());
 
             // Free Phase 2 Pippenger buffers + per-iteration buffers before Phase 3
             drop(per_iter_buffers);
@@ -2408,7 +2408,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
             let download_start = std::time::Instant::now();
             let mut combined_cpu = vec![F::ZERO; poly_len];
             program.read_into_buffer(&combined_buffer, &mut combined_cpu)?;
-            eprintln!("[fused_open] phase3 download combined: {:?}", download_start.elapsed());
+            tracing::trace!("[fused_open] phase3 download combined: {:?}", download_start.elapsed());
 
             // Compute all witnesses on CPU in parallel (synthetic division is O(n) sequential — CPU excels)
             let cpu_witness_start = std::time::Instant::now();
@@ -2420,7 +2420,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .collect()
             };
             drop(combined_cpu);
-            eprintln!("[fused_open] phase3 CPU witness ({} points): {:?}", num_points, cpu_witness_start.elapsed());
+            tracing::trace!("[fused_open] phase3 CPU witness ({} points): {:?}", num_points, cpu_witness_start.elapsed());
 
             // Single witness buffer (reusable across all eval points, written from CPU each iteration)
             let mut single_witness_buffer = unsafe { program.create_buffer::<F>(witness_len)? };
@@ -2459,7 +2459,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 // Upload pre-computed CPU witness to GPU
                 let upload_start = std::time::Instant::now();
                 program.write_from_buffer(&mut single_witness_buffer, &witnesses_cpu[point_idx])?;
-                eprintln!("[fused_open]   witness[{}] upload: {:?}", point_idx, upload_start.elapsed());
+                tracing::trace!("[fused_open]   witness[{}] upload: {:?}", point_idx, upload_start.elapsed());
                 let to_scalar_start = std::time::Instant::now();
 
                 // === Convert witness Fr → scalar bytes on GPU ===
@@ -2473,7 +2473,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(witness_len as u32))
                     .run()?;
 
-                eprintln!("[fused_open]   witness[{}] to_scalar: {:?}", point_idx, to_scalar_start.elapsed());
+                tracing::trace!("[fused_open]   witness[{}] to_scalar: {:?}", point_idx, to_scalar_start.elapsed());
                 let sort_msm_start = std::time::Instant::now();
 
                 // === Sort-based MSM (coalesced memory access for large MSMs) ===
@@ -2524,7 +2524,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(p3_total_buckets as u32))
                     .run()?;
 
-                eprintln!("[fused_open]   witness[{}] sort prep (preprocess+decompose+count+prefix): {:?}", point_idx, sort_msm_start.elapsed());
+                tracing::trace!("[fused_open]   witness[{}] sort prep (preprocess+decompose+count+prefix): {:?}", point_idx, sort_msm_start.elapsed());
 
                 // 5. Download num_nonempty
                 let mut num_nonempty_vec = vec![0u32; 1];
@@ -2632,7 +2632,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(REDUCTION_CHUNK_SIZE as u32))
                     .run()?;
 
-                eprintln!("[fused_open]   witness[{}] accum+reduce: {:?}", point_idx, accum_start.elapsed());
+                tracing::trace!("[fused_open]   witness[{}] accum+reduce: {:?}", point_idx, accum_start.elapsed());
 
                 // 10. Horner reduction on GPU
                 let reduce_windows_kernel = program.create_kernel(&reduce_windows_kernel_name, 1, 1)?;
@@ -2652,10 +2652,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     .arg(&(point_idx as u32))
                     .run()?;
 
-                eprintln!("[fused_open]   witness[{}] TOTAL: {:?}", point_idx, witness_iter_start.elapsed());
+                tracing::trace!("[fused_open]   witness[{}] TOTAL: {:?}", point_idx, witness_iter_start.elapsed());
             }
 
-            eprintln!("[fused_open] phase3 total ({} points): {:?}", num_points, witness_msm_start.elapsed());
+            tracing::trace!("[fused_open] phase3 total ({} points): {:?}", num_points, witness_msm_start.elapsed());
 
             // Batch download all witness commitments (1 sync instead of 3)
             let mut witness_commitments = vec![<G::Group as AdditiveGroup>::ZERO; num_points];
@@ -2663,7 +2663,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 program.read_into_buffer(&witness_commitments_gpu, &mut witness_commitments)?;
             }
 
-            eprintln!("[fused_open] TOTAL: {:?}", fused_open_start.elapsed());
+            tracing::trace!("[fused_open] TOTAL: {:?}", fused_open_start.elapsed());
 
             Ok(FusedOpenResult {
                 intermediates,
