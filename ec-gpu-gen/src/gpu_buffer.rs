@@ -1635,11 +1635,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
         let persistent_base_len = self.base_buffer_len;
         let num_groups = groups.len();
 
-        // Print group summary
-        let group_desc: Vec<String> = groups.iter()
-            .map(|(polys, ml)| format!("{}×{}", ml, polys.len()))
-            .collect();
-        eprintln!("[batch_commit_concurrent] {} groups: [{}]", num_groups, group_desc.join(", "));
+        // (group summary logging removed — was debug instrumentation)
 
         let closures = program_closures!(|program, _arg| -> EcResult<Vec<Vec<G::Group>>> {
             let t_total = std::time::Instant::now();
@@ -1732,24 +1728,11 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 g_batch_size.push(b);
             }
 
-            // Log Pippenger params per group (including batch size)
-            for gi in 0..num_groups {
-                let bases_per_group = div_ceil(g_max_len[gi], g_num_groups_msm[gi]);
-                let bucket_len = 1usize << (g_ws[gi] - 1);
-                let adds_per_thread = bases_per_group + bucket_len * 2;
-                let bucket_bytes = bucket_len * std::mem::size_of::<G::Group>();
-                let tpp = g_num_windows[gi] * g_num_groups_msm[gi];
-                eprintln!(
-                    "[batch_commit_concurrent] group {}: {}×{} polys, B={}, ws={}, nw={}, ng={}, bases/group={}, buckets={}, adds/thread={}, bucket_mem/thread={}B, threads={}",
-                    gi, g_max_len[gi], g_num_polys[gi], g_batch_size[gi], g_ws[gi], g_num_windows[gi], g_num_groups_msm[gi],
-                    bases_per_group, bucket_len, adds_per_thread, bucket_bytes, tpp
-                );
-            }
+            // (per-group Pippenger param logging removed — was debug instrumentation)
 
             // === Buffer allocation: per-group for upload, per-stream for compute ===
             let t_alloc = std::time::Instant::now();
 
-            let t_device = std::time::Instant::now();
             // Per-group: GPU fr_buffer sized for B × max_len, commitments for all polys
             let mut g_fr_buffer = Vec::with_capacity(num_groups);
             let mut g_commitments_gpu = Vec::with_capacity(num_groups);
@@ -1797,37 +1780,10 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 s_window_results.push(unsafe { program.create_buffer::<G::Group>(max_windows)? });
                 s_final_result.push(unsafe { program.create_buffer::<G::Group>(max_final)? });
             }
-            let device_alloc_ms = t_device.elapsed().as_secs_f64() * 1000.0;
-
-            // Pinned staging: 2 small buffers for double-buffered async DMA.
-            // Only allocated if any B>1 group has polys that fit.
-            let staging_capacity_elems: usize = 1024 * 1024; // ~32MB for F=32B (1M elements)
-            let needs_staging = (0..num_groups).any(|gi|
-                g_batch_size[gi] > 1 && g_max_len[gi] <= staging_capacity_elems);
-
-            let (mut pinned_a, mut pinned_b) = if needs_staging {
-                let t_pin = std::time::Instant::now();
-                let a = program.create_pinned_host_buffer::<F>(staging_capacity_elems)?;
-                let b = program.create_pinned_host_buffer::<F>(staging_capacity_elems)?;
-                let pin_ms = t_pin.elapsed().as_secs_f64() * 1000.0;
-                eprintln!("[batch_commit_concurrent] pinned staging: 2 × {}MB, alloc {:.1}ms",
-                    staging_capacity_elems * std::mem::size_of::<F>() / (1024*1024), pin_ms);
-                (Some(a), Some(b))
-            } else {
-                (None, None)
-            };
-            let mut use_pinned_a = true;
-
             let alloc_ms = t_alloc.elapsed().as_secs_f64() * 1000.0;
 
             // === Interleaved batched dispatch loop ===
             let t_dispatch = std::time::Instant::now();
-            let mut pack_ns: u64 = 0;
-            let mut dma_enqueue_ns: u64 = 0;
-            let mut launch_ns: u64 = 0;
-            let mut total_dma_calls: u32 = 0;
-            let mut total_poly_dmas: usize = 0;
-            let mut batch_iteration = vec![0usize; num_groups];
 
             loop {
                 let mut any_active = false;
@@ -1842,66 +1798,23 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                     let remaining = polys.len() - g_poly_counter[gi];
                     let b = std::cmp::min(g_batch_size[gi], remaining);
 
-                    // --- DMA: three-branch dispatch ---
+                    // --- DMA: per-poly scatter (pageable host memory, safe for multi-stream) ---
+                    // NOTE: pinned staging double-buffer was removed because it caused a
+                    // race condition — with multiple streams, cuMemcpyHtoDAsync from pinned
+                    // memory is truly async, so a later group's CPU packing can overwrite the
+                    // pinned buffer while an earlier group's DMA is still in flight on a
+                    // different stream. Pageable DMA is safe because CUDA internally stages
+                    // the data before returning.
                     let batch_len = b * g_max_len[gi];
-                    let mut dma_calls = 0u32;
 
-                    if b == 1 {
-                        // B=1: direct DMA, no packing benefit
-                        let t_dma = std::time::Instant::now();
-                        let poly = polys[g_poly_counter[gi]];
+                    for bi in 0..b {
+                        let poly = polys[g_poly_counter[gi] + bi];
+                        let offset = bi * g_max_len[gi];
                         program.write_from_buffer_at_offset_on_stream(
-                            &mut g_fr_buffer[gi], poly, 0, stream)?;
-                        dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
-                        dma_calls += 1;
-                    } else if g_max_len[gi] <= staging_capacity_elems && pinned_a.is_some() {
-                        // Pinned staging: pack polys into pinned buffer, async DMA
-                        let polys_per_sub = staging_capacity_elems / g_max_len[gi];
-                        let max_len = g_max_len[gi];
-                        let mut bi = 0;
-                        while bi < b {
-                            let sub_count = std::cmp::min(polys_per_sub, b - bi);
-                            let pinned = if use_pinned_a {
-                                pinned_a.as_mut().unwrap()
-                            } else {
-                                pinned_b.as_mut().unwrap()
-                            };
-                            // Serial pack into pinned staging
-                            let t_pack = std::time::Instant::now();
-                            for si_inner in 0..sub_count {
-                                let poly = polys[g_poly_counter[gi] + bi + si_inner];
-                                let off = si_inner * max_len;
-                                pinned[off..off + poly.len()].copy_from_slice(poly);
-                            }
-                            pack_ns += t_pack.elapsed().as_nanos() as u64;
-                            // Async DMA from pinned
-                            let t_dma = std::time::Instant::now();
-                            let gpu_offset = bi * max_len;
-                            let data_len = sub_count * max_len;
-                            program.write_from_buffer_at_offset_on_stream(
-                                &mut g_fr_buffer[gi], &pinned[..data_len], gpu_offset, stream)?;
-                            dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
-                            use_pinned_a = !use_pinned_a;
-                            bi += sub_count;
-                            dma_calls += 1;
-                        }
-                    } else {
-                        // Fallback: scatter DMA (per-poly, same as original)
-                        let t_dma = std::time::Instant::now();
-                        for bi in 0..b {
-                            let poly = polys[g_poly_counter[gi] + bi];
-                            let offset = bi * g_max_len[gi];
-                            program.write_from_buffer_at_offset_on_stream(
-                                &mut g_fr_buffer[gi], poly, offset, stream)?;
-                            dma_calls += 1;
-                        }
-                        dma_enqueue_ns += t_dma.elapsed().as_nanos() as u64;
+                            &mut g_fr_buffer[gi], poly, offset, stream)?;
                     }
-                    total_dma_calls += dma_calls;
-                    total_poly_dmas += b;
 
                     // --- kernel launch phase ---
-                    let t_kl = std::time::Instant::now();
                     let n_total = batch_len; // b × max_len (only process valid elements)
 
                     // 1. to_scalar_bytes: n = B × max_len (unchanged kernel, processes all elements)
@@ -2014,9 +1927,7 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                             .run_async()?;
                     }
 
-                    launch_ns += t_kl.elapsed().as_nanos() as u64;
                     g_poly_counter[gi] += b;
-                    batch_iteration[gi] += 1;
                 }
 
                 if !any_active {
@@ -2024,35 +1935,24 @@ impl<F: PrimeField + GpuName, G: GpuAffine<ScalarField = F>> FusedPolyCommit<F, 
                 }
             }
             let dispatch_ms = t_dispatch.elapsed().as_secs_f64() * 1000.0;
-            let pack_ms = pack_ns as f64 / 1_000_000.0;
-            let dma_enqueue_ms = dma_enqueue_ns as f64 / 1_000_000.0;
-            let launch_ms = launch_ns as f64 / 1_000_000.0;
-            let total_batch_iters: usize = batch_iteration.iter().sum();
 
             // Sync all streams
-            let t_sync = std::time::Instant::now();
             for stream in &streams {
                 stream.synchronize().map_err(|e| rust_gpu_tools::GPUError::from(e))?;
             }
-            let sync_ms = t_sync.elapsed().as_secs_f64() * 1000.0;
 
             // Download results from each group
-            let t_download = std::time::Instant::now();
             let mut all_results = Vec::with_capacity(num_groups);
             for gi in 0..num_groups {
                 let mut results = vec![<G::Group as AdditiveGroup>::ZERO; g_num_polys[gi]];
                 program.read_into_buffer(&g_commitments_gpu[gi], &mut results)?;
                 all_results.push(results);
             }
-            let download_ms = t_download.elapsed().as_secs_f64() * 1000.0;
             let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
 
-            eprintln!(
-                "[batch_commit_concurrent] alloc: {:.1}ms (device: {:.1}ms), dispatch: {:.1}ms (pack: {:.1}ms, dma: {:.1}ms [{} calls for {} polys], launch: {:.1}ms, batches={}), sync: {:.1}ms, download: {:.1}ms, total: {:.1}ms",
-                alloc_ms, device_alloc_ms,
-                dispatch_ms, pack_ms, dma_enqueue_ms, total_dma_calls, total_poly_dmas, launch_ms, total_batch_iters,
-                sync_ms, download_ms, total_ms
-            );
+            eprintln!("[batch_commit_concurrent] alloc={:.1}ms dispatch={:.1}ms total={:.1}ms ({} groups, {} total polys)",
+                alloc_ms, dispatch_ms, total_ms, num_groups,
+                g_num_polys.iter().sum::<usize>());
 
             Ok(all_results)
         });
